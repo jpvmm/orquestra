@@ -18,6 +18,26 @@ It has two parts:
 
 > Status: early, used daily by its author on a single Linux box. Expect rough edges.
 
+## Why Orquestra
+
+- **Event-driven, not polling.** The bot launches a Claude or Codex run, ends its turn, and is woken by a webhook
+  when the run finishes. No "is it done yet?" loops burning tokens, and news arrives right away.
+- **Catches problems on its own.** Vigia notices stalled, timed-out and looping runs (the same error over and over,
+  the same edit/test cycle with no progress) and stops them before they waste quota.
+- **Leaves the machine clean.** When a run is stopped, the whole process group is killed and verified gone.
+  No orphaned processes or leftover containers.
+- **Keeps evidence.** On failure it freezes log tails, the process tree and the status at that moment, so you can
+  see what happened without re-running.
+- **Really protects tests.** Claude Code and Codex hooks stop the implementing agent from editing test files to
+  make them pass.
+- **Same rules for both agents.** Claude Code and Codex get the same states, alerts and limits, and each can review
+  the other's work.
+- **Small and portable.** A few standard-library Python scripts: no Docker, no services. Hooks apply only to
+  supervised runs, never to your global CLI config. A Grok Bot can install the whole thing by itself with the
+  bundled skill.
+- **One bot, clear rules.** Instead of a stack of agents talking to each other, a single orchestrator with
+  explicit working rules and a tiny supervisor that tells it when there is something to do.
+
 ## How Vigia works
 
 ```

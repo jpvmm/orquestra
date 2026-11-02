@@ -1,0 +1,19 @@
+# secrets
+webhook.env
+*.env
+!webhook.env.example
+
+# Vigia runtime state
+active/
+ativos/
+*.jsonl
+*.log
+runs/
+*.evidence/
+
+# rendered per-install file
+bin/claude-hooks.json
+
+# Python
+__pycache__/
+*.pyc

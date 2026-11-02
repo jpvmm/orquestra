@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+"""vigia-run: supervise a headless Claude Code or Codex CLI run in the background.
+
+Usage:
+  vigia-run --tool claude|codex --task-dir DIR --name NAME [--stall-min 10] [--max-min 20]
+            [--max-turns-hint N] [--max-files N] [--protect-tests] [--loop-repeat 3]
+            [--cwd DIR] [--foreground] -- <full claude/codex command>
+
+Returns immediately (the supervisor is detached and survives the end of the shell/turn) and prints
+a JSON object with the status path. Exit 0 = started; 2 = bad usage; 3 = active-run cap reached;
+4 = name already used in this task-dir; 5 = command not found.
+
+Paths: state lives in $VIGIA_BASE (default $ORQUESTRA_HOME/vigia, default ~/.orquestra/vigia);
+per-run files live in <task-dir>/runs/.
+"""
+import argparse, ctypes, json, os, re, shlex, signal, shutil, subprocess, sys, time
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vigia_lib as V
+
+POLL = float(os.environ.get("VIGIA_POLL_SEC", "3"))
+CPU_TICKS_ATIVO = int(os.environ.get("VIGIA_CPU_TICKS", "15"))  # CPU ticks (1/100 s) per poll that count as "working"
+KILL_GRACE = float(os.environ.get("VIGIA_KILL_GRACE", "10"))
+
+
+def erro(msg, code):
+    print(f"vigia-run: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def parse():
+    argv = sys.argv[1:]
+    if "--" not in argv:
+        erro("missing '--' before the command. E.g.: vigia-run --tool claude --task-dir D --name N -- claude -p ...", 2)
+    i = argv.index("--")
+    ours, cmd = argv[:i], argv[i + 1:]
+    p = argparse.ArgumentParser(prog="vigia-run")
+    p.add_argument("--tool", required=True, choices=["claude", "codex", "other"])
+    p.add_argument("--task-dir", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--stall-min", type=float, default=10)
+    p.add_argument("--max-min", type=float, default=20)
+    p.add_argument("--max-turns-hint", type=int, default=0,
+                   help="expected tool calls: above this is an alert, above 2x is a loop (growing scope)")
+    p.add_argument("--max-files", type=int, default=0, help="number of distinct edited files above which it counts as growing scope (loop)")
+    p.add_argument("--protect-tests", action="store_true")
+    p.add_argument("--loop-repeat", type=int, default=3, help="repetitions of the same error/cycle that count as a loop")
+    p.add_argument("--cwd", default=None)
+    p.add_argument("--foreground", action="store_true", help="do not detach (debug)")
+    a = p.parse_args(ours)
+    if not cmd:
+        erro("empty command after '--'", 2)
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", a.name):
+        erro("--name only accepts letters, digits, dot, _ and - (up to 80)", 2)
+    a.cmd = cmd
+    a.task_dir = os.path.abspath(a.task_dir)
+    a.cwd = os.path.abspath(a.cwd or os.getcwd())
+    return a
+
+
+# ======================= event analysis =======================
+
+class Analisador:
+    """Reads events (claude stream-json, codex --json, hook lines) and detects loops."""
+
+    def __init__(self, a):
+        self.a = a
+        self.erros = {}         # signature -> count
+        self.ciclos = {}        # edit/test cycle signature -> count
+        self.edits_desde_teste = []
+        self.arquivos = set()
+        self.tools = {}         # tool_use_id -> (name, input)
+        self.turnos = 0
+        self.chamadas = 0
+        self.loop = None        # reason
+        self.alertas = []
+        self.ultima_msg = None
+        self.resultado = None
+        self.session_id = None
+        self.stream_claude = False
+        self.stream_codex = False   # saw codex exec --json events (main source; hooks only complement)
+        self.codex_pend = []        # hook PostToolUse with no matching --json item yet: [t, ev]
+        self.codex_json = []        # --json items that arrived before the hook: [t, cmd, paths]
+        self.ultimo_erro = None
+
+    # --- helpers
+    def _alerta(self, txt):
+        if V.ALERTA_RE.search(txt or ""):
+            m = V.normalizar(txt, 200)
+            if m not in self.alertas and len(self.alertas) < 10:
+                self.alertas.append(m)
+
+    def _erro(self, origem, texto):
+        self.ultimo_erro = str(texto)[-300:]
+        self._alerta(texto)
+        sig = V.h(origem, V.normalizar(texto))
+        self.erros[sig] = self.erros.get(sig, 0) + 1
+        if self.erros[sig] >= self.a.loop_repeat and not self.loop:
+            self.loop = f"same error {self.erros[sig]}x ({origem}): {str(texto).strip()[:200]}"
+
+    def _edit(self, path, conteudo=""):
+        if not path:
+            return
+        self.arquivos.add(path)
+        self.edits_desde_teste.append(V.h(path, conteudo))
+        if self.a.protect_tests and V.eh_teste(path) and not self.loop:
+            self.loop = f"touched a protected test file: {path}"
+        if self.a.max_files and len(self.arquivos) > self.a.max_files and not self.loop:
+            self.loop = f"growing scope: {len(self.arquivos)} files edited (> --max-files {self.a.max_files})"
+
+    def _shell(self, cmd):
+        for p in V.escritas_em_teste_por_shell(cmd):
+            self._edit(p, "shell:" + cmd)
+
+    def _teste(self, cmd, saida, falhou):
+        sig = V.h(sorted(self.edits_desde_teste), V.normalizar(cmd, 200), V.normalizar(saida, 600), falhou)
+        self.edits_desde_teste = []
+        self.ciclos[sig] = self.ciclos.get(sig, 0) + 1
+        if self.ciclos[sig] >= self.a.loop_repeat and not self.loop:
+            self.loop = f"identical edit/test cycle {self.ciclos[sig]}x with no progress ({cmd[:120]})"
+
+    def _chamada(self):
+        self.chamadas += 1
+        n = self.a.max_turns_hint
+        if n:
+            if self.chamadas > n and f"exceeded max-turns-hint ({n})" not in self.alertas:
+                self.alertas.append(f"exceeded max-turns-hint ({n})")
+            if self.chamadas > 2 * n and not self.loop:
+                self.loop = f"growing scope: {self.chamadas} tool calls (> 2x --max-turns-hint {n})"
+
+    # --- claude stream-json
+    def claude(self, ev):
+        t = ev.get("type")
+        if t == "system":
+            self.stream_claude = True
+            if ev.get("subtype") == "init":
+                self.session_id = ev.get("session_id")
+            else:
+                self._alerta(json.dumps(ev, ensure_ascii=False)[:500]) if ev.get("subtype") in ("api_retry", "error") else None
+        elif t == "assistant":
+            self.stream_claude = True
+            self.turnos += 1
+            for c in (ev.get("message") or {}).get("content") or []:
+                if c.get("type") == "tool_use":
+                    nome, inp = c.get("name"), c.get("input") or {}
+                    self.tools[c.get("id")] = (nome, inp)
+                    self._chamada()
+                    if nome in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+                        self._edit(inp.get("file_path") or inp.get("notebook_path"),
+                                   json.dumps(inp, sort_keys=True)[:5000])
+                    elif nome == "Bash":
+                        self._shell(inp.get("command", ""))
+                elif c.get("type") == "text" and c.get("text"):
+                    self.ultima_msg = c["text"]
+        elif t == "user":
+            self.stream_claude = True
+            for c in (ev.get("message") or {}).get("content") or [] if isinstance((ev.get("message") or {}).get("content"), list) else []:
+                if c.get("type") != "tool_result":
+                    continue
+                cont = c.get("content")
+                if isinstance(cont, list):
+                    cont = "\n".join(x.get("text", "") for x in cont if isinstance(x, dict))
+                nome, inp = self.tools.get(c.get("tool_use_id"), (None, {}))
+                if c.get("is_error"):
+                    self._erro(f"tool:{nome}", cont)
+                if nome == "Bash" and V.CMD_TESTE_RE.search(inp.get("command", "")):
+                    self._teste(inp.get("command", ""), cont, bool(c.get("is_error")))
+        elif t == "rate_limit_event":
+            info = ev.get("rate_limit_info") or {}
+            if info.get("status") not in (None, "allowed", "allowed_warning"):
+                a = f"Claude rate limit: status={info.get('status')} type={info.get('rateLimitType')}"
+                if a not in self.alertas:
+                    self.alertas.append(a)
+        elif t == "result":
+            self.stream_claude = True
+            self.resultado = ev
+            self.session_id = ev.get("session_id") or self.session_id
+            if ev.get("is_error"):
+                self._alerta(str(ev.get("result")) + " " + str(ev.get("subtype")))
+            if ev.get("result"):
+                self.ultima_msg = ev.get("result")
+
+    # --- Codex hooks: --json already carries commands/edits/errors; the hook only adds what --json does not show
+    def hook_codex(self, ev):
+        nome_ev, nome = ev.get("hook_event_name"), ev.get("tool_name")
+        if nome_ev == "PreToolUse" and ev.get("denied"):
+            # a denied apply_patch does not show up in --json: count it as an attempt to touch a test
+            self._edit(ev.get("path"), "denied")
+            return
+        if nome_ev == "PostToolUse" and nome in ("Bash", "apply_patch"):
+            # Codex 0.166 --json omits commands blocked by the sandbox; hold the hook event for a while and,
+            # if no --json item matches, count it from the hook (see codex_conciliar)
+            self.codex_pend.append([time.monotonic(), ev])
+            for k, (_t, cmd, paths) in enumerate(self.codex_json):
+                if self._codex_bate(cmd=cmd, paths=paths):
+                    del self.codex_json[k]
+                    break
+            return
+        if self.stream_codex:
+            return
+        if nome_ev == "PostToolUse":  # no --json: other tools count as calls
+            self._chamada()
+            if nome == "apply_patch":
+                for p in ev.get("files") or []:
+                    self._edit(p, ev.get("edit_sig", ""))
+            elif nome == "Bash":
+                cmd = (ev.get("tool_input") or {}).get("command", "")
+                self._shell(cmd)
+                if V.CMD_TESTE_RE.search(cmd):
+                    self._teste(cmd, ev.get("output", ""), None)
+        elif nome_ev == "Stop" and ev.get("last_message"):
+            self.ultima_msg = ev.get("last_message")
+
+    def _codex_item(self, cmd=None, paths=None):
+        if not self._codex_bate(cmd=cmd, paths=paths):
+            agora = time.monotonic()
+            self.codex_json = [x for x in self.codex_json if agora - x[0] < 60][-50:] + [[agora, cmd, paths]]
+
+    def _codex_bate(self, cmd=None, paths=None):
+        """Remove from the hook queue the PostToolUse that matches a --json item. True if found."""
+        for k, (_t, h) in enumerate(self.codex_pend):
+            if cmd is not None and h.get("tool_name") == "Bash":
+                hc = (h.get("tool_input") or {}).get("command", "")
+                try:
+                    partes = shlex.split(cmd)
+                except ValueError:
+                    partes = [cmd]
+                if hc and (hc == cmd or (partes and partes[-1] == hc)):
+                    del self.codex_pend[k]; return True
+            if paths is not None and h.get("tool_name") == "apply_patch":
+                hp = h.get("files") or []
+                if hp and all(any(q == x or q.endswith("/" + x.lstrip("./")) for q in paths) for x in hp):
+                    del self.codex_pend[k]; return True
+
+    def codex_conciliar(self, fim=False, espera=10):
+        """Hook PostToolUse with no --json item after `espera` s: count it here (call, test write via
+        shell, test cycle and error). Without --json, everything comes through here."""
+        agora = time.monotonic()
+        resto = []
+        for t, h in self.codex_pend:
+            if not fim and self.stream_codex and agora - t < espera:
+                resto.append([t, h]); continue
+            self._chamada()
+            nome, saida = h.get("tool_name"), h.get("output", "")
+            if nome == "Bash":
+                cmd = (h.get("tool_input") or {}).get("command", "")
+                self._shell(cmd)
+                if V.CMD_TESTE_RE.search(cmd):
+                    self._teste(cmd, saida, None)
+                if self.stream_codex:  # missing from --json: in 0.166 this is a command blocked by the sandbox
+                    self._erro("command-hook", f"{cmd}\n{saida[-800:]}")
+            elif nome == "apply_patch":
+                if self.stream_codex:  # patch that never became a file_change: it failed
+                    self._erro("apply_patch", saida or " ".join(h.get("files") or []))
+                else:
+                    for p in h.get("files") or []:
+                        self._edit(p, h.get("edit_sig", ""))
+        self.codex_pend = resto
+
+    # --- Claude hooks (used for loop detection only when there is no stream-json)
+    def hook(self, ev):
+        nome_ev = ev.get("hook_event_name")
+        if ev.get("origin") == "codex":
+            return self.hook_codex(ev)
+        if self.stream_claude:
+            return
+        if nome_ev == "PostToolUse" or nome_ev == "PostToolUseFailure":
+            nome, inp = ev.get("tool_name"), ev.get("tool_input") or {}
+            self._chamada()
+            if nome in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+                self._edit(inp.get("file_path") or inp.get("notebook_path"), ev.get("edit_sig", ""))
+            if nome == "Bash":
+                self._shell(inp.get("command", ""))
+                if V.CMD_TESTE_RE.search(inp.get("command", "")):
+                    self._teste(inp.get("command", ""), ev.get("output", ""), nome_ev == "PostToolUseFailure")
+            if nome_ev == "PostToolUseFailure":
+                self._erro(f"tool:{nome}", ev.get("error", ""))
+        elif nome_ev == "PreToolUse" and ev.get("denied"):
+            self._edit(ev.get("path"), "denied")
+        elif nome_ev == "StopFailure":
+            self._alerta(str(ev.get("error", "")) + " " + str(ev.get("matcher", "")))
+
+    # --- codex exec --json
+    def codex(self, ev):
+        t = ev.get("type", "")
+        if t:
+            self.stream_codex = True
+        if t == "thread.started":
+            self.session_id = ev.get("thread_id")
+        elif t == "turn.started":
+            self.turnos += 1
+        elif t == "turn.failed":
+            self._erro("turn.failed", json.dumps(ev.get("error"), ensure_ascii=False))
+        elif t == "error":
+            self._erro("error", ev.get("message", ""))
+        elif t == "item.started":
+            it = ev.get("item") or {}
+            if it.get("type") in ("command_execution", "file_change", "mcp_tool_call", "web_search"):
+                self._chamada()
+            if it.get("type") == "command_execution":
+                self._shell(it.get("command", ""))
+        elif t == "item.completed":
+            it = ev.get("item") or {}
+            ty = it.get("type")
+            if ty == "agent_message":
+                self.ultima_msg = it.get("text")
+            elif ty == "file_change":
+                for ch in it.get("changes") or []:
+                    self._edit(ch.get("path"), ch.get("kind", ""))
+                self._codex_item(paths=[ch.get("path", "") for ch in it.get("changes") or []])
+            elif ty == "command_execution":
+                cmd, out, ec = it.get("command", ""), it.get("aggregated_output", ""), it.get("exit_code")
+                self._codex_item(cmd=cmd)
+                falhou = ec not in (0, None) or it.get("status") == "failed"
+                if falhou:
+                    self._erro("command", f"{cmd}\n{out[-800:]}")
+                if V.CMD_TESTE_RE.search(cmd):
+                    self._teste(cmd, out[-2000:], falhou)
+            elif ty == "error":
+                if "--dangerously-bypass-hook-trust" not in str(it.get("message", "")):  # our own warning, not an error
+                    self._erro("item.error", it.get("message", ""))
+            elif ty == "mcp_tool_call" and it.get("status") == "failed":
+                self._erro("mcp", json.dumps(it.get("error"), ensure_ascii=False))
+
+    def linha(self, txt, origem):
+        txt = txt.strip()
+        if not txt:
+            return
+        try:
+            ev = json.loads(txt)
+        except Exception:
+            if origem == "events":
+                self._alerta(txt)
+            return
+        if not isinstance(ev, dict):
+            return
+        if origem == "hooks":
+            self.hook(ev)
+        elif self.a.tool == "codex" or "." in str(ev.get("type", "")) or ev.get("type") == "error":
+            self.codex(ev)
+        else:
+            self.claude(ev)
+
+
+class Seguidor:
+    """Reads new lines from a file incrementally."""
+
+    def __init__(self, path):
+        self.path, self.pos, self.buf = path, 0, ""
+
+    def tamanho(self):
+        try:
+            return os.path.getsize(self.path)
+        except OSError:
+            return 0
+
+    def novas(self):
+        try:
+            with open(self.path, "r", errors="replace") as f:
+                f.seek(self.pos)
+                data = f.read(4 * 1024 * 1024)
+                self.pos = f.tell()
+        except OSError:
+            return []
+        self.buf += data
+        *linhas, self.buf = self.buf.split("\n")
+        return linhas
+
+
+# ======================= Codex hooks (this run only) =======================
+
+CODEX_HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vigia-codex-hook")
+CODEX_OPC_COM_VALOR = {"-c", "--config", "-m", "--model", "-p", "--profile", "-s", "--sandbox", "-C", "--cd",
+                       "-i", "--image", "--enable", "--disable", "-a", "--ask-for-approval", "--add-dir",
+                       "--remote", "--local-provider", "--color", "-o", "--output-last-message", "--output-schema"}
+CODEX_EVENTOS = (("SessionStart", False), ("PreToolUse", True), ("PostToolUse", True),
+                 ("Stop", False), ("SubagentStop", False))
+
+
+def codex_com_hooks(cmd):
+    """If cmd is `codex ... exec ...`, return (cmd with Vigia's -c hooks.* + --dangerously-bypass-hook-trust
+    right after `exec`, True). Nothing is written to ~/.codex. Disable with VIGIA_CODEX_HOOKS=0."""
+    if os.environ.get("VIGIA_CODEX_HOOKS", "1") == "0" or os.path.basename(cmd[0]) not in ("codex", "codex.js"):
+        return cmd, False
+    i = next((k for k in range(1, len(cmd)) if cmd[k] in ("exec", "e") and cmd[k - 1] not in CODEX_OPC_COM_VALOR), None)
+    if i is None:
+        return cmd, False
+    extra = []
+    if "--dangerously-bypass-hook-trust" not in cmd:
+        extra.append("--dangerously-bypass-hook-trust")  # without this Codex silently skips untrusted hooks
+    for ev, com_matcher in CODEX_EVENTOS:
+        m = 'matcher="*",' if com_matcher else ""
+        extra += ["-c", f'hooks.{ev}=[{{{m}hooks=[{{type="command",command="{CODEX_HOOK}",timeout=10}}]}}]']
+    return cmd[:i + 1] + extra + cmd[i + 1:], True
+
+
+# ======================= supervisor =======================
+
+def supervisionar(a, paths, chave):
+    cmd_original = a.cmd
+    hooks_codex = False
+    if a.tool == "codex":
+        a.cmd, hooks_codex = codex_com_hooks(a.cmd)
+    st = {
+        "name": a.name, "tool": a.tool, "state": "running", "task_dir": a.task_dir, "cwd": a.cwd,
+        "cmd": cmd_original, "codex_hooks": hooks_codex, "supervisor_pid": os.getpid(), "pid": None, "pgid": None,
+        "started_at": V.agora_iso(), "ended_at": None, "exit_code": None, "last_event_at": None,
+        "checked_at": None, "summary": "", "loop_reason": None, "alerts": [],
+        "limits": {"stall_min": a.stall_min, "max_min": a.max_min, "max_turns_hint": a.max_turns_hint,
+                   "max_files": a.max_files, "protect_tests": a.protect_tests, "loop_repeat": a.loop_repeat},
+        "stats": {}, "kill": None, "paths": paths,
+    }
+
+    def salvar():
+        st["checked_at"] = V.agora_iso()
+        V.escrever_json_atomico(paths["status"], st)
+
+    # subreaper: orphaned descendants are re-parented here (so they can be tracked and killed even if they leave the group)
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)
+    except Exception:
+        pass
+
+    termo = {"sinal": None}
+
+    def on_sig(signum, _f):
+        termo["sinal"] = signum
+    signal.signal(signal.SIGTERM, on_sig)
+    signal.signal(signal.SIGINT, on_sig)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    env = dict(os.environ)
+    env["PATH"] = env.get("PATH", "") + ":" + os.path.expanduser("~/.local/bin")  # fallback: default claude install dir
+    env["VIGIA_HEARTBEAT"] = paths["hooks"]
+    env["VIGIA_RUN"] = a.name
+    env["VIGIA_PROTECT_TESTS"] = "1" if a.protect_tests else "0"
+
+    ev_f = open(paths["events"], "ab")
+    er_f = open(paths["stderr"], "ab")
+    try:
+        proc = subprocess.Popen(a.cmd, stdin=subprocess.DEVNULL, stdout=ev_f, stderr=er_f,
+                                cwd=a.cwd, env=env, start_new_session=True)
+    except Exception as e:
+        st.update(state="failed", ended_at=V.agora_iso(), exit_code=127, summary=f"could not start: {e}")
+        salvar()
+        return st
+    ev_f.close(); er_f.close()
+    pgid = proc.pid
+    pstat = V.proc_stat(proc.pid) or {}
+    st.update(pid=proc.pid, pgid=pgid, pid_start=pstat.get("start"))
+    salvar()
+
+    an = Analisador(a)
+    seg_ev, seg_hk = Seguidor(paths["events"]), Seguidor(paths["hooks"])
+    t0 = time.monotonic()
+    ultimo_vida = time.monotonic()
+    st["last_event_at"] = V.agora_iso()
+    tam_ant = (0, 0, 0)
+    cpu_ant = None
+    ultimo_save = 0
+    motivo = None  # stalled|timeout|loop|killed
+    rc = None
+
+    while True:
+        # reaper (we are a subreaper): reap zombies, keep the main child's exit code
+        while True:
+            try:
+                p, s = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if p == 0:
+                break
+            if p == proc.pid:
+                rc = os.waitstatus_to_exitcode(s)
+        for ln in seg_ev.novas():
+            an.linha(ln, "events")
+        for ln in seg_hk.novas():
+            an.linha(ln, "hooks")
+        an.codex_conciliar()
+
+        tams = (seg_ev.tamanho(), seg_hk.tamanho(), os.path.getsize(paths["stderr"]) if os.path.exists(paths["stderr"]) else 0)
+        vivos, procs = V.membros(pgid, [proc.pid])
+        cpu = sum(procs[p]["cpu"] for p in vivos if p in procs)
+        cresceu = tams != tam_ant
+        trabalhando = cpu_ant is not None and (cpu - cpu_ant) >= CPU_TICKS_ATIVO
+        if cresceu:
+            st["last_event_at"] = V.agora_iso()
+        if cresceu or trabalhando:
+            ultimo_vida = time.monotonic()
+        tam_ant, cpu_ant = tams, cpu
+
+        st["stats"] = {"turns": an.turnos, "tool_calls": an.chamadas, "files_edited": len(an.arquivos),
+                       "bytes_events": tams[0], "bytes_hooks": tams[1], "bytes_stderr": tams[2],
+                       "cpu_sec": round(cpu / os.sysconf("SC_CLK_TCK"), 1), "processes": len(vivos),
+                       "idle_sec": int(time.monotonic() - ultimo_vida)}
+        st["session_id"] = an.session_id
+        st["alerts"] = an.alertas
+
+        if rc is not None:
+            break
+        if termo["sinal"]:
+            motivo = "killed"; st["summary"] = f"received signal {termo['sinal']} (vigia-stop?)"
+        elif an.loop:
+            motivo = "loop"; st["loop_reason"] = an.loop; st["summary"] = "loop: " + an.loop
+        elif time.monotonic() - t0 > a.max_min * 60:
+            motivo = "timeout"; st["summary"] = f"exceeded {a.max_min:g} min of wall-clock time"
+        elif time.monotonic() - ultimo_vida > a.stall_min * 60:
+            motivo = "stalled"; st["summary"] = f"no new bytes and no CPU for {a.stall_min:g} min"
+        if motivo:
+            break
+        if time.monotonic() - ultimo_save > 15 or cresceu:
+            salvar(); ultimo_save = time.monotonic()
+        time.sleep(POLL)
+
+    if motivo:
+        congelar_evidencia(paths, pgid, proc.pid, st)
+        st["kill"] = matar_grupo(pgid, proc.pid)
+        rc = st["kill"].pop("main_rc", None)
+        if rc is None:
+            try:
+                p, s = os.waitpid(proc.pid, 0)
+                rc = os.waitstatus_to_exitcode(s)
+            except ChildProcessError:
+                pass
+        st["state"] = motivo
+    else:
+        # finished on its own; read the remaining events
+        for ln in seg_ev.novas() + ([seg_ev.buf] if seg_ev.buf else []):
+            an.linha(ln, "events")
+        for ln in seg_hk.novas():
+            an.linha(ln, "hooks")
+        an.codex_conciliar(fim=True)
+        st["alerts"] = an.alertas
+        st["stats"].update(turns=an.turnos, tool_calls=an.chamadas, files_edited=len(an.arquivos))
+        # anything left in the group (background server etc.)? kill it and record it
+        vivos, _ = V.membros(pgid, [proc.pid])
+        if vivos:
+            st["kill"] = matar_grupo(pgid, proc.pid)
+            st["kill"].pop("main_rc", None)
+            st["kill"]["reason"] = "leftovers after the command ended"
+        else:
+            st["kill"] = verificar(pgid, proc.pid)
+        if rc == 0:
+            st["state"] = "done"
+        elif rc is not None and rc < 0:
+            st["state"] = "killed"
+            st["summary"] = f"command killed by signal {-rc} (outside Vigia)"
+        else:
+            st["state"] = "failed"
+        if an.resultado and an.resultado.get("is_error") and st["state"] == "done":
+            st["state"] = "failed"
+    st["exit_code"] = rc
+    st["ended_at"] = V.agora_iso()
+    st["duration_sec"] = int(time.monotonic() - t0)
+    if an.resultado:
+        r = an.resultado
+        st["result"] = {k: r.get(k) for k in ("subtype", "is_error", "num_turns", "total_cost_usd", "duration_ms") if k in r}
+    if not st["summary"]:
+        base = an.ultima_msg or an.ultimo_erro or ""
+        if not base:
+            try:
+                with open(paths["stderr"], errors="replace") as f:
+                    base = f.read()[-300:]
+            except OSError:
+                pass
+        st["summary"] = re.sub(r"\s+", " ", str(base)).strip()[:300]
+    if st["alerts"]:
+        st["summary"] = (st["summary"] + " | ALERT: " + "; ".join(st["alerts"][:3]))[:500]
+    st["summary"] = re.sub(r"\s+", " ", st["summary"] or "").strip()[:500]
+    salvar()
+    return st
+
+
+def verificar(pgid, pid):
+    out = subprocess.run(["pgrep", "-g", str(pgid)], capture_output=True, text=True)
+    vivos, _ = V.membros(pgid, [pid])
+    return {"pgrep_g": out.stdout.split(), "pgrep_rc": out.returncode, "survivors": sorted(vivos),
+            "ok": out.returncode == 1 and not vivos, "verified_at": V.agora_iso()}
+
+
+def matar_grupo(pgid, pid):
+    log = {"term_at": V.agora_iso(), "kill_sent": False}
+    vivos, _ = V.membros(pgid, [pid])
+    log["targets"] = sorted(vivos)
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    for p in vivos:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    fim = time.monotonic() + KILL_GRACE
+    while time.monotonic() < fim:
+        _colher(excluir=pid)
+        vivos, _ = V.membros(pgid, [pid])
+        if not vivos:
+            break
+        time.sleep(0.5)
+    if vivos:
+        log["kill_sent"] = True
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for p in vivos:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(1)
+    _colher(excluir=pid)
+    # reap the main child here (keeping its exit code) so its zombie does not show up in pgrep
+    for _ in range(20):
+        try:
+            p, s = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if p == pid:
+            log["main_rc"] = os.waitstatus_to_exitcode(s)
+            break
+        time.sleep(0.25)
+    time.sleep(0.3)
+    log.update(verificar(pgid, pid))
+    return log
+
+
+def _colher(excluir=None):
+    # reap orphaned zombies, but leave the main child to the waitpid that collects its exit code
+    for p, s in list(V.todos_procs().items()):
+        if s["state"] == "Z" and s["ppid"] == os.getpid() and p != excluir:
+            try:
+                os.waitpid(p, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+
+def congelar_evidencia(paths, pgid, pid, st):
+    d = paths["evidence"]
+    os.makedirs(d, exist_ok=True)
+    def tail(src, dst, n=200_000):
+        try:
+            with open(src, "rb") as f:
+                f.seek(0, 2); tam = f.tell(); f.seek(max(0, tam - n))
+                data = f.read()
+            with open(os.path.join(d, dst), "wb") as g:
+                g.write(data)
+        except OSError:
+            pass
+    tail(paths["events"], "events.tail.jsonl")
+    tail(paths["stderr"], "stderr.tail.log")
+    tail(paths["hooks"], "hooks.tail.jsonl")
+    vivos, procs = V.membros(pgid, [pid])
+    ps = subprocess.run(["ps", "-o", "pid,ppid,pgid,sid,stat,etime,time,args", "--forest", "-p",
+                         ",".join(map(str, sorted(vivos))) or str(pid)], capture_output=True, text=True).stdout
+    with open(os.path.join(d, "ps.txt"), "w") as f:
+        f.write(f"# captured at {V.agora_iso()} pgid={pgid}\n{ps}")
+    V.escrever_json_atomico(os.path.join(d, "status-at-capture.json"), st)
+
+
+# ======================= main / detach =======================
+
+def main():
+    a = parse()
+    exe = a.cmd[0]
+    path_busca = os.environ.get("PATH", "") + ":" + os.path.expanduser("~/.local/bin")
+    if not (os.path.isabs(exe) and os.access(exe, os.X_OK)) and not shutil.which(exe, path=path_busca):
+        erro(f"command not found: {exe}", 5)
+    runs = os.path.join(a.task_dir, "runs")
+    os.makedirs(runs, exist_ok=True)
+    b = os.path.join(runs, a.name)
+    paths = {"status": b + ".status.json", "events": b + ".events.jsonl", "stderr": b + ".stderr.log",
+             "hooks": b + ".hooks.jsonl", "evidence": b + ".evidence", "supervisor_log": b + ".vigia.log"}
+    chave = V.h(a.task_dir, a.name)
+    entrada = os.path.join(V.ATIVOS, f"{a.name}-{chave}.json")
+
+    with V.Trava():
+        V.limpar_mortos()
+        ativos = V.entradas_ativas()
+        if os.path.exists(paths["status"]) or os.path.exists(entrada):
+            erro(f"a run named '{a.name}' already exists in {runs} (status: {paths['status']}). Use another --name.", 4)
+        if len(ativos) >= V.MAX_ATIVOS:
+            nomes = ", ".join(e.get("name", "?") for e in ativos)
+            erro(f"cap of {V.MAX_ATIVOS} active supervised runs reached ({nomes}). "
+                 f"Wait for one to finish or stop one with vigia-stop.", 3)
+        for k in ("events", "stderr", "hooks"):
+            open(paths[k], "a").close()
+
+        if a.foreground:
+            sup_pid = os.getpid()
+            V.escrever_json_atomico(entrada, _entrada(a, paths, chave, sup_pid))
+        else:
+            r, w = os.pipe()
+            pid1 = os.fork()
+            if pid1 == 0:
+                os.close(r)
+                os.setsid()
+                if os.fork() > 0:
+                    os._exit(0)
+                # grandchild: the detached supervisor
+                os.write(w, str(os.getpid()).encode()); os.close(w)
+                devnull = os.open(os.devnull, os.O_RDWR)
+                log = os.open(paths["supervisor_log"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                os.dup2(devnull, 0); os.dup2(log, 1); os.dup2(log, 2)
+                # close inherited fds (including the lock's)
+                os.closerange(3, 1024)
+                os.chdir("/")
+                rodar_supervisor(a, paths, chave, entrada)
+                os._exit(0)
+            os.close(w)
+            os.waitpid(pid1, 0)
+            sup_pid = int(os.read(r, 32).decode() or 0)
+            os.close(r)
+            V.escrever_json_atomico(entrada, _entrada(a, paths, chave, sup_pid))
+
+    if a.foreground:
+        st = rodar_supervisor(a, paths, chave, entrada)
+        print(json.dumps({"name": a.name, "state": st["state"], "status_path": paths["status"]}, ensure_ascii=False))
+        return
+    # wait for the supervisor to record the command's pid (up to 10s) so we can return something useful
+    st = None
+    for _ in range(100):
+        st = V.ler_json(paths["status"])
+        if st and st.get("pid"):
+            break
+        time.sleep(0.1)
+    print(json.dumps({"name": a.name, "tool": a.tool, "state": (st or {}).get("state", "starting"),
+                      "supervisor_pid": sup_pid, "pid": (st or {}).get("pid"), "pgid": (st or {}).get("pgid"),
+                      "status_path": paths["status"], "events_path": paths["events"]}, ensure_ascii=False))
+
+
+def _entrada(a, paths, chave, sup_pid):
+    s = V.proc_stat(sup_pid) or {}
+    return {"name": a.name, "key": chave, "tool": a.tool, "task_dir": a.task_dir,
+            "status_path": paths["status"], "supervisor_pid": sup_pid, "supervisor_start": s.get("start"),
+            "registered_at": V.agora_iso()}
+
+
+def rodar_supervisor(a, paths, chave, entrada):
+    st = None
+    try:
+        st = supervisionar(a, paths, chave)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        st = V.ler_json(paths["status"]) or {"name": a.name, "tool": a.tool, "task_dir": a.task_dir, "paths": paths}
+        if st.get("pgid"):
+            st["kill"] = matar_grupo(st["pgid"], st.get("pid"))
+        st.update(state="failed", ended_at=V.agora_iso(), summary=f"internal Vigia error: {e}")
+        V.escrever_json_atomico(paths["status"], st)
+    finally:
+        with V.Trava():
+            try:
+                os.unlink(entrada)
+            except FileNotFoundError:
+                pass
+    try:
+        subprocess.run([os.path.join(V.BIN, "vigia-notify"), paths["status"]], timeout=90,
+                       stdin=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"vigia-notify failed: {e}", file=sys.stderr)
+    return st
+
+
+if __name__ == "__main__":
+    main()

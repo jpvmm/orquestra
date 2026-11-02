@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""vigia-status [-n 15] [--json]
+Shows active runs (registry in $VIGIA_BASE/active/) and the most recent finished ones ($VIGIA_BASE/events.jsonl)."""
+import argparse, json, os, sys
+from datetime import datetime
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vigia_lib as V
+
+
+def dur(a, b=None):
+    try:
+        t0 = datetime.fromisoformat(a)
+        t1 = datetime.fromisoformat(b) if b else V.agora()
+        s = int((t1 - t0).total_seconds())
+        return f"{s // 60}m{s % 60:02d}s"
+    except Exception:
+        return "-"
+
+
+def main():
+    p = argparse.ArgumentParser(prog="vigia-status")
+    p.add_argument("-n", type=int, default=15, help="how many recent finished runs to show")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args()
+    with V.Trava():
+        V.limpar_mortos()
+        ativos = V.entradas_ativas()
+    linhas, vistos = [], set()
+    for e in ativos:
+        st = V.ler_json(e["status_path"]) or {}
+        st.setdefault("name", e.get("name")); st.setdefault("tool", e.get("tool"))
+        st["_active"] = True; st["_status_path"] = e["status_path"]
+        linhas.append(st); vistos.add(e["status_path"])
+    recentes = []
+    if os.path.exists(V.EVENTOS):
+        with open(V.EVENTOS) as f:
+            for ln in f:
+                try:
+                    recentes.append(json.loads(ln))
+                except Exception:
+                    pass
+    for ev in reversed(recentes):
+        if len([l for l in linhas if not l.get("_active")]) >= a.n:
+            break
+        sp = ev.get("status_path")
+        if sp in vistos:
+            continue
+        vistos.add(sp)
+        st = V.ler_json(sp) or {"name": ev.get("run"), "tool": ev.get("tool"), "state": ev.get("state"),
+                                 "summary": ev.get("summary"), "ended_at": ev.get("ended_at")}
+        st["_status_path"] = sp
+        linhas.append(st)
+    if a.json:
+        print(json.dumps(linhas, ensure_ascii=False, indent=2)); return
+    print(f"Vigia -- {len(ativos)}/{V.MAX_ATIVOS} active -- {V.agora_iso()}")
+    cab = f"{'NAME':<22} {'TOOL':<6} {'STATE':<8} {'START':<8} {'DURATION':>8} {'LAST.SEEN':>9} {'PID':>7}  SUMMARY"
+    print(cab); print("-" * len(cab))
+    for st in linhas:
+        ini = (st.get("started_at") or "")[11:19][:5] or "-"
+        ultimo = "-"
+        if st.get("state") == "running" and st.get("last_event_at"):
+            ultimo = dur(st["last_event_at"]) + " ago"
+        print(f"{str(st.get('name'))[:22]:<22} {str(st.get('tool'))[:6]:<6} {str(st.get('state'))[:8]:<8} {ini:<8} "
+              f"{dur(st.get('started_at'), st.get('ended_at')) if st.get('started_at') else '-':>8} {ultimo:>9} "
+              f"{str(st.get('pid') or '-'):>7}  {(st.get('summary') or '')[:70]}")
+
+
+if __name__ == "__main__":
+    main()

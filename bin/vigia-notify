@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""vigia-notify <status.json>
+Records the end of a run in $VIGIA_BASE/events.jsonl and, if $VIGIA_BASE/webhook.env exists,
+POSTs a small JSON payload to the webhook (e.g. a Grok Bot routine with a webhook trigger) to wake the orchestrator.
+Never prints the key. A missing webhook.env is not an error."""
+import json, os, sys, time, urllib.request, urllib.error
+from urllib.parse import urlsplit
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vigia_lib as V
+
+WEBHOOK_ENV = os.environ.get("VIGIA_WEBHOOK_ENV") or os.path.join(V.BASE, "webhook.env")
+LOG = os.path.join(V.BASE, "notify.log")
+
+
+def ler_env(path):
+    """Parse KEY=value lines. The file is never executed."""
+    out = {}
+    with open(path) as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            k, v = ln.split("=", 1)
+            k = k.strip().removeprefix("export ").strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1]
+            out[k] = v
+    return out
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{V.agora_iso()} {msg}\n")
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("usage: vigia-notify <status.json>", file=sys.stderr)
+        return 2
+    sp = os.path.abspath(sys.argv[1])
+    st = V.ler_json(sp) or {}
+    paths = st.get("paths") or {}
+    ev = paths.get("evidence")
+    payload = {
+        "run": st.get("name"), "tool": st.get("tool"), "state": st.get("state"),
+        "exit_code": st.get("exit_code"), "summary": (st.get("summary") or "")[:500],
+        "task_dir": st.get("task_dir"), "status_path": sp,
+        "evidence_path": ev if ev and os.path.isdir(ev) else None,
+    }
+    V.append_jsonl(V.EVENTOS, {"ts": V.agora_iso(), **payload, "ended_at": st.get("ended_at"),
+                               "kill_ok": (st.get("kill") or {}).get("ok")})
+
+    if not os.path.exists(WEBHOOK_ENV):
+        return 0
+    try:
+        cfg = ler_env(WEBHOOK_ENV)
+    except Exception as e:
+        log(f"webhook.env unreadable: {type(e).__name__}")
+        return 1
+    url, chave = cfg.get("VIGIA_WEBHOOK_URL"), cfg.get("VIGIA_WEBHOOK_KEY", "")
+    if not url:
+        log("webhook.env has no VIGIA_WEBHOOK_URL; nothing sent")
+        return 1
+    header = cfg.get("VIGIA_WEBHOOK_HEADER", "Authorization")
+    valor = chave
+    if header.lower() == "authorization" and chave and not chave.lower().startswith("bearer "):
+        valor = "Bearer " + chave
+    host = urlsplit(url).netloc  # only the host is logged, never the full URL or the key
+    body = json.dumps(payload, ensure_ascii=False).encode()
+    esperas = [0, 2, 5, 15]
+    for tentativa, espera in enumerate(esperas, 1):
+        time.sleep(espera)
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json", "User-Agent": "vigia-notify/1"})
+        if chave:
+            req.add_header(header, valor)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                log(f"POST {host} run={payload['run']} state={payload['state']} -> HTTP {r.status} (attempt {tentativa})")
+                return 0
+        except urllib.error.HTTPError as e:
+            log(f"POST {host} run={payload['run']} -> HTTP {e.code} (attempt {tentativa})")
+            if e.code not in (408, 425, 429) and e.code < 500:
+                return 1  # other 4xx: wrong key/URL, retrying will not help
+        except Exception as e:
+            log(f"POST {host} run={payload['run']} -> {type(e).__name__} (attempt {tentativa})")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

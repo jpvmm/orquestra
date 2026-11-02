@@ -7,55 +7,55 @@ import hashlib, json, os, re, sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-TESTE_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*$|(^|/)[^/]*_test\.[^/]+$|\.spec\.[^/]+$|\.test\.[^/]+$|(^|/)conftest\.py$")
+TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*$|(^|/)[^/]*_test\.[^/]+$|\.spec\.[^/]+$|\.test\.[^/]+$|(^|/)conftest\.py$")
 EDIT = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 DENY_MSG = "Test file protected by Vigia: do not edit tests in this task."
 
 
-def agora_iso():
+def now_iso():
     tz = os.environ.get("VIGIA_TZ")
     d = datetime.now(ZoneInfo(tz)) if tz else datetime.now().astimezone()
     return d.isoformat(timespec="seconds")
 
 
 def main():
-    alvo = os.environ.get("VIGIA_HEARTBEAT")
+    target = os.environ.get("VIGIA_HEARTBEAT")
     try:
         ev = json.load(sys.stdin)
     except Exception:
         return 0
-    nome = ev.get("hook_event_name")
+    name = ev.get("hook_event_name")
     tool = ev.get("tool_name")
     inp = ev.get("tool_input") or {}
-    caminho = inp.get("file_path") or inp.get("notebook_path")
-    negar = (nome == "PreToolUse" and tool in EDIT and os.environ.get("VIGIA_PROTECT_TESTS") == "1"
-             and caminho and TESTE_RE.search(caminho))
-    if alvo:
-        linha = {"ts": agora_iso(), "hook_event_name": nome, "session_id": ev.get("session_id")}
+    file_path = inp.get("file_path") or inp.get("notebook_path")
+    deny = (name == "PreToolUse" and tool in EDIT and os.environ.get("VIGIA_PROTECT_TESTS") == "1"
+             and file_path and TEST_RE.search(file_path))
+    if target:
+        rec = {"ts": now_iso(), "hook_event_name": name, "session_id": ev.get("session_id")}
         if tool:
-            linha["tool_name"] = tool
-            linha["tool_input"] = {k: (str(v)[:500]) for k, v in inp.items()
+            rec["tool_name"] = tool
+            rec["tool_input"] = {k: (str(v)[:500]) for k, v in inp.items()
                                    if k in ("file_path", "notebook_path", "command", "pattern", "path", "url")}
             if tool in EDIT:
-                linha["edit_sig"] = hashlib.sha1(json.dumps(inp, sort_keys=True).encode()).hexdigest()[:16]
-        if nome == "PostToolUse" and tool == "Bash":
+                rec["edit_sig"] = hashlib.sha1(json.dumps(inp, sort_keys=True).encode()).hexdigest()[:16]
+        if name == "PostToolUse" and tool == "Bash":
             resp = ev.get("tool_response")
-            linha["output"] = (json.dumps(resp, ensure_ascii=False) if not isinstance(resp, str) else resp)[-1500:]
-        if nome in ("PostToolUseFailure", "StopFailure"):
-            linha["error"] = str(ev.get("error") or ev.get("error_message") or ev.get("tool_response") or "")[-1500:]
-            linha["matcher"] = ev.get("error_type") or ev.get("matcher")
-        if nome in ("Stop", "SubagentStop"):
-            linha["agent_type"] = ev.get("agent_type")
-            linha["last_message"] = str(ev.get("last_assistant_message") or "")[:300]
-        if negar:
-            linha["denied"] = True
-            linha["path"] = caminho
+            rec["output"] = (json.dumps(resp, ensure_ascii=False) if not isinstance(resp, str) else resp)[-1500:]
+        if name in ("PostToolUseFailure", "StopFailure"):
+            rec["error"] = str(ev.get("error") or ev.get("error_message") or ev.get("tool_response") or "")[-1500:]
+            rec["matcher"] = ev.get("error_type") or ev.get("matcher")
+        if name in ("Stop", "SubagentStop"):
+            rec["agent_type"] = ev.get("agent_type")
+            rec["last_message"] = str(ev.get("last_assistant_message") or "")[:300]
+        if deny:
+            rec["denied"] = True
+            rec["path"] = file_path
         try:
-            with open(alvo, "a") as f:
-                f.write(json.dumps(linha, ensure_ascii=False) + "\n")
+            with open(target, "a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:
             pass
-    if negar:
+    if deny:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                  "permissionDecisionReason": DENY_MSG}}))
     return 0

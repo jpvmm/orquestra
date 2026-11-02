@@ -6,14 +6,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vigia_lib as V
 if len(sys.argv) != 2:
     sys.exit("usage: vigia-stop <status.json>")
-st = V.ler_json(sys.argv[1]) or {}
+st = V.read_json(sys.argv[1]) or {}
 pid = st.get("supervisor_pid")
-if st.get("state") != "running" or not V.vivo(pid):
+if st.get("state") != "running" or not V.alive(pid):
     sys.exit(f"run is not running (state: {st.get('state')})")
 os.kill(pid, signal.SIGTERM)
 for _ in range(60):
     time.sleep(0.5)
-    st = V.ler_json(sys.argv[1]) or {}
+    st = V.read_json(sys.argv[1]) or {}
     if st.get("state") != "running":
         print(f"{st.get('name')}: {st.get('state')} -- process group verified clean: {(st.get('kill') or {}).get('ok')}")
         sys.exit(0)

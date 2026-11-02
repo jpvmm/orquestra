@@ -5,7 +5,6 @@ webhook.env
 
 # Vigia runtime state
 active/
-ativos/
 *.jsonl
 *.log
 runs/

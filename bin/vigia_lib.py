@@ -8,45 +8,45 @@ Configuration (environment variables):
   VIGIA_MAX_ACTIVE maximum number of concurrently supervised runs (default: 5)
   VIGIA_TZ         IANA time zone for timestamps, e.g. "Europe/Lisbon" (default: system local time)
 """
-import json, os, re, fcntl, time, hashlib
+import json, os, re, fcntl, hashlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 BIN = os.path.dirname(os.path.abspath(__file__))
 
 
-def _home_padrao():
+def _default_home():
     # an install made by install.sh drops a marker next to bin/, so the installed copy finds its own home
-    pai = os.path.dirname(BIN)
-    return pai if os.path.exists(os.path.join(pai, ".orquestra-home")) else "~/.orquestra"
+    parent = os.path.dirname(BIN)
+    return parent if os.path.exists(os.path.join(parent, ".orquestra-home")) else "~/.orquestra"
 
 
-HOME = os.path.expanduser(os.environ.get("ORQUESTRA_HOME") or _home_padrao())
+HOME = os.path.expanduser(os.environ.get("ORQUESTRA_HOME") or _default_home())
 BASE = os.path.expanduser(os.environ.get("VIGIA_BASE") or os.path.join(HOME, "vigia"))
-ATIVOS = os.path.join(BASE, "active")
-EVENTOS = os.path.join(BASE, "events.jsonl")
-MAX_ATIVOS = int(os.environ.get("VIGIA_MAX_ACTIVE", "5"))
+ACTIVE_DIR = os.path.join(BASE, "active")
+EVENTS_FILE = os.path.join(BASE, "events.jsonl")
+MAX_ACTIVE = int(os.environ.get("VIGIA_MAX_ACTIVE", "5"))
 TZ = ZoneInfo(os.environ["VIGIA_TZ"]) if os.environ.get("VIGIA_TZ") else None
-TERMINAIS = ("done", "failed", "stalled", "timeout", "loop", "killed")
+FINAL_STATES = ("done", "failed", "stalled", "timeout", "loop", "killed")
 
 
-def agora():
+def now_local():
     """Timezone-aware 'now' (VIGIA_TZ if set, otherwise the system local zone)."""
     return datetime.now(TZ) if TZ else datetime.now().astimezone()
 
 
-def agora_iso():
-    return agora().isoformat(timespec="seconds")
+def now_iso():
+    return now_local().isoformat(timespec="seconds")
 
 
-def iso_de(ts):
+def iso_from(ts):
     if not ts:
         return None
     d = datetime.fromtimestamp(ts, TZ) if TZ else datetime.fromtimestamp(ts).astimezone()
     return d.isoformat(timespec="seconds")
 
 
-def escrever_json_atomico(path, obj):
+def write_json_atomic(path, obj):
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
@@ -54,7 +54,7 @@ def escrever_json_atomico(path, obj):
     os.replace(tmp, path)
 
 
-def ler_json(path):
+def read_json(path):
     try:
         with open(path) as f:
             return json.load(f)
@@ -95,7 +95,7 @@ def proc_stat(pid):
     }
 
 
-def todos_procs():
+def all_procs():
     out = {}
     for d in os.listdir("/proc"):
         if d.isdigit():
@@ -105,7 +105,7 @@ def todos_procs():
     return out
 
 
-def vivo(pid, start=None):
+def alive(pid, start=None):
     """Process exists (not a zombie) and, if given, has the same start time (guards against PID reuse)."""
     if not pid:
         return False
@@ -115,35 +115,35 @@ def vivo(pid, start=None):
     return start is None or s["start"] == start
 
 
-def membros(pgid, raiz_pids=(), procs=None):
+def members(pgid, root_pids=(), procs=None):
     """Live PIDs in process group pgid plus descendants of the root PIDs (even if they left the group)."""
-    procs = procs or todos_procs()
+    procs = procs or all_procs()
     sel = {p for p, s in procs.items() if s["pgid"] == pgid and s["state"] not in ("Z", "X")}
-    filhos = {}
+    children = {}
     for p, s in procs.items():
-        filhos.setdefault(s["ppid"], []).append(p)
-    pilha = list(raiz_pids) + list(sel)
-    vistos = set()
-    while pilha:
-        p = pilha.pop()
-        if p in vistos:
+        children.setdefault(s["ppid"], []).append(p)
+    stack = list(root_pids) + list(sel)
+    seen = set()
+    while stack:
+        p = stack.pop()
+        if p in seen:
             continue
-        vistos.add(p)
-        for c in filhos.get(p, []):
+        seen.add(p)
+        for c in children.get(p, []):
             if procs[c]["state"] not in ("Z", "X"):
                 sel.add(c)
-            pilha.append(c)
+            stack.append(c)
     return sel, procs
 
 
 # ---------- registry of active runs ----------
 
-class Trava:
+class Lock:
     """Exclusive flock on the active-runs registry."""
 
     def __init__(self):
-        os.makedirs(ATIVOS, exist_ok=True)
-        self.f = open(os.path.join(ATIVOS, ".lock"), "a+")
+        os.makedirs(ACTIVE_DIR, exist_ok=True)
+        self.f = open(os.path.join(ACTIVE_DIR, ".lock"), "a+")
 
     def __enter__(self):
         fcntl.flock(self.f, fcntl.LOCK_EX)
@@ -154,45 +154,45 @@ class Trava:
         self.f.close()
 
 
-def entradas_ativas():
+def active_entries():
     out = []
-    for n in sorted(os.listdir(ATIVOS)):
+    for n in sorted(os.listdir(ACTIVE_DIR)):
         if n.endswith(".json"):
-            e = ler_json(os.path.join(ATIVOS, n))
+            e = read_json(os.path.join(ACTIVE_DIR, n))
             if e:
-                e["_file"] = os.path.join(ATIVOS, n)
+                e["_file"] = os.path.join(ACTIVE_DIR, n)
                 out.append(e)
     return out
 
 
-def limpar_mortos():
+def cleanup_dead():
     """Remove registry entries whose supervisor died. If the supervised command is still
     alive (supervisor was killed hard), kill its group and mark the status as killed.
-    Call while holding Trava. Returns the list of cleaned keys."""
-    limpos = []
-    for e in entradas_ativas():
-        if vivo(e.get("supervisor_pid"), e.get("supervisor_start")):
+    Call while holding Lock. Returns the list of cleaned keys."""
+    cleaned = []
+    for e in active_entries():
+        if alive(e.get("supervisor_pid"), e.get("supervisor_start")):
             continue
-        st = ler_json(e.get("status_path", "")) or {}
+        st = read_json(e.get("status_path", "")) or {}
         if st.get("state") == "running":
             import signal, subprocess, time as _t
             pgid = st.get("pgid")
-            restos = membros(pgid, [st["pid"]] if st.get("pid") else [])[0] if pgid else set()
-            for alvo in ([("g", pgid)] if pgid else []) + [("p", x) for x in restos]:
+            leftovers = members(pgid, [st["pid"]] if st.get("pid") else [])[0] if pgid else set()
+            for target in ([("g", pgid)] if pgid else []) + [("p", x) for x in leftovers]:
                 try:
-                    (os.killpg if alvo[0] == "g" else os.kill)(alvo[1], signal.SIGKILL)
+                    (os.killpg if target[0] == "g" else os.kill)(target[1], signal.SIGKILL)
                 except Exception:
                     pass
             _t.sleep(0.5)
             pg = subprocess.run(["pgrep", "-g", str(pgid)], capture_output=True, text=True) if pgid else None
-            st["kill"] = {"targets": sorted(restos), "kill_sent": bool(restos),
+            st["kill"] = {"targets": sorted(leftovers), "kill_sent": bool(leftovers),
                           "pgrep_g": pg.stdout.split() if pg else [], "ok": (pg is None or pg.returncode == 1),
-                          "verified_at": agora_iso(), "reason": "supervisor died; registry cleanup"}
+                          "verified_at": now_iso(), "reason": "supervisor died; registry cleanup"}
             st["state"] = "killed"
-            st["ended_at"] = agora_iso()
+            st["ended_at"] = now_iso()
             st["summary"] = "supervisor died; registry cleanup killed what was left of the group"
             try:
-                escrever_json_atomico(e["status_path"], st)
+                write_json_atomic(e["status_path"], st)
                 subprocess.Popen([os.path.join(BIN, "vigia-notify"), e["status_path"]], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             except Exception:
@@ -201,49 +201,49 @@ def limpar_mortos():
             os.unlink(e["_file"])
         except FileNotFoundError:
             pass
-        limpos.append(e.get("key"))
-    return limpos
+        cleaned.append(e.get("key"))
+    return cleaned
 
 
 # ---------- patterns ----------
 
-TESTE_RE = re.compile(
+TEST_RE = re.compile(
     r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*$|(^|/)[^/]*_test\.[^/]+$|\.spec\.[^/]+$|\.test\.[^/]+$|(^|/)conftest\.py$"
 )
-CMD_TESTE_RE = re.compile(
+TEST_CMD_RE = re.compile(
     r"\b(pytest|py\.test|python3? -m (pytest|unittest)|nose2|tox|jest|vitest|mocha|go test|cargo test|"
     r"(npm|pnpm|yarn|bun)( run)? test|make (test|check)|phpunit|rspec|ctest|mvn test|gradle\w* test|deno test)\b"
 )
-ESCRITA_SHELL_RE = re.compile(
+SHELL_WRITE_RE = re.compile(
     r"(?:>>?|\btee(?:\s+-a)?)\s*['\"]?([^\s;|&'\"]+)|\b(?:sed\s+-i\S*|perl\s+-p?i\S*|rm(?:\s+-\S+)*|mv|cp|truncate(?:\s+-\S+)*|"
     r"git\s+(?:checkout|restore)(?:\s+--)?)\s+((?:[^\s;|&]+\s*)+)"
 )
-ALERTA_RE = re.compile(
+ALERT_RE = re.compile(
     r"rate.?limit|usage limit|too many requests|\b429\b|quota|authentication_failed|invalid api key|not logged in|"
     r"please run /login|unauthorized|\b401\b|oauth token|login required|credit balance",
     re.I,
 )
 
 
-def eh_teste(path):
-    return bool(path) and bool(TESTE_RE.search(str(path)))
+def is_test(path):
+    return bool(path) and bool(TEST_RE.search(str(path)))
 
 
-def escritas_em_teste_por_shell(cmd):
+def shell_test_writes(cmd):
     """Heuristic: test-file paths that a shell command appears to write or delete."""
-    achados = []
-    for m in ESCRITA_SHELL_RE.finditer(cmd or ""):
-        alvo = m.group(1) or m.group(2) or ""
-        for tok in alvo.split():
+    found = []
+    for m in SHELL_WRITE_RE.finditer(cmd or ""):
+        target = m.group(1) or m.group(2) or ""
+        for tok in target.split():
             tok = tok.strip("'\"")
             if tok.startswith("-") or tok == "/dev/null":
                 continue
-            if eh_teste(tok):
-                achados.append(tok)
-    return achados
+            if is_test(tok):
+                found.append(tok)
+    return found
 
 
-def normalizar(txt, n=400):
+def normalize(txt, n=400):
     t = str(txt or "").lower()
     t = re.sub(r"0x[0-9a-f]+|[0-9a-f]{8,}", "<h>", t)
     t = re.sub(r"\d+(\.\d+)?", "#", t)
@@ -252,5 +252,5 @@ def normalizar(txt, n=400):
     return t[-n:]
 
 
-def h(*partes):
-    return hashlib.sha1("\x1f".join(map(str, partes)).encode()).hexdigest()[:16]
+def h(*parts):
+    return hashlib.sha1("\x1f".join(map(str, parts)).encode()).hexdigest()[:16]

@@ -7,61 +7,61 @@ import hashlib, json, os, re, sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vigia_lib import eh_teste, agora_iso
+from vigia_lib import is_test, now_iso
 
 PATCH_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$", re.M)
 DENY_MSG = "Test file protected by Vigia: do not edit tests in this task."
 
 
-def arquivos_do_patch(txt):
+def patch_files(txt):
     return [(m.group(1) or m.group(2)).strip() for m in PATCH_RE.finditer(txt or "")]
 
 
 def main():
-    alvo = os.environ.get("VIGIA_HEARTBEAT")
+    target = os.environ.get("VIGIA_HEARTBEAT")
     try:
         ev = json.load(sys.stdin)
     except Exception:
         return 0
-    nome = ev.get("hook_event_name")
+    name = ev.get("hook_event_name")
     tool = ev.get("tool_name")
     inp = ev.get("tool_input")
     inp = inp if isinstance(inp, dict) else {"value": inp}
     patch = tool == "apply_patch"
-    arquivos = arquivos_do_patch(inp.get("command")) if patch else []
-    testes = [p for p in arquivos if eh_teste(p)]
-    negar = nome == "PreToolUse" and patch and os.environ.get("VIGIA_PROTECT_TESTS") == "1" and testes
-    if alvo:
-        linha = {"ts": agora_iso(), "hook_event_name": nome, "session_id": ev.get("session_id"), "origin": "codex"}
+    files = patch_files(inp.get("command")) if patch else []
+    tests = [p for p in files if is_test(p)]
+    deny = name == "PreToolUse" and patch and os.environ.get("VIGIA_PROTECT_TESTS") == "1" and tests
+    if target:
+        rec = {"ts": now_iso(), "hook_event_name": name, "session_id": ev.get("session_id"), "origin": "codex"}
         if ev.get("turn_id"):
-            linha["turn_id"] = ev["turn_id"]
+            rec["turn_id"] = ev["turn_id"]
         if tool:
-            linha["tool_name"] = tool
-            linha["tool_use_id"] = ev.get("tool_use_id")
+            rec["tool_name"] = tool
+            rec["tool_use_id"] = ev.get("tool_use_id")
             if patch:
-                linha["files"] = arquivos[:50]
-                linha["edit_sig"] = hashlib.sha1(str(inp.get("command")).encode()).hexdigest()[:16]
+                rec["files"] = files[:50]
+                rec["edit_sig"] = hashlib.sha1(str(inp.get("command")).encode()).hexdigest()[:16]
             else:
-                linha["tool_input"] = {k: str(v)[:500] for k, v in inp.items()
+                rec["tool_input"] = {k: str(v)[:500] for k, v in inp.items()
                                        if k in ("command", "file_path", "path", "pattern", "url", "query")}
-        if nome == "PostToolUse" and tool in ("Bash", "apply_patch"):
+        if name == "PostToolUse" and tool in ("Bash", "apply_patch"):
             resp = ev.get("tool_response")
-            linha["output"] = (resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False))[-1500:]
-        if nome == "SessionStart":
-            linha["source"] = ev.get("source")
-            linha["model"] = ev.get("model")
-        if nome in ("Stop", "SubagentStop"):
-            linha["agent_type"] = ev.get("agent_type")
-            linha["last_message"] = str(ev.get("last_assistant_message") or "")[:300]
-        if negar:
-            linha["denied"] = True
-            linha["path"] = testes[0]
+            rec["output"] = (resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False))[-1500:]
+        if name == "SessionStart":
+            rec["source"] = ev.get("source")
+            rec["model"] = ev.get("model")
+        if name in ("Stop", "SubagentStop"):
+            rec["agent_type"] = ev.get("agent_type")
+            rec["last_message"] = str(ev.get("last_assistant_message") or "")[:300]
+        if deny:
+            rec["denied"] = True
+            rec["path"] = tests[0]
         try:
-            with open(alvo, "a") as f:
-                f.write(json.dumps(linha, ensure_ascii=False) + "\n")
+            with open(target, "a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:
             pass
-    if negar:
+    if deny:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                  "permissionDecisionReason": DENY_MSG}}))
     return 0

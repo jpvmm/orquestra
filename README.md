@@ -146,6 +146,10 @@ Final states: `done`, `failed`, `stalled`, `timeout`, `loop`, `killed`.
 4. Ask for work: "Add rate limiting to the API in ~/src/myproject". The bot plans, launches runs under Vigia,
    tells you when to expect news, and picks up when the routine wakes it.
 
+**Automatic setup in Grok Bot:** give your bot the skill in [`skills/orquestra-setup/SKILL.md`](skills/orquestra-setup/SKILL.md)
+and ask "install Orquestra". It installs everything, creates the Vigia routine, asks you only for logins and the
+webhook URL/key (through a masked field), and tests the wake-up.
+
 **In any other agent** (Claude Code itself, a custom agent, another assistant): use the prompt as the system
 prompt. Replace the "routine named Vigia" part with whatever your platform offers for webhook-triggered runs,
 or drop it and have the agent run `vigia-status` at the time it promised.
@@ -161,6 +165,7 @@ bin/            vigia-run, vigia-status, vigia-stop, vigia-notify, hooks, vigia_
                 claude-hooks.json.template
 docs/vigia.md   full Vigia reference
 prompts/        orquestra.md (the bot instructions)
+skills/         orquestra-setup/SKILL.md (self-install skill for Grok Bot)
 install.sh      installer (into $ORQUESTRA_HOME, default ~/.orquestra)
 webhook.env.example
 ```

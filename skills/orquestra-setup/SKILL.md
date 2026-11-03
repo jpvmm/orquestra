@@ -22,7 +22,17 @@ command -v claude || ls ~/.local/bin/claude; command -v codex || ls ~/.local/bin
 if [ -d ~/src/orquestra/.git ]; then git -C ~/src/orquestra pull --ff-only; else git clone https://github.com/jpvmm/orquestra.git ~/src/orquestra; fi
 ~/src/orquestra/install.sh
 ```
-Confirm `~/.orquestra/bin/vigia-run` exists.
+Confirm `~/.orquestra/bin/vigia-run` and `~/.orquestra/fleet/bin/fleet-run` exist.
+
+Smoke-test the fleet without launching anything (a temp git repo, `--dry-run`):
+```bash
+d=$(mktemp -d) && git -C "$d" init -q && echo 'x = 1' > "$d/a.py" && git -C "$d" add . && git -C "$d" -c user.name=t -c user.email=t@t commit -qm base
+mkdir -p "$d/T" && echo 'Smoke test.' > "$d/T/plan.md" && echo '{"criteria":[{"id":"C1","command":"true"}]}' > "$d/T/criteria.json"
+echo '{"tasks":[{"id":"1","files":["a.py"]}]}' > "$d/T/tasks.json"
+VIGIA_WEBHOOK_ENV="" ~/.orquestra/fleet/bin/fleet-run --task-dir "$d/T" --complexity M --lead claude --task smoke --repo "$d" --dry-run
+rm -rf "$d"
+```
+It must print JSON with `"dry_run": true` and a `vigia-run` command.
 
 ## 3. Make sure the CLIs are logged in
 Test each installed CLI with a trivial, cheap call:
@@ -36,7 +46,9 @@ If one says it is not logged in: **USER** — the login is theirs. Start the CLI
 On the bot that will run the work (usually yourself), create a routine with a **webhook** trigger (read the `routines` skill first):
 - name: `Vigia`
 - trigger: `{ "type": "webhook" }`
-- prompt: "A Vigia run finished. Read the JSON received (run, state, exit_code, summary) and its status_path, then continue the task according to your Orquestra rules: verify the result, launch the next step or tell the user."
+- prompt: the text after `---` in `~/.orquestra/vigia-routine.md` (relay rules + the fleet addendum).
+
+One routine per bot: by default every run notifies `~/.orquestra/vigia/webhook.env`. To send a run's notifications to a different bot, launch it with `VIGIA_WEBHOOK_ENV=/abs/path/other-webhook.env` (stored per run; `""` mutes it), or for the fleet `FLEET_WEBHOOK_ENV=/abs/path/other-webhook.env fleet-run ...`. Codex sub-runs of a fleet lead are muted unless `FLEET_NOTIFY_SUBRUNS=1`.
 
 ## 5. Connect the webhook
 **USER**: the URL and key appear only in the routine's panel. Tell the user, in one short message: open the bot's info pane (click the bot's name in the chat header), open the **Vigia** routine, and copy its webhook URL and key. Then request each value with a masked secret request (never in plain chat):
@@ -54,13 +66,13 @@ Never cat, echo or log this file.
 ```bash
 ~/.orquestra/bin/vigia-run --tool other --task-dir ~/.orquestra/setup-test --name wake-test --max-min 1 -- sh -c 'echo hi; exit 1'
 ```
-Wait about 30 s, then check `~/.orquestra/vigia/notify.log` for an HTTP 2xx and that the Vigia routine woke you. If it fails, recheck the URL/key (step 5) and retry once. Delete `~/.orquestra/setup-test` afterwards.
+Wait about 30 s, then check `~/.orquestra/vigia/notify.log` for an HTTP 2xx and that the Vigia routine woke you (`started` is only recorded, not sent; the `finished` notification is what wakes you). If it fails, recheck the URL/key (step 5) and retry once. Delete `~/.orquestra/setup-test` afterwards.
 
 ## 7. Give the bot its rules
 The working rules are in `~/.orquestra/orquestra.md` (the part after `---`).
 - If the user wants a dedicated bot, offer to create one named "Orquestra" with that text as its instructions, then do steps 4–6 on that bot instead of yourself.
 - Otherwise, follow those rules yourself when the user asks for software work.
-Keep the prompt's hard stops: no merge, deploy, publishing or spending without the user's OK in chat.
+The prompt is autonomous: the bot commits, pushes, opens PRs, merges and deploys itself after its own check. Keep its hard stops: never spend money or send external messages for the user, never force-push or rewrite main, never delete repos/branches/data it did not create, never touch secrets, `~/.ssh` or `~/.claude`. If the user wants an approval gate, apply the one-sentence change described in the prompt's header.
 
 ## 8. Report
-Tell the user in two or three sentences: what's installed, which CLIs work, that the Vigia test woke the bot, and how to start ("ask for a coding task in a repo"). Mention that Codex runs use `--dangerously-bypass-hook-trust` for Vigia's per-run hooks (`VIGIA_CODEX_HOOKS=0` turns it off).
+Tell the user in two or three sentences: what's installed (Vigia + fleet), which CLIs work, that the Vigia test woke the bot, and how to start ("ask for a coding task in a repo"). Mention that Codex runs use `--dangerously-bypass-hook-trust` for Vigia's per-run hooks (`VIGIA_CODEX_HOOKS=0` turns it off).

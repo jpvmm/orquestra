@@ -7,8 +7,11 @@ Configuration (environment variables):
   VIGIA_BASE       Vigia state folder: registry, event log, webhook config (default: $ORQUESTRA_HOME/vigia)
   VIGIA_MAX_ACTIVE maximum number of concurrently supervised runs (default: 5)
   VIGIA_TZ         IANA time zone for timestamps, e.g. "Europe/Lisbon" (default: system local time)
+  VIGIA_HB_STALE_SEC    watchdog: a running run whose status.json (heartbeat) is older than this is suspect (default: 180)
+  VIGIA_WD_GRACE_SEC    watchdog: grace after the wall-clock --max-min before alerting (default: 120)
+  VIGIA_WD_RECHECK_SEC  watchdog: awake seconds to wait for a fresh heartbeat before acting (default: 20)
 """
-import json, os, re, fcntl, hashlib
+import contextlib, json, os, re, fcntl, time, hashlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -27,7 +30,11 @@ ACTIVE_DIR = os.path.join(BASE, "active")
 EVENTS_FILE = os.path.join(BASE, "events.jsonl")
 MAX_ACTIVE = int(os.environ.get("VIGIA_MAX_ACTIVE", "5"))
 TZ = ZoneInfo(os.environ["VIGIA_TZ"]) if os.environ.get("VIGIA_TZ") else None
-FINAL_STATES = ("done", "failed", "stalled", "timeout", "loop", "killed")
+FINAL_STATES = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete")
+# watchdog (watch_active): heartbeat = mtime of status.json (the supervisor touches it every poll)
+HB_STALE = float(os.environ.get("VIGIA_HB_STALE_SEC", "180"))
+WD_GRACE = float(os.environ.get("VIGIA_WD_GRACE_SEC", "120"))
+WD_RECHECK = float(os.environ.get("VIGIA_WD_RECHECK_SEC", "20"))
 
 
 def now_local():
@@ -193,7 +200,9 @@ def cleanup_dead():
             st["summary"] = "supervisor died; registry cleanup killed what was left of the group"
             try:
                 write_json_atomic(e["status_path"], st)
-                subprocess.Popen([os.path.join(BIN, "vigia-notify"), e["status_path"]], stdin=subprocess.DEVNULL,
+                subprocess.Popen([os.path.join(BIN, "vigia-notify"), e["status_path"], "--event", "finished",
+                                  "--state", "killed", "--prev", "running",
+                                  "--detail", "supervisor died; registry cleanup"], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             except Exception:
                 pass
@@ -203,6 +212,190 @@ def cleanup_dead():
             pass
         cleaned.append(e.get("key"))
     return cleaned
+
+
+@contextlib.contextmanager
+def run_lock(sp, wait=None):
+    """Per-run flock (<status>.lock) shared by the supervisor (save) and the watchdog. wait=None blocks; otherwise
+    tries for 'wait' seconds and yields False on failure (a stopped supervisor holding the lock: the watchdog retries later)."""
+    fd = os.open(sp + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        ok = False
+        if wait is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            ok = True
+        else:
+            end = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    ok = True
+                    break
+                except OSError:
+                    if time.monotonic() >= end:
+                        break
+                    time.sleep(0.1)
+        yield ok
+    finally:
+        os.close(fd)
+
+
+def _notify_cmd(sp, event, state, prev, detail=None):
+    cmd = [os.path.join(BIN, "vigia-notify"), sp, "--event", event, "--state", state, "--prev", prev]
+    if detail:
+        cmd += ["--detail", detail]
+    return cmd
+
+
+def _notify_bg(sp, event, state, prev, detail=None):
+    import subprocess
+    try:
+        subprocess.Popen(_notify_cmd(sp, event, state, prev, detail), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def _notify(sp, event, state, prev, detail=None, timeout=30):
+    """Synchronous (keeps ordering: detected before finished)."""
+    import subprocess
+    try:
+        subprocess.run(_notify_cmd(sp, event, state, prev, detail), stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+    except Exception:
+        pass
+
+
+def _valid_targets(pgid, pid, pid_start):
+    """Live members of the run's group, without killing a stranger after PID reuse: if the run's pid exists with a
+    different start time (zombie or not), it is no longer ours (nor its children) and, if it was the group leader
+    (pgid == pid), neither is the group. A zombie leader with the same start time is still ours (its group and
+    children remain targets)."""
+    s = proc_stat(int(pid)) if pid else None
+    reused = s is not None and pid_start is not None and s["start"] != pid_start
+    if reused and pgid == pid:
+        return None, set()
+    sel = members(pgid, [pid] if s is not None and not reused else [])[0] if pgid else set()
+    return pgid, sel
+
+
+def _kill_pg(pgid, pid, pid_start=None):
+    """SIGTERM then SIGKILL the run's group (revalidated before each signal). Returns a kill report."""
+    import signal, subprocess
+    g, leftovers = _valid_targets(pgid, pid, pid_start)
+    targets0 = sorted(leftovers)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        g, leftovers = _valid_targets(pgid, pid, pid_start)  # revalidate before each signal
+        for target in ([("g", g)] if g and leftovers else []) + [("p", x) for x in leftovers]:
+            try:
+                (os.killpg if target[0] == "g" else os.kill)(target[1], sig)
+            except Exception:
+                pass
+        end = time.monotonic() + 5
+        while time.monotonic() < end and _valid_targets(pgid, pid, pid_start)[1]:
+            time.sleep(0.25)
+    pg = subprocess.run(["pgrep", "-g", str(pgid)], capture_output=True, text=True) if pgid else None
+    survivors = sorted(_valid_targets(pgid, pid, pid_start)[1])  # no zombies: the (stopped) supervisor reaps them
+    return {"targets": targets0, "kill_sent": bool(targets0), "pgrep_g": pg.stdout.split() if pg else [],
+            "survivors": survivors, "ok": not survivors, "verified_at": now_iso()}
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def watch_active():
+    """Check independent of the supervisor (vigia-status and vigia-run call it, without Lock; may wait up to
+    WD_RECHECK s). For a 'running' run whose supervisor is alive:
+      - heartbeat (status.json mtime) older than HB_STALE s, confirmed after re-reading for up to WD_RECHECK s
+        (the box may have just resumed from suspension: a healthy supervisor updates within seconds) => the
+        supervisor is not watching: notify 'alert' once; if it is also past the wall-clock max-min or stall-min,
+        kill the group, mark timeout/stalled and notify detected + finished;
+      - heartbeat ok but past the wall-clock max-min + WD_GRACE => the supervisor did not enforce the cap: 'alert'.
+    Events are deduplicated by <run>.notified.json (fixed detail). Returns [(name, action)]."""
+    now = time.time()
+    suspects = []
+    for e in active_entries():
+        if not alive(e.get("supervisor_pid"), e.get("supervisor_start")):
+            continue  # dead supervisor: cleanup_dead handles it
+        sp = e.get("status_path", "")
+        st = read_json(sp) or {}
+        if st.get("state") != "running" or not st.get("started_at"):
+            continue
+        try:
+            hb = os.path.getmtime(sp)
+            dur = now - datetime.fromisoformat(st["started_at"]).timestamp()
+        except Exception:
+            continue
+        mx = float((st.get("limits") or {}).get("max_min") or 0)
+        if now - hb > HB_STALE or (mx and dur > mx * 60 + WD_GRACE):
+            suspects.append((e, sp, hb))
+    if not suspects:
+        return []
+    # recheck for WD_RECHECK s of AWAKE time (monotonic): if the box pauses midway the deadline does not run, and a
+    # healthy supervisor (touches status.json every poll) has time to show a heartbeat after resuming.
+    w0, m0 = time.time(), time.monotonic()
+    while time.monotonic() - m0 < WD_RECHECK:
+        if all(_mtime(sp) != hb for _e, sp, hb in suspects):
+            break
+        time.sleep(1)
+    if (time.time() - w0) - (time.monotonic() - m0) > 30:
+        return []  # the box was suspended during the recheck: decide on the next call
+    done = []
+    for e, sp, hb in suspects:
+        st = read_json(sp) or {}
+        if st.get("state") != "running":
+            continue
+        now = time.time()
+        hb2 = _mtime(sp)
+        lim = st.get("limits") or {}
+        mx, sm = float(lim.get("max_min") or 0), float(lim.get("stall_min") or 0)
+        dur = now - datetime.fromisoformat(st["started_at"]).timestamp()
+        stale = now - hb2 if hb2 == hb else 0
+        name = st.get("name") or e.get("name")
+        if stale > HB_STALE:
+            _notify_bg(sp, "alert", "running", "running",
+                       f"watchdog: supervisor has no heartbeat (status.json unchanged > {HB_STALE:g} s)")
+            reason = "timeout" if mx and dur > mx * 60 else ("stalled" if sm and stale > sm * 60 else None)
+            if not reason:
+                done.append((name, "alert:no-heartbeat"))
+                continue
+            summary = (f"watchdog: past {mx:g} min of wall clock and the supervisor was not watching" if reason == "timeout"
+                       else f"watchdog: supervisor without heartbeat for {int(stale // 60)} min (> stall {sm:g} min)")
+            # claim the run under its lock: the supervisor only saves status under the same lock and honors the mark;
+            # a second watchdog sees the mark and gives up. Final state + mark BEFORE the kill.
+            with run_lock(sp, wait=5) as ok:
+                if not ok:
+                    continue
+                st = read_json(sp) or {}
+                if st.get("state") != "running" or st.get("watchdog") or _mtime(sp) != hb:
+                    continue  # the supervisor came back, or another watchdog took over
+                st.update(stopping=st.get("stopping") or {"reason": reason, "detail": summary, "at": now_iso()},
+                          watchdog=summary, state=reason, ended_at=now_iso(), summary=summary)
+                write_json_atomic(sp, st)
+            sto = st["stopping"]
+            if sto.get("reason") == reason and sto.get("detail") == summary:
+                det = f"{reason}: watchdog (supervisor without heartbeat)"
+            else:  # the supervisor had already detected it: same detail => vigia-notify dedups if it was already sent
+                det = f"{sto.get('reason')}: {sto.get('detail')}"
+            _notify(sp, "detected", "running", "running", det)
+            st["kill"] = dict(_kill_pg(st.get("pgid"), st.get("pid"), st.get("pid_start")),
+                              reason="watchdog: supervisor without heartbeat")
+            write_json_atomic(sp, st)
+            try:
+                os.unlink(e["_file"])
+            except OSError:
+                pass
+            _notify_bg(sp, "finished", reason, "running", "watchdog")
+            done.append((name, reason))
+        elif mx and dur > mx * 60 + WD_GRACE:
+            _notify_bg(sp, "alert", "running", "running",
+                       f"watchdog: past {mx:g} min of wall clock and the supervisor did not stop it (old supervisor?)")
+            done.append((name, "alert:cap"))
+    return done
 
 
 # ---------- patterns ----------
@@ -223,6 +416,10 @@ ALERT_RE = re.compile(
     r"please run /login|unauthorized|\b401\b|oauth token|login required|credit balance",
     re.I,
 )
+
+# agent stderr: this pattern always applies; ALERT_RE only on Claude's stderr (Codex echoes the whole conversation: noise)
+STDERR_ALERT_RE = re.compile(r"Background tasks still running", re.I)
+LEAD_RE = re.compile(r"fleet-.+-lead-.+")  # fleet lead: must leave T/FINAL-SUMMARY.md
 
 
 def is_test(path):

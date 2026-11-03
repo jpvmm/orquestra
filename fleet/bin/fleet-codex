@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""fleet-codex — runs a fleet role in Codex UNDER the Vigia and (by default) waits for the end.
+
+Called by codex-reviewer / codex-dev (or directly: fleet-codex reviewer|dev ...). Each call is 1 supervised
+run and COUNTS toward the Vigia cap of 5. If the cap is full (vigia-run exits 3), it waits for a slot.
+
+  codex-reviewer --task-dir T --name rev-1-r1 --prompt-file F --output S [--cwd WT] [--model M]
+  codex-dev      --task-dir T --name dev-1    --prompt-file F --output S --cwd WT [--model M]
+  options: --no-wait (launch only), --wait-max SEC (default 540: fits a 10-min Bash call), --max-min MIN
+reviewer: read-only sandbox (only reads; the reply goes to the --output file via codex's own -o).
+dev:      workspace-write sandbox in --cwd (the task worktree) + --add-dir T (to write the report).
+          No network (Codex sandbox): tests that open sockets fail there; the lead runs those.
+Default model: fleet.json → roles.<role>.model (or gpt-6.1-sol).
+VIGIA_BIN: default the bin/ next to this fleet/ folder ($ORQUESTRA_HOME/bin once installed).
+Webhook: sub-runs are MUTED by default (VIGIA_WEBHOOK_ENV="") — the lead's run is what wakes Orquestra.
+FLEET_NOTIFY_SUBRUNS=1 lets them notify. Output: JSON with state, output, status_path, conversation_path."""
+import argparse, json, os, subprocess, sys, time
+
+FLEET = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+VIGIA_BIN = os.path.expanduser(os.environ.get("VIGIA_BIN") or os.path.join(os.path.dirname(FLEET), "bin"))
+TERMINAL = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete")
+
+
+def default_model(td, role):
+    try:
+        with open(os.path.join(td, "fleet.json")) as f:
+            fj = json.load(f)
+        m = fj.get("roles", {}).get(role, {})
+        if m.get("tool", "codex") == "codex" and m.get("model"):
+            return m["model"]
+    except (OSError, ValueError):
+        pass
+    return "gpt-6.1-sol"
+
+
+def wait(status_path, maximum):
+    end = time.time() + maximum
+    st = {}
+    while True:
+        try:
+            with open(status_path) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            pass
+        if st.get("state") in TERMINAL or time.time() >= end:
+            return st
+        time.sleep(5)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="fleet-codex")
+    p.add_argument("role", choices=["reviewer", "dev", "final_reviewer", "security"])
+    p.add_argument("--task-dir", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--prompt-file", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--cwd")
+    p.add_argument("--model")
+    p.add_argument("--task", default=None)
+    p.add_argument("--max-min", type=float, default=30)
+    p.add_argument("--no-wait", action="store_true")
+    p.add_argument("--wait-max", type=float, default=540)
+    p.add_argument("--slot-wait", type=float, default=900, help="seconds waiting for a free slot under the Vigia cap")
+    a = p.parse_args()
+    td = os.path.abspath(a.task_dir)
+    cwd = os.path.abspath(a.cwd or td)
+    model = a.model or default_model(td, a.role)
+    with open(a.prompt_file) as f:
+        prompt = f.read()
+    output = os.path.abspath(a.output)
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    writes = a.role == "dev"
+    cmd = ["codex", "exec", "--json", "-m", model, "-C", cwd,
+           "-s", "workspace-write" if writes else "read-only", "-o", output]
+    if writes:
+        cmd += ["--add-dir", td]
+    cmd += [prompt]
+    env = dict(os.environ)
+    if os.environ.get("FLEET_NOTIFY_SUBRUNS") != "1":
+        env["VIGIA_WEBHOOK_ENV"] = ""
+    env["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + env.get("PATH", "")
+    vr = [os.path.join(VIGIA_BIN, "vigia-run"), "--tool", "codex", "--task-dir", td, "--name", a.name,
+          "--cwd", cwd, "--max-min", str(a.max_min), "--task", a.task or f"fleet {a.role} {a.name}"]
+    if writes:
+        vr += ["--max-files", "30"]
+    vr += ["--"] + cmd
+    limit = time.time() + a.slot_wait
+    while True:
+        r = subprocess.run(vr, capture_output=True, text=True, env=env)
+        if r.returncode == 3 and time.time() < limit:  # cap of 5 runs is full: wait for a slot
+            time.sleep(30); continue
+        break
+    if r.returncode != 0:
+        print(json.dumps({"state": "not_launched", "code": r.returncode, "error": (r.stderr or r.stdout)[-800:]}, ensure_ascii=False))
+        sys.exit(r.returncode)
+    info = json.loads(r.stdout)
+    out = {"name": a.name, "model": model, "output": output, "status_path": info["status_path"],
+           "conversation_path": info["conversation_path"], "state": "running"}
+    if not a.no_wait:
+        st = wait(info["status_path"], a.wait_max)
+        out["state"] = st.get("state", "running")
+        out["summary"] = (st.get("summary") or "")[:300]
+        if out["state"] == "running":
+            out["hint"] = f"still running; run: fleet-wait {info['status_path']}"
+    print(json.dumps(out, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

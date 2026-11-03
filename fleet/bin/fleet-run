@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""fleet-run — launches the fleet under the Vigia for a task folder prepared by Orquestra.
+
+  fleet-run --task-dir T --complexity P|M|G --lead claude|codex --task "desc" [--repo R]
+            [--security auto|yes|no] [--stage dev|review] [--max-min N] [--budget-usd X] [--dry-run]
+
+Input in T: plan.md, criteria.json (every criterion has a "command"), tasks.json (required for M/G).
+Does: validates the input → writes T/fleet.json (role → tool/model, max_parallel) → creates the integration
+(fleet-wt init) → generates T/.fleet/agents.json from fleet/.claude/agents/*.md (passed via --agents; the target
+repo is not touched) → launches through vigia-run.
+  M/G: 1 team-lead run (it coordinates everything; Orquestra sleeps until the finished/alert notice).
+  P:   --stage dev (default) launches the dev; when it finishes, run again with --stage review (cross reviewer).
+       In P, --lead is the DEV's tool; the reviewer is the other one.
+Values already in T/fleet.json["roles"] and "max_parallel" are kept (that is how you change models).
+Webhook: by default fleet-run does NOT set VIGIA_WEBHOOK_ENV, so the Vigia uses its default
+$VIGIA_BASE/webhook.env (Orquestra's own "Vigia" routine). Per-bot option: FLEET_WEBHOOK_ENV=/abs/path
+exports VIGIA_WEBHOOK_ENV=that file (another bot's webhook). An inherited VIGIA_WEBHOOK_ENV="" (empty) = muted (tests).
+Every Claude run it launches gets --disallowedTools for git commit/push/merge/rebase, gh and `rm -rf`: the fleet
+works with patches and never publishes; Orquestra commits after checking the integration.
+Paths: VIGIA_BIN (default: the bin/ next to this fleet/ folder, i.e. $ORQUESTRA_HOME/bin once installed),
+VIGIA_BASE (default $ORQUESTRA_HOME/vigia; ORQUESTRA_HOME defaults to this install, else ~/.orquestra).
+Output: JSON with name, status_path, conversation_path. Exit codes: 2 invalid input, 3 Vigia cap full,
+4 name in use, 5 command not found."""
+import argparse, json, os, re, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))          # .../fleet
+BIN = os.path.join(HERE, "bin")
+INSTALL = os.path.dirname(HERE)                                                # the folder that holds fleet/ and bin/
+VIGIA_BIN = os.path.expanduser(os.environ.get("VIGIA_BIN") or os.path.join(INSTALL, "bin"))
+ORQUESTRA_HOME = os.path.expanduser(os.environ.get("ORQUESTRA_HOME") or (
+    INSTALL if os.path.exists(os.path.join(INSTALL, ".orquestra-home")) else "~/.orquestra"))
+VIGIA_BASE = os.path.expanduser(os.environ.get("VIGIA_BASE") or os.path.join(ORQUESTRA_HOME, "vigia"))
+VIGIA_DEFAULT_WEBHOOK = os.path.join(VIGIA_BASE, "webhook.env")   # only documented; never read here
+# the fleet never publishes: Orquestra commits/pushes after checking the integration (see docs/fleet.md)
+DISALLOWED = ["Bash(git commit:*)", "Bash(git push:*)", "Bash(git merge:*)", "Bash(git rebase:*)", "Bash(gh:*)",
+              "Bash(rm -rf *)"]
+SKILL = os.path.join(HERE, "skill", "fleet-sdd", "SKILL.md")
+OTHER = {"claude": "codex", "codex": "claude"}
+MODELS = {"claude": {"top": "opus", "mid": "sonnet", "cheap": "haiku"},
+          "codex": {"top": "gpt-6-astra", "mid": "gpt-6.1-sol", "cheap": "gpt-6-luna"}}
+# security keywords (English plus a few Portuguese ones, for plans written in Portuguese)
+SEC_WORDS = re.compile(r"\b(auth|login|senha|password|token|segredo|secret|credential|credencia|oauth|jwt|cookie|session|sess[aã]o|"
+                       r"http|rede|network|socket|url|upload|user input|entrada do usu|input|sql|webhook|api key)", re.I)
+
+
+def fail(msg, code=2):
+    print(json.dumps({"error": msg}, ensure_ascii=False)); sys.exit(code)
+
+
+def read_json(p, default=None):
+    try:
+        with open(p) as f: return json.load(f)
+    except FileNotFoundError:
+        return default
+    except ValueError as e:
+        fail(f"{p}: invalid JSON: {e}")
+
+
+def default_roles(cx, lead):
+    dev_t = lead
+    rev_t = OTHER[dev_t]
+    r = {
+        "dev": {"tool": dev_t, "model": MODELS[dev_t]["mid"], "judgment_model": MODELS[dev_t]["top"]},
+        "reviewer": {"tool": rev_t, "model": MODELS[rev_t]["mid"]},
+        "final_reviewer": {"tool": rev_t, "model": MODELS[rev_t]["top"]},
+        "security": {"tool": "claude", "model": "opus", "enabled": False},
+    }
+    if cx != "P":
+        r = {"team-lead": {"tool": lead, "model": MODELS[lead]["top"]}, **r}
+    return r
+
+
+def build_agents(roles, dest):
+    """fleet/.claude/agents/*.md → JSON for --agents, with each role's model taken from fleet.json.
+    @FLEET_HOME@ in a prompt becomes this fleet folder (no install-time rendering needed)."""
+    mapping = {"dev": "dev", "reviewer-claude": "reviewer", "security": "security", "team-lead": "team-lead"}
+    out = {}
+    folder = os.path.join(HERE, ".claude", "agents")
+    for name in sorted(os.listdir(folder)):
+        if not name.endswith(".md"): continue
+        txt = open(os.path.join(folder, name)).read()
+        m = re.match(r"^---\n(.*?)\n---\n(.*)$", txt, re.S)
+        fm = dict(re.findall(r"^(\w+):\s*(.*)$", m.group(1), re.M))
+        ag = {"description": fm["description"], "prompt": m.group(2).strip().replace("@FLEET_HOME@", HERE),
+              "tools": [t.strip() for t in fm.get("tools", "").split(",") if t.strip()]}
+        if fm.get("model"): ag["model"] = fm["model"]
+        if fm.get("maxTurns"): ag["maxTurns"] = int(fm["maxTurns"])
+        rr = roles.get(mapping.get(fm["name"], ""), {})
+        if rr.get("tool") == "claude" and rr.get("model"):
+            ag["model"] = rr["model"]
+        out[fm["name"]] = ag
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+    return dest
+
+
+def vigia_run(args_vr, cmd, env, dry):
+    vr = [os.path.join(VIGIA_BIN, "vigia-run")] + args_vr + ["--"] + cmd
+    if dry:
+        return {"dry_run": True, "command": vr}
+    r = subprocess.run(vr, capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        fail(f"vigia-run exited {r.returncode}: {(r.stderr or r.stdout).strip()[-600:]}", r.returncode)
+    return json.loads(r.stdout)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="fleet-run")
+    ap.add_argument("--task-dir", required=True)
+    ap.add_argument("--complexity", required=True, choices=["P", "M", "G"])
+    ap.add_argument("--lead", required=True, choices=["claude", "codex"])
+    ap.add_argument("--task", required=True)
+    ap.add_argument("--repo")
+    ap.add_argument("--security", choices=["auto", "yes", "no"], default="auto")
+    ap.add_argument("--stage", choices=["dev", "review"], default="dev", help="P only")
+    ap.add_argument("--max-min", type=float)
+    ap.add_argument("--budget-usd", type=float, help="claude --max-budget-usd (lead or P dev)")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    T = os.path.abspath(a.task_dir)
+    cx = a.complexity
+
+    # 1. input
+    for f in ("plan.md", "criteria.json"):
+        if not os.path.isfile(os.path.join(T, f)): fail(f"missing {T}/{f}")
+    crit = read_json(os.path.join(T, "criteria.json"), {})
+    items = crit.get("criteria") or fail("criteria.json has no 'criteria'")
+    no_cmd = [c.get("id", "?") for c in items if not str(c.get("command", "")).strip()]
+    if no_cmd: fail(f"criterion without a proving command: {no_cmd}")
+    tasks = read_json(os.path.join(T, "tasks.json"))
+    if cx in ("M", "G"):
+        if not tasks: fail("M/G requires tasks.json (DAG: id, files, depends_on)")
+        r = subprocess.run([os.path.join(BIN, "fleet-wt"), "--task-dir", T, "waves"], capture_output=True, text=True)
+        if r.returncode != 0: fail(f"invalid DAG: {r.stdout.strip()}")
+        waves = json.loads(r.stdout)["waves"]
+    else:
+        waves = [["1"]]
+
+    # 2. fleet.json
+    fj = read_json(os.path.join(T, "fleet.json"), {}) or {}
+    repo = a.repo or fj.get("repo") or fail("pass --repo (target repository)")
+    repo = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo, capture_output=True, text=True).stdout.strip() or fail(f"{repo} is not a git repo")
+    roles = default_roles(cx, a.lead)
+    for k, v in (fj.get("roles") or {}).items():   # whatever was already written wins
+        if k in roles: roles[k].update(v)
+    text = open(os.path.join(T, "plan.md")).read() + json.dumps(tasks or {}, ensure_ascii=False)
+    sec = {"yes": True, "no": False}.get(a.security)
+    if sec is None:
+        sec = cx == "G" or any(t.get("security") for t in (tasks or {}).get("tasks", [])) or bool(SEC_WORDS.search(text))
+    roles["security"]["enabled"] = sec
+
+    env = dict(os.environ)
+    if os.environ.get("FLEET_WEBHOOK_ENV"):           # per-bot option: another bot's webhook file
+        env["VIGIA_WEBHOOK_ENV"] = os.environ["FLEET_WEBHOOK_ENV"]
+    webhook = env.get("VIGIA_WEBHOOK_ENV")             # None = Vigia default (Orquestra); "" = muted
+    fj.update(complexity=cx, lead=a.lead, task=a.task, repo=repo, roles=roles,
+              max_parallel=int(fj.get("max_parallel", 4)), waves=waves,
+              webhook_env=webhook if webhook is not None else f"(Vigia default: {VIGIA_DEFAULT_WEBHOOK})",
+              vigia_cap="5 active runs in total (all bots); the lead run counts 1; each Codex run counts 1; Claude subagents do not count",
+              updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    fj.setdefault("runs", [])
+
+    # 3. integration + agents
+    if not a.dry_run:
+        r = subprocess.run([os.path.join(BIN, "fleet-wt"), "--task-dir", T, "init", "--repo", repo], capture_output=True, text=True)
+        if r.returncode != 0: fail(f"fleet-wt init: {r.stderr.strip()}")
+        st = json.loads(r.stdout)
+        fj["base"], fj["integration"] = st["base"], st["integration"]
+    integ = fj.get("integration") or os.path.join(T, "wt", "integration")
+    agents = build_agents(roles, os.path.join(T, ".fleet", "agents.json"))
+
+    env["PATH"] = os.pathsep.join([BIN, os.path.expanduser("~/.local/bin"), env.get("PATH", "")])
+    env["PYTHONDONTWRITEBYTECODE"] = "1"   # no __pycache__ in worktrees (junk in patches)
+    env["BASH_DEFAULT_TIMEOUT_MS"] = env["BASH_MAX_TIMEOUT_MS"] = "600000"   # codex-* wait up to 9 min
+    hooks = os.path.join(VIGIA_BIN, "claude-hooks.json")
+    hhmmss = time.strftime("%H%M%S")
+    base_name = re.sub(r"[^a-zA-Z0-9_-]", "-", os.path.basename(T))[:40]
+    tools_rw = "Agent,Read,Edit,Write,Grep,Glob,Bash"
+
+    def claude_cmd(prompt, agent, model, turns, tools, extra_dirs):
+        c = ["claude", "-p", prompt, "--agent", agent, "--agents", agents, "--model", model,
+             "--max-turns", str(turns), "--output-format", "stream-json", "--verbose", "--settings", hooks,
+             "--allowedTools", tools, "--disallowedTools", *DISALLOWED]
+        for d in extra_dirs: c += ["--add-dir", d]
+        if a.budget_usd: c += ["--max-budget-usd", str(a.budget_usd)]
+        return c
+
+    if cx in ("M", "G"):
+        lead = roles["team-lead"]
+        name = f"fleet-{base_name}-lead-{hhmmss}"
+        prompt = (f"You are the fleet team-lead. Task folder T={T}. Task: {a.task}. Complexity {cx}. "
+                  f"First read {SKILL} and follow it strictly, headless (nobody answers; a doubt becomes a BLOCKED entry in T/progress.md). "
+                  f"Integration (your cwd): {integ}. Tools: {BIN}. Write files in English. "
+                  f"Dispatch every Agent/Bash call in the foreground (run_in_background: false) and wait for its result; a reply "
+                  f"without a tool call ENDS this headless session and kills pending subagents, so never reply with a status. "
+                  f"If T/progress.md exists you are RESUMING: skip tasks fleet-state.json lists as integrated. "
+                  f"Finish with T/FINAL-SUMMARY.md in the fixed format; that is your only final reply.")
+        mx = a.max_min or (120 if cx == "M" else 240)
+        vr = ["--tool", lead["tool"], "--task-dir", T, "--name", name, "--cwd", integ, "--task", a.task,
+              "--max-min", str(mx), "--stall-min", "20", "--max-files", "80"]
+        if lead["tool"] == "claude":
+            env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"   # headless: a background subagent dies when the turn ends
+            cmd = claude_cmd(prompt, "team-lead", lead["model"], 200 if cx == "M" else 400, tools_rw, [T, HERE])
+        else:  # EXPERIMENTAL: a Codex lead needs network/writes outside its sandbox to call claude/vigia-run
+            cmd = ["codex", "exec", "--json", "-m", lead["model"], "-C", integ, "-s", "workspace-write",
+                   "--add-dir", T, "--add-dir", VIGIA_BASE, "-c", "sandbox_workspace_write.network_access=true",
+                   "-o", os.path.join(T, "FINAL-SUMMARY.md"), prompt]
+        info = vigia_run(vr, cmd, env, a.dry_run)
+        run_role = "team-lead"
+    else:
+        dev = roles["dev"]
+        wt = os.path.join(T, "wt", "task-1")
+        if a.stage == "dev":
+            if not a.dry_run and not os.path.isdir(wt):
+                subprocess.run([os.path.join(BIN, "fleet-wt"), "--task-dir", T, "new", "1"], check=True, capture_output=True)
+            os.makedirs(os.path.join(T, "briefs"), exist_ok=True); os.makedirs(os.path.join(T, "reports"), exist_ok=True)
+            brief = os.path.join(T, ".fleet" if a.dry_run else "briefs", "task-1-brief.md")   # dry-run never overwrites the real brief
+            rep = os.path.join(T, "reports", "task-1-report.md")
+            template = open(os.path.join(HERE, "skill", "fleet-sdd", "brief-implementer.md")).read()
+            with open(brief, "w") as f:
+                f.write(f"<!-- generated by fleet-run (P) -->\nTask: {a.task}\nWorktree: {wt}\nReport: {rep}\n"
+                        f"Full plan: {T}/plan.md  Criteria: {T}/criteria.json  (read both)\n"
+                        f"Allowed files: the ones in the plan.\n\nFollow the format below (the {{...}} fields are in the plan):\n\n" + template)
+            name = f"fleet-{base_name}-dev-{hhmmss}"
+            prompt = f"Read and execute the brief {brief}. Work only in the worktree {wt}. Write the report to {rep}."
+            if dev["tool"] == "claude":
+                cmd = claude_cmd(prompt, "dev", dev["model"], 80, "Read,Edit,Write,Grep,Glob,Bash", [T])
+                info = vigia_run(["--tool", "claude", "--task-dir", T, "--name", name, "--cwd", wt, "--task", a.task,
+                                  "--max-min", str(a.max_min or 40), "--max-files", "30"], cmd, env, a.dry_run)
+            else:
+                env["FLEET_NOTIFY_SUBRUNS"] = "1"
+                cmd = [os.path.join(BIN, "codex-dev"), "--task-dir", T, "--name", name, "--cwd", wt, "--prompt-file", brief,
+                       "--output", rep, "--model", dev["model"], "--task", a.task, "--no-wait", "--max-min", str(a.max_min or 40)]
+                info = {"dry_run": True, "command": cmd} if a.dry_run else json.loads(subprocess.run(cmd, capture_output=True, text=True, env=env).stdout)
+            run_role = "dev"
+        else:
+            rev = roles["reviewer"]
+            pk = json.loads(subprocess.run([os.path.join(BIN, "fleet-wt"), "--task-dir", T, "package", "1"],
+                                           capture_output=True, text=True, check=True).stdout) if not a.dry_run else {"package": "?", "outside_declared": []}
+            brief = os.path.join(T, ".fleet" if a.dry_run else "briefs", "rev-1-r1.md")
+            out = os.path.join(T, "review", "task-1-r1.review.md")
+            template = open(os.path.join(HERE, "skill", "fleet-sdd", "brief-task-reviewer.md")).read()
+            with open(brief, "w") as f:
+                f.write(f"<!-- generated by fleet-run (P) -->\nPackage: {pk['package']}\nWorktree: {wt}\n"
+                        f"Dev report: {T}/reports/task-1-report.md\nPlan: {T}/plan.md  Criteria: {T}/criteria.json\n"
+                        + (f"Write the review to: {out}\n\n" if rev["tool"] == "claude" else
+                           "Read only (read-only sandbox): your final reply is saved automatically; do not try to write a file.\n\n")
+                        + template)
+            name = f"fleet-{base_name}-rev-{hhmmss}"
+            prompt = f"Read and execute the review brief {brief}. Only read; do not edit the repository."
+            if rev["tool"] == "claude":
+                cmd = claude_cmd(prompt, "reviewer-claude", rev["model"], 40, "Read,Grep,Glob,Bash,Write(//" + out.lstrip("/") + ")", [T])
+                info = vigia_run(["--tool", "claude", "--task-dir", T, "--name", name, "--cwd", wt, "--task", a.task,
+                                  "--max-min", str(a.max_min or 30)], cmd, env, a.dry_run)
+            else:
+                env["FLEET_NOTIFY_SUBRUNS"] = "1"
+                cmd = [os.path.join(BIN, "codex-reviewer"), "--task-dir", T, "--name", name, "--cwd", wt, "--prompt-file", brief,
+                       "--output", out, "--model", rev["model"], "--task", a.task, "--no-wait", "--max-min", str(a.max_min or 30)]
+                info = {"dry_run": True, "command": cmd} if a.dry_run else json.loads(subprocess.run(cmd, capture_output=True, text=True, env=env).stdout)
+            run_role = "reviewer"
+
+    fj["runs"].append({"role": run_role, "name": info.get("name"), "status_path": info.get("status_path"),
+                       "conversation_path": info.get("conversation_path"), "launched_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    if not a.dry_run:
+        with open(os.path.join(T, "fleet.json"), "w") as f:
+            json.dump(fj, f, indent=2, ensure_ascii=False)
+    print(json.dumps({"fleet_json": os.path.join(T, "fleet.json"), "role": run_role, "webhook_env": webhook, **info}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

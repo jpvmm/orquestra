@@ -1,0 +1,9 @@
+{
+  "suite": "python3 -m pytest -q",
+  "tasks": [
+    {"id": "1", "title": "add function", "files": ["calc.py", "test_calc.py"], "depends_on": [],
+     "text": "Implement add(a, b) in calc.py ...", "criteria": ["C1"], "judgment": false, "security": false},
+    {"id": "2", "title": "...", "files": ["other.py", "test_other.py"], "depends_on": [], "criteria": ["C2"]},
+    {"id": "3", "title": "uses 1 and 2", "files": ["app.py"], "depends_on": ["1", "2"], "criteria": ["C3"]}
+  ]
+}

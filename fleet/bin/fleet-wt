@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""fleet-wt — fleet worktrees, review packages and integration, WITHOUT commits.
+
+Why no commits: fleet-run launches every Claude run with `git commit`/`git merge`/`git push` disallowed
+(on purpose: committing belongs to the orchestrator after checking). So each task becomes a patch:
+a worktree's state is snapshotted as a git *tree* (temporary index + write-tree; creates no
+commit, does not touch the worktree's index or HEAD) and the difference between the start snapshot and the
+current snapshot is the task's diff. Integration applies the patches to the integration worktree with `git apply --3way`.
+
+Usage (always with --task-dir T):
+  fleet-wt init --repo R             creates T/wt/integration (detached at R's HEAD = BASE) and T/fleet-state.json
+  fleet-wt new ID                    creates T/wt/task-ID from the CURRENT integration state; prints the path
+  fleet-wt package ID [--label r1]   writes T/review/task-ID-r1.diff (stat + diff -U10) and T/patches/task-ID.patch
+                                     ID=final: whole integration against BASE (final review)
+  fleet-wt integrate ID              applies T/patches/task-ID.patch to the integration (exit 1 = conflict)
+  fleet-wt waves [--max N]           validates T/tasks.json (DAG) and prints the parallel waves
+  fleet-wt resolved ID               after resolving a conflict by hand in the integration: marks it resolved (git add)
+  fleet-wt state                     prints T/fleet-state.json
+Standard library only. Never commits, pushes, merges, resets or deletes a worktree."""
+import argparse, fcntl, json, os, subprocess, sys, tempfile, time
+
+# junk that never goes into a patch, even without a .gitignore in the repo
+EXCLUDE = [":(exclude).claude/worktrees", ":(exclude).superpowers", ":(exclude).fleet",
+           ":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.pytest_cache/**",
+           ":(exclude,glob)**/node_modules/**", ":(exclude,glob)**/.DS_Store"]
+
+
+def sh(args, cwd=None, env=None, check=True, input=None):
+    r = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, input=input)
+    if check and r.returncode != 0:
+        sys.exit(f"fleet-wt: failed: {' '.join(args)}\n{r.stderr.strip()}")
+    return r
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+class State:
+    def __init__(self, td):
+        self.path = os.path.join(td, "fleet-state.json")
+        self.lock = open(os.path.join(td, ".fleet-state.lock"), "a+")
+
+    def __enter__(self):
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        try:
+            with open(self.path) as f:
+                self.d = json.load(f)
+        except FileNotFoundError:
+            self.d = {}
+        return self.d
+
+    def __exit__(self, *exc):
+        if exc[0] is None:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.d, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        fcntl.flock(self.lock, fcntl.LOCK_UN)
+
+
+def snapshot(wt):
+    """Tree of the worktree's current state (includes untracked files, honors .gitignore). Does not touch the real index."""
+    with tempfile.TemporaryDirectory() as d:
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(d, "index"))
+        sh(["git", "read-tree", "HEAD"], cwd=wt, env=env)
+        sh(["git", "add", "-A", "--", "."] + EXCLUDE, cwd=wt, env=env)
+        return sh(["git", "write-tree"], cwd=wt, env=env).stdout.strip()
+
+
+def load(td):
+    with State(td) as d:
+        if not d:
+            sys.exit("fleet-wt: run `fleet-wt init --repo R` first")
+        return dict(d)
+
+
+def cmd_init(a):
+    td = a.task_dir
+    repo = sh(["git", "rev-parse", "--show-toplevel"], cwd=a.repo).stdout.strip()
+    with State(td) as d:
+        if d.get("integration") and os.path.isdir(d["integration"]):
+            print(json.dumps(d, indent=2, ensure_ascii=False)); return
+        base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        integ = os.path.join(td, "wt", "integration")
+        os.makedirs(os.path.dirname(integ), exist_ok=True)
+        sh(["git", "worktree", "add", "--detach", integ, base], cwd=repo)
+        d.update(repo=repo, base=base, base_tree=sh(["git", "rev-parse", base + "^{tree}"], cwd=repo).stdout.strip(),
+                 integration=integ, integrated=[], tasks={}, created_at=now())
+        print(json.dumps(d, indent=2, ensure_ascii=False))
+
+
+def integration_patch(d):
+    t = snapshot(d["integration"])
+    return sh(["git", "diff", "--binary", d["base_tree"], t], cwd=d["integration"]).stdout
+
+
+def cmd_new(a):
+    td, tid = a.task_dir, a.id
+    d = load(td)
+    wt = os.path.join(td, "wt", f"task-{tid}")
+    if os.path.isdir(wt):
+        sys.exit(f"fleet-wt: {wt} already exists (task already created; reuse the same worktree for fixes)")
+    sh(["git", "worktree", "add", "--detach", wt, d["base"]], cwd=d["repo"])
+    p = integration_patch(d)
+    if p.strip():
+        sh(["git", "apply", "--whitespace=nowarn", "-"], cwd=wt, input=p)
+    start = snapshot(wt)
+    with State(td) as e:
+        e["tasks"][tid] = {"worktree": wt, "start_tree": start, "created_at": now(),
+                           "integrated_at_start": list(e.get("integrated", []))}
+    print(wt)
+
+
+def write_package(cwd, frm, to, out, patch_out, title):
+    stat = sh(["git", "diff", "--stat", frm, to], cwd=cwd).stdout
+    names = sh(["git", "diff", "--name-status", frm, to], cwd=cwd).stdout
+    diff = sh(["git", "diff", "-U10", frm, to], cwd=cwd).stdout
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        f.write(f"# Review package: {title}\n\n(no commits: diff between git snapshots, from {frm[:10]} to {to[:10]})\n\n"
+                f"## Files\n{names}\n## Stat\n{stat}\n## Diff\n{diff}")
+    if patch_out:
+        os.makedirs(os.path.dirname(patch_out), exist_ok=True)
+        with open(patch_out, "w") as f:
+            f.write(sh(["git", "diff", "--binary", frm, to], cwd=cwd).stdout)
+    return [ln.split("\t")[-1] for ln in names.splitlines() if ln.strip()]
+
+
+def cmd_package(a):
+    td, tid = a.task_dir, a.id
+    d = load(td)
+    label = a.label or "r1"
+    if tid == "final":
+        frm, cwd = d["base_tree"], d["integration"]
+        out = os.path.join(td, "review", f"final-{label}.diff"); patch = None
+    else:
+        t = d["tasks"].get(tid) or sys.exit(f"fleet-wt: task {tid} not created (fleet-wt new {tid})")
+        frm, cwd = t["start_tree"], t["worktree"]
+        out = os.path.join(td, "review", f"task-{tid}-{label}.diff")
+        patch = os.path.join(td, "patches", f"task-{tid}.patch")
+    to = snapshot(cwd)
+    files = write_package(cwd, frm, to, out, patch, f"task {tid} ({label})")
+    outside = []
+    if tid != "final":
+        decl = set(declared(td, tid))
+        outside = [x for x in files if decl and x not in decl]
+    print(json.dumps({"package": out, "patch": patch, "files": files, "outside_declared": outside,
+                      "empty": not files}, ensure_ascii=False))
+
+
+def declared(td, tid):
+    try:
+        with open(os.path.join(td, "tasks.json")) as f:
+            tj = json.load(f)
+    except (OSError, ValueError):
+        return []
+    for t in tj.get("tasks", []):
+        if str(t.get("id")) == str(tid):
+            return t.get("files", [])
+    return []
+
+
+def cmd_integrate(a):
+    td, tid = a.task_dir, a.id
+    d = load(td)
+    patch = os.path.join(td, "patches", f"task-{tid}.patch")
+    if not os.path.exists(patch):
+        sys.exit(f"fleet-wt: {patch} does not exist (run fleet-wt package {tid} after a clean review)")
+    if tid in d.get("integrated", []):
+        print(json.dumps({"integrated": tid, "already": True})); return
+    # --3way implies --index: sync the integration index with the worktree first (git add is not a commit)
+    sh(["git", "add", "-A", "--", "."] + EXCLUDE, cwd=d["integration"])
+    if os.path.getsize(patch) == 0:
+        r = None
+    else:
+        r = sh(["git", "apply", "--3way", "--whitespace=nowarn", patch], cwd=d["integration"], check=False)
+    if r is not None and r.returncode != 0:
+        conflicts = sh(["git", "diff", "--name-only", "--diff-filter=U"], cwd=d["integration"], check=False).stdout.split()
+        print(json.dumps({"integrated": None, "conflict": True, "conflicted_files": conflicts,
+                          "output": (r.stdout + r.stderr)[-2000:]}, ensure_ascii=False))
+        sys.exit(1)
+    with State(td) as e:
+        e.setdefault("integrated", []).append(tid)
+        e["tasks"].setdefault(tid, {})["integrated_at"] = now()
+    print(json.dumps({"integrated": tid, "conflict": False}))
+
+
+def cmd_waves(a):
+    td = a.task_dir
+    with open(os.path.join(td, "tasks.json")) as f:
+        tj = json.load(f)
+    mx = a.max
+    if mx is None:
+        try:
+            with open(os.path.join(td, "fleet.json")) as f:
+                mx = int(json.load(f).get("max_parallel", 4))
+        except (OSError, ValueError):
+            mx = 4
+    ts = tj.get("tasks") or sys.exit("fleet-wt: tasks.json has no 'tasks'")
+    ids = [str(t["id"]) for t in ts]
+    errors = []
+    if len(set(ids)) != len(ids):
+        errors.append("duplicate ids")
+    by = {str(t["id"]): t for t in ts}
+    for t in ts:
+        for dep in t.get("depends_on", []):
+            if str(dep) not in by:
+                errors.append(f"{t['id']} depends on {dep}, which does not exist")
+        if not t.get("files"):
+            errors.append(f"{t['id']} has no 'files'")
+    done, waves = set(), []
+    while len(done) < len(ids) and not errors:
+        ready = [i for i in ids if i not in done and all(str(x) in done for x in by[i].get("depends_on", []))]
+        if not ready:
+            errors.append("dependency cycle: " + ", ".join(i for i in ids if i not in done)); break
+        wave, used = [], set()
+        for i in ready:  # same file never runs together; honor max_parallel
+            files = set(by[i].get("files", []))
+            if len(wave) < mx and not (files & used):
+                wave.append(i); used |= files
+        waves.append(wave); done |= set(wave)
+    print(json.dumps({"ok": not errors, "errors": errors, "max_parallel": mx, "waves": waves}, ensure_ascii=False))
+    sys.exit(0 if not errors else 1)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="fleet-wt")
+    p.add_argument("--task-dir", required=True)
+    s = p.add_subparsers(dest="cmd", required=True)
+    x = s.add_parser("init"); x.add_argument("--repo", required=True)
+    x = s.add_parser("new"); x.add_argument("id")
+    x = s.add_parser("package"); x.add_argument("id"); x.add_argument("--label")
+    x = s.add_parser("integrate"); x.add_argument("id")
+    x = s.add_parser("waves"); x.add_argument("--max", type=int)
+    s.add_parser("state"); x = s.add_parser("resolved"); x.add_argument("id")
+    a = p.parse_args()
+    a.task_dir = os.path.abspath(a.task_dir)
+    os.makedirs(a.task_dir, exist_ok=True)
+    if a.cmd == "state":
+        print(json.dumps(load(a.task_dir), indent=2, ensure_ascii=False)); return
+    if a.cmd == "resolved":
+        d = load(a.task_dir)
+        sh(["git", "add", "-A", "--", "."] + EXCLUDE, cwd=d["integration"])
+        if sh(["git", "diff", "--name-only", "--diff-filter=U"], cwd=d["integration"], check=False).stdout.strip():
+            sys.exit("fleet-wt: there is still a conflict")
+        if "<<<<<<<" in sh(["git", "diff", "--cached"], cwd=d["integration"]).stdout:
+            sys.exit("fleet-wt: there is still a <<<<<<< marker in the diff")
+        with State(a.task_dir) as e:
+            if a.id not in e.setdefault("integrated", []): e["integrated"].append(a.id)
+        print(json.dumps({"integrated": a.id, "resolved": True})); return
+    {"init": cmd_init, "new": cmd_new, "package": cmd_package, "integrate": cmd_integrate, "waves": cmd_waves}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

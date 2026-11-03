@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-03
+
 ### Added
 - **Fleet** (`fleet/`, `docs/fleet.md`): spec-to-code runner. `fleet-run` launches a headless Claude team lead (M/G)
   or a dev + cross-reviewer pair (P) under Vigia; `fleet-wt` handles worktrees, review packages, commit-free patches,
@@ -39,3 +41,6 @@ All notable changes to this project are documented here. The format is based on
   deleting what it did not create, and secrets. The header says how to restore the approval gate.
 - `install.sh` also installs the fleet into `$ORQUESTRA_HOME/fleet/` and `vigia-routine.md`; the setup skill
   smoke-tests the fleet with `fleet-run --dry-run` and documents per-bot webhooks.
+
+[Unreleased]: https://github.com/jpvmm/orquestra/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jpvmm/orquestra/releases/tag/v0.1.0

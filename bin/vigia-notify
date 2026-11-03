@@ -1,16 +1,39 @@
 #!/usr/bin/env python3
-"""vigia-notify <status.json>
-Records the end of a run in $VIGIA_BASE/events.jsonl and, if $VIGIA_BASE/webhook.env exists,
+"""vigia-notify <status.json> [--event started|alert|detected|finished] [--state S] [--prev S] [--detail TXT]
+Records a run state change in $VIGIA_BASE/events.jsonl and, if the run's webhook file exists,
 POSTs a small JSON payload to the webhook (e.g. a Grok Bot routine with a webhook trigger) to wake the orchestrator.
-Never prints the key. A missing webhook.env is not an error."""
-import json, os, sys, time, urllib.request, urllib.error
+vigia-run calls it on start (started), on each new alert (alert), when it detects a loop/stall/timeout/signal
+and is about to kill (detected), and at the end (finished). Without --event: 'finished' if the state is final
+(backward compatible). Each (run, event) is sent once (<run>.notified.json); 'finished' exactly once.
+Everything is redacted for secrets first. Never prints the key. A missing webhook.env is not an error.
+
+Per-run webhook (one bot per run): webhook_env_for(status) picks, in order, the "webhook_env" stored in
+status.json by vigia-run (VIGIA_WEBHOOK_ENV at launch), VIGIA_WEBHOOK_ENV of the caller, then
+$VIGIA_BASE/webhook.env. An empty value mutes the run (recorded in events.jsonl, no POST).
+'started' is only recorded, not POSTed (it would wake the bot for nothing), unless VIGIA_NOTIFY_STARTED=1."""
+import argparse, fcntl, json, os, sys, time, urllib.request, urllib.error
 from urllib.parse import urlsplit
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vigia_lib as V
+import vigia_comms as C
 
-WEBHOOK_ENV = os.environ.get("VIGIA_WEBHOOK_ENV") or os.path.join(V.BASE, "webhook.env")
+DEFAULT_WEBHOOK_ENV = os.path.join(V.BASE, "webhook.env")
+WEBHOOK_ENV = os.environ.get("VIGIA_WEBHOOK_ENV", DEFAULT_WEBHOOK_ENV)  # compat for code that imports the module
+
+
+def webhook_env_for(st):
+    """Which webhook file to use for this run (per-bot webhook).
+    1) "webhook_env" stored in status.json by vigia-run (VIGIA_WEBHOOK_ENV at launch);
+    2) VIGIA_WEBHOOK_ENV in the caller's environment; 3) default $VIGIA_BASE/webhook.env.
+    "" = this run sends no webhook (only recorded in events.jsonl)."""
+    v = (st or {}).get("webhook_env")
+    if v is None:
+        v = os.environ.get("VIGIA_WEBHOOK_ENV", DEFAULT_WEBHOOK_ENV)
+    return v.strip() if isinstance(v, str) else DEFAULT_WEBHOOK_ENV
+
+
 LOG = os.path.join(V.BASE, "notify.log")
 
 
@@ -37,27 +60,78 @@ def log(msg):
         f.write(f"{V.now_iso()} {msg}\n")
 
 
-def main():
-    if len(sys.argv) != 2:
-        print("usage: vigia-notify <status.json>", file=sys.stderr)
-        return 2
-    sp = os.path.abspath(sys.argv[1])
-    st = V.read_json(sp) or {}
+def already_sent(sp, key):
+    """Mark (run, key) as sent in <run>.notified.json. True if it was already marked."""
+    path = C.status_side_path(sp, ".notified.json")
+    try:
+        with open(path, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            try:
+                done = json.loads(f.read() or "[]")
+            except ValueError:
+                done = []
+            if key in done:
+                return True
+            done.append(key)
+            f.seek(0); f.truncate()
+            f.write(json.dumps(done))
+    except OSError:
+        pass
+    return False
+
+
+def build_payload(sp, st, a):
     paths = st.get("paths") or {}
     ev = paths.get("evidence")
-    payload = {
-        "run": st.get("name"), "tool": st.get("tool"), "state": st.get("state"),
-        "exit_code": st.get("exit_code"), "summary": (st.get("summary") or "")[:500],
+    state = a.state or st.get("state")
+    event = a.event or ("finished" if state in V.FINAL_STATES else "update")
+    prev = a.prev or ("running" if event == "finished" else None)
+    end = event == "finished"
+    pp = st.get("prompt_path") or paths.get("prompt")
+    cp = st.get("conversation_path") or paths.get("conversation")
+    return {
+        "event": event, "ts": V.now_iso(), "run": st.get("name"), "tool": st.get("tool"), "model": st.get("model"),
+        "task": st.get("task"), "previous_state": prev, "state": state,
+        "transition": f"{prev or '-'} -> {state}", "detail": a.detail,
+        "exit_code": st.get("exit_code") if end else None,
+        "summary": (st.get("summary") or "")[:500] if end or event == "detected" else None,
+        "prompt_preview": st.get("prompt_preview"),
+        "reply_preview": st.get("reply_preview"),
+        "prompt_path": pp if pp and os.path.exists(pp) else None,
+        "conversation_path": cp if cp and os.path.exists(cp) else None,
         "task_dir": st.get("task_dir"), "status_path": sp,
         "evidence_path": ev if ev and os.path.isdir(ev) else None,
     }
-    V.append_jsonl(V.EVENTS_FILE, {"ts": V.now_iso(), **payload, "ended_at": st.get("ended_at"),
-                               "kill_ok": (st.get("kill") or {}).get("ok")})
 
-    if not os.path.exists(WEBHOOK_ENV):
+
+def main():
+    p = argparse.ArgumentParser(prog="vigia-notify")
+    p.add_argument("status")
+    p.add_argument("--event", default=None)
+    p.add_argument("--state", default=None)
+    p.add_argument("--prev", default=None)
+    p.add_argument("--detail", default=None)
+    a = p.parse_args()
+    sp = os.path.abspath(a.status)
+    st = V.read_json(sp) or {}
+    payload = C.redact_obj(build_payload(sp, st, a))
+    dedupe_key = "finished" if payload["event"] == "finished" else \
+        f"{payload['event']}|{payload['previous_state']}|{payload['state']}|{V.h(payload.get('detail') or '')}"
+    if already_sent(sp, dedupe_key):
+        return 0
+    extra = {"ended_at": st.get("ended_at"), "kill_ok": (st.get("kill") or {}).get("ok")} if payload["event"] == "finished" \
+        else {"ended_at": None, "kill_ok": None}
+    V.append_jsonl(V.EVENTS_FILE, {**payload, **extra})
+
+    # 'started' is only recorded (events.jsonl); it does not wake the bot. Re-enable with VIGIA_NOTIFY_STARTED=1
+    if payload.get("event") == "started" and os.environ.get("VIGIA_NOTIFY_STARTED", "0") != "1":
+        return 0
+    webhook_env = webhook_env_for(st)
+    if not webhook_env or not os.path.isfile(webhook_env):
         return 0
     try:
-        cfg = read_env(WEBHOOK_ENV)
+        cfg = read_env(webhook_env)
     except Exception as e:
         log(f"webhook.env unreadable: {type(e).__name__}")
         return 1
@@ -80,7 +154,7 @@ def main():
             req.add_header(header, value)
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                log(f"POST {host} run={payload['run']} state={payload['state']} -> HTTP {r.status} (attempt {attempt})")
+                log(f"POST {host} run={payload['run']} event={payload['event']} state={payload['state']} -> HTTP {r.status} (attempt {attempt})")
                 return 0
         except urllib.error.HTTPError as e:
             log(f"POST {host} run={payload['run']} -> HTTP {e.code} (attempt {attempt})")

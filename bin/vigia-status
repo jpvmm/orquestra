@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""vigia-status [-n 15] [--json]
-Shows active runs (registry in $VIGIA_BASE/active/) and the most recent finished ones ($VIGIA_BASE/events.jsonl)."""
+"""vigia-status [-n 15] [--json] [--short]
+Shows active runs (registry in $VIGIA_BASE/active/) and the most recent finished ones ($VIGIA_BASE/events.jsonl).
+For each run: the task (--task), the start of the prompt the agent received and the start of its latest reply
+(full prompt in <run>.prompt.md, conversation in <run>.conversation.md). --short: table only.
+Runs the watchdog first (vigia_lib.watch_active); its actions are printed to stderr."""
 import argparse, json, os, sys
 from datetime import datetime
 
@@ -23,7 +26,13 @@ def main():
     p = argparse.ArgumentParser(prog="vigia-status")
     p.add_argument("-n", type=int, default=15, help="how many recent finished runs to show")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--short", action="store_true", help="no task/prompt/reply lines")
     a = p.parse_args()
+    try:
+        for name, action in V.watch_active():  # watchdog independent of the supervisor (see vigia_lib.watch_active)
+            print(f"watchdog: {name}: {action}", file=sys.stderr)
+    except Exception as e:
+        print(f"vigia-status: watchdog failed: {e}", file=sys.stderr)
     with V.Lock():
         V.cleanup_dead()
         active = V.active_entries()
@@ -45,26 +54,40 @@ def main():
         if len([l for l in lines if not l.get("_active")]) >= a.n:
             break
         sp = ev.get("status_path")
+        if ev.get("event") not in (None, "finished"):
+            continue  # started/alert/detected: current state comes from status.json or the finished event
         if sp in seen:
             continue
         seen.add(sp)
         st = V.read_json(sp) or {"name": ev.get("run"), "tool": ev.get("tool"), "state": ev.get("state"),
-                                 "summary": ev.get("summary"), "ended_at": ev.get("ended_at")}
+                                 "summary": ev.get("summary"), "ended_at": ev.get("ended_at"),
+                                 "task": ev.get("task"), "model": ev.get("model"),
+                                 "prompt_preview": ev.get("prompt_preview"), "reply_preview": ev.get("reply_preview"),
+                                 "prompt_path": ev.get("prompt_path"), "conversation_path": ev.get("conversation_path")}
         st["_status_path"] = sp
         lines.append(st)
     if a.json:
         print(json.dumps(lines, ensure_ascii=False, indent=2)); return
     print(f"Vigia -- {len(active)}/{V.MAX_ACTIVE} active -- {V.now_iso()}")
-    hdr = f"{'NAME':<22} {'TOOL':<6} {'STATE':<8} {'START':<8} {'DURATION':>8} {'LAST.SEEN':>9} {'PID':>7}  SUMMARY"
+    hdr = f"{'NAME':<22} {'TOOL':<6} {'STATE':<10} {'START':<8} {'DURATION':>8} {'LAST.SEEN':>9} {'PID':>7}  SUMMARY"
     print(hdr); print("-" * len(hdr))
     for st in lines:
         begin = (st.get("started_at") or "")[11:19][:5] or "-"
         last = "-"
         if st.get("state") == "running" and st.get("last_event_at"):
             last = dur(st["last_event_at"]) + " ago"
-        print(f"{str(st.get('name'))[:22]:<22} {str(st.get('tool'))[:6]:<6} {str(st.get('state'))[:8]:<8} {begin:<8} "
+        print(f"{str(st.get('name'))[:22]:<22} {str(st.get('tool'))[:6]:<6} {str(st.get('state'))[:10]:<10} {begin:<8} "
               f"{dur(st.get('started_at'), st.get('ended_at')) if st.get('started_at') else '-':>8} {last:>9} "
               f"{str(st.get('pid') or '-'):>7}  {(st.get('summary') or '')[:70]}")
+        if a.short:
+            continue
+        one = lambda t, n=150: " ".join(str(t).split())[:n]
+        if st.get("task") or st.get("model"):
+            print(f"    task: {one(st.get('task') or '-', 110)}" + (f"  [{st['model']}]" if st.get("model") else ""))
+        if st.get("prompt_preview"):
+            print(f"    prompt: {one(st['prompt_preview'])}")
+        if st.get("reply_preview"):
+            print(f"    reply: {one(st['reply_preview'])}")
 
 
 if __name__ == "__main__":

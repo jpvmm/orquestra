@@ -4,7 +4,16 @@
 Usage:
   vigia-run --tool claude|codex --task-dir DIR --name NAME [--stall-min 10] [--max-min 20]
             [--max-turns-hint N] [--max-files N] [--protect-tests] [--loop-repeat 3]
-            [--cwd DIR] [--foreground] -- <full claude/codex command>
+            [--cwd DIR] [--task "short description"] [--prompt-file PATH] [--foreground]
+            -- <full claude/codex command>
+
+Next to the status it writes <name>.prompt.md (task, tool, model, rule files, system prompt additions and the
+full prompt the agent received) and <name>.conversation.md (Orquestra -> agent, agent messages, one line per
+tool call, subagents and the final reply). Notifies (vigia-notify) on start, on each alert/detection and at the end.
+
+--max-min is wall-clock time: it also counts time the machine spent suspended. The supervisor touches its
+status.json every poll (heartbeat), so the watchdog in vigia-status / vigia-run can tell when it stopped watching.
+VIGIA_WEBHOOK_ENV at launch is stored in the status (per-run webhook; "" = muted).
 
 Returns immediately (the supervisor is detached and survives the end of the shell/turn) and prints
 a JSON object with the status path. Exit 0 = started; 2 = bad usage; 3 = active-run cap reached;
@@ -18,10 +27,14 @@ import argparse, ctypes, json, os, re, shlex, signal, shutil, subprocess, sys, t
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vigia_lib as V
+import vigia_comms as C
 
 POLL = float(os.environ.get("VIGIA_POLL_SEC", "3"))
 CPU_TICKS_BUSY = int(os.environ.get("VIGIA_CPU_TICKS", "15"))  # CPU ticks (1/100 s) per poll that count as "working"
 KILL_GRACE = float(os.environ.get("VIGIA_KILL_GRACE", "10"))
+# no new bytes for STALL_CPU_MULT x stall-min = stalled even with CPU (a live process spinning without producing anything)
+STALL_CPU_MULT = float(os.environ.get("VIGIA_STALL_CPU_MULT", "3"))
+SUSPEND_SEC = float(os.environ.get("VIGIA_SUSPEND_SEC", "60"))  # wall clock ran this much ahead of monotonic = box suspended
 
 
 def fail(msg, code):
@@ -48,6 +61,9 @@ def parse():
     p.add_argument("--loop-repeat", type=int, default=3, help="repetitions of the same error/cycle that count as a loop")
     p.add_argument("--cwd", default=None)
     p.add_argument("--foreground", action="store_true", help="do not detach (debug)")
+    p.add_argument("--task", default=None, help="short task description (goes into the status, notifications and prompt.md)")
+    p.add_argument("--prompt-file", default=None,
+                   help="file holding the prompt (when the prompt comes from stdin/'-', or to record the full prompt)")
     a = p.parse_args(ours)
     if not cmd:
         fail("empty command after '--'", 2)
@@ -56,6 +72,8 @@ def parse():
     a.cmd = cmd
     a.task_dir = os.path.abspath(a.task_dir)
     a.cwd = os.path.abspath(a.cwd or os.getcwd())
+    a.prompt_file = os.path.abspath(a.prompt_file) if a.prompt_file else None
+    a.task = re.sub(r"\s+", " ", a.task).strip()[:300] if a.task else None
     return a
 
 
@@ -83,6 +101,15 @@ class Analyzer:
         self.codex_pending = []        # hook PostToolUse with no matching --json item yet: [t, ev]
         self.codex_json = []        # --json items that arrived before the hook: [t, cmd, paths]
         self.last_error = None
+        self.model = None
+        self.conv = None            # C.Transcript (conversation.md), set by the supervisor
+
+    def _conv(self, kind, text, who=None):
+        if self.conv is not None:
+            try:
+                self.conv.add(kind, text, who)
+            except Exception:
+                pass
 
     # --- helpers
     def _alert(self, txt):
@@ -136,15 +163,23 @@ class Analyzer:
             self.stream_claude = True
             if ev.get("subtype") == "init":
                 self.session_id = ev.get("session_id")
+                self.model = self.model or ev.get("model")
             else:
                 self._alert(json.dumps(ev, ensure_ascii=False)[:500]) if ev.get("subtype") in ("api_retry", "error") else None
         elif t == "assistant":
             self.stream_claude = True
             self.turn_count += 1
+            who = "subagent" if ev.get("parent_tool_use_id") else None
+            if not self.model and (ev.get("message") or {}).get("model"):
+                self.model = ev["message"]["model"]
             for c in (ev.get("message") or {}).get("content") or []:
                 if c.get("type") == "tool_use":
                     name, inp = c.get("name"), c.get("input") or {}
                     self.tools[c.get("id")] = (name, inp)
+                    if name in ("Task", "Agent") and self.conv is not None:
+                        self.conv.subagent_call(c.get("id"), inp.get("subagent_type"), inp.get("description"), inp.get("prompt"))
+                    else:
+                        self._conv("tool", C.tool_line(name, inp), who)
                     self._tool_call()
                     if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
                         self._edit(inp.get("file_path") or inp.get("notebook_path"),
@@ -152,7 +187,9 @@ class Analyzer:
                     elif name == "Bash":
                         self._shell(inp.get("command", ""))
                 elif c.get("type") == "text" and c.get("text"):
-                    self.last_msg = c["text"]
+                    if not who:
+                        self.last_msg = c["text"]
+                    self._conv("assistant", c["text"], who)
         elif t == "user":
             self.stream_claude = True
             for c in (ev.get("message") or {}).get("content") or [] if isinstance((ev.get("message") or {}).get("content"), list) else []:
@@ -162,8 +199,11 @@ class Analyzer:
                 if isinstance(content, list):
                     content = "\n".join(x.get("text", "") for x in content if isinstance(x, dict))
                 name, inp = self.tools.get(c.get("tool_use_id"), (None, {}))
+                if name in ("Task", "Agent"):
+                    self._conv("sub_result", content, (inp or {}).get("subagent_type") or "subagent")
                 if c.get("is_error"):
                     self._error(f"tool:{name}", content)
+                    self._conv("error", f"{name}: {str(content)[:300]}")
                 if name == "Bash" and V.TEST_CMD_RE.search(inp.get("command", "")):
                     self._test(inp.get("command", ""), content, bool(c.get("is_error")))
         elif t == "rate_limit_event":
@@ -180,10 +220,17 @@ class Analyzer:
                 self._alert(str(ev.get("result")) + " " + str(ev.get("subtype")))
             if ev.get("result"):
                 self.last_msg = ev.get("result")
+                self._conv("final", ev.get("result"))
+            elif ev.get("is_error"):
+                self._conv("error", f"{ev.get('subtype')}: {str(ev.get('result') or '')[:300]}")
 
     # --- Codex hooks: --json already carries commands/edits/errors; the hook only adds what --json does not show
     def codex_hook(self, ev):
         event_name, name = ev.get("hook_event_name"), ev.get("tool_name")
+        if event_name == "SessionStart" and ev.get("model"):
+            self.model = self.model or ev.get("model")
+        if event_name == "SubagentStop":
+            self._conv("sub_result", ev.get("last_message") or "(no message)", ev.get("agent_type") or "subagent")
         if event_name == "PreToolUse" and ev.get("denied"):
             # a denied apply_patch does not show up in --json: count it as an attempt to touch a test
             self._edit(ev.get("path"), "denied")
@@ -280,6 +327,10 @@ class Analyzer:
             self._edit(ev.get("path"), "denied")
         elif event_name == "StopFailure":
             self._alert(str(ev.get("error", "")) + " " + str(ev.get("matcher", "")))
+        elif event_name == "SubagentStop":
+            self._conv("sub_result", ev.get("last_message") or "(no message)", ev.get("agent_type") or "subagent")
+        elif event_name == "Stop" and ev.get("last_message") and not self.last_msg:
+            self.last_msg = ev.get("last_message")
 
     # --- codex exec --json
     def codex(self, ev):
@@ -292,8 +343,10 @@ class Analyzer:
             self.turn_count += 1
         elif t == "turn.failed":
             self._error("turn.failed", json.dumps(ev.get("error"), ensure_ascii=False))
+            self._conv("error", json.dumps(ev.get("error"), ensure_ascii=False)[:300])
         elif t == "error":
             self._error("error", ev.get("message", ""))
+            self._conv("error", str(ev.get("message", ""))[:300])
         elif t == "item.started":
             it = ev.get("item") or {}
             if it.get("type") in ("command_execution", "file_change", "mcp_tool_call", "web_search"):
@@ -305,12 +358,16 @@ class Analyzer:
             ty = it.get("type")
             if ty == "agent_message":
                 self.last_msg = it.get("text")
+                self._conv("assistant", it.get("text"))
             elif ty == "file_change":
+                self._conv("tool", "edit: " + ", ".join(f"{ch.get('kind', '')} {ch.get('path', '')}".strip()
+                                                       for ch in it.get("changes") or [])[:200])
                 for ch in it.get("changes") or []:
                     self._edit(ch.get("path"), ch.get("kind", ""))
                 self._codex_item(paths=[ch.get("path", "") for ch in it.get("changes") or []])
             elif ty == "command_execution":
                 cmd, out, ec = it.get("command", ""), it.get("aggregated_output", ""), it.get("exit_code")
+                self._conv("tool", C.tool_line("shell", {"command": cmd}) + (f" (exit {ec})" if ec not in (0, None) else ""))
                 self._codex_item(cmd=cmd)
                 failed = ec not in (0, None) or it.get("status") == "failed"
                 if failed:
@@ -322,6 +379,15 @@ class Analyzer:
                     self._error("item.error", it.get("message", ""))
             elif ty == "mcp_tool_call" and it.get("status") == "failed":
                 self._error("mcp", json.dumps(it.get("error"), ensure_ascii=False))
+            if ty == "mcp_tool_call":
+                self._conv("tool", f"mcp {it.get('server', '')}.{it.get('tool', '')}" + (" (failed)" if it.get("status") == "failed" else ""))
+            elif ty == "web_search":
+                self._conv("tool", C.tool_line("web_search", {"query": it.get("query", "")}))
+            elif ty and ty not in ("agent_message", "file_change", "command_execution", "reasoning", "error", "todo_list"):
+                # collaboration/subagents and new item types: one line with whatever is visible
+                txt = it.get("prompt") or it.get("text") or it.get("description") or ""
+                who = "subagent" if re.search(r"agent|collab|spawn|delegat", ty) else None
+                self._conv("sub_call" if who else "tool", f"{ty}: {C.preview(txt, 300)}".rstrip(": "))
 
     def rec(self, txt, origin):
         txt = txt.strip()
@@ -397,24 +463,75 @@ def codex_with_hooks(cmd):
 
 # ======================= supervisor =======================
 
-def supervise(a, paths, key):
+def prepare_prompt(a, paths, started):
+    """Extract prompt/model/system prompt from the command, write <run>.prompt.md (redacted) and return the info."""
+    try:
+        info = C.extract_prompt(a.tool, a.cmd, a.cwd, a.prompt_file)
+    except Exception as e:
+        info = {"model": None, "prompt": None, "prompt_source": None, "system": [], "reply_file": None,
+                "notes": [f"could not extract the prompt: {type(e).__name__}: {e}"]}
+    rules = []
+    try:
+        rules = C.rules_files(a.cwd)
+        C.write_atomic(paths["prompt"], C.render_prompt_md(a.name, a.task, a.tool, info, a.cwd, a.cmd, rules, started))
+    except Exception as e:
+        info.setdefault("notes", []).append(f"could not write prompt.md: {type(e).__name__}")
+    info["rules"] = rules
+    return info
+
+
+def supervise(a, paths, key, notifier=None):
     cmd_original = a.cmd
     codex_hooks_on = False
     if a.tool == "codex":
         a.cmd, codex_hooks_on = codex_with_hooks(a.cmd)
+    started = V.now_iso()
+    info = prepare_prompt(a, paths, started)
     st = {
         "name": a.name, "tool": a.tool, "state": "running", "task_dir": a.task_dir, "cwd": a.cwd,
+        "task": a.task, "model": info.get("model"), "prompt_preview": C.preview(C.redact(info.get("prompt") or "")) or None,
+        "prompt_path": paths["prompt"], "prompt_source": info.get("prompt_source"), "rules_files": info.get("rules"),
+        "system_prompt_additions": [k for k, _ in info.get("system") or []],
+        "conversation_path": paths["conversation"], "reply_preview": None, "stopping": None,
         "cmd": cmd_original, "codex_hooks": codex_hooks_on, "supervisor_pid": os.getpid(), "pid": None, "pgid": None,
-        "started_at": V.now_iso(), "ended_at": None, "exit_code": None, "last_event_at": None,
+        "started_at": started, "ended_at": None, "exit_code": None, "last_event_at": None,
         "checked_at": None, "summary": "", "loop_reason": None, "alerts": [],
         "limits": {"stall_min": a.stall_min, "max_min": a.max_min, "max_turns_hint": a.max_turns_hint,
                    "max_files": a.max_files, "protect_tests": a.protect_tests, "loop_repeat": a.loop_repeat},
         "stats": {}, "kill": None, "paths": paths,
+        # per-bot webhook: VIGIA_WEBHOOK_ENV at launch is stored here so notifications go to the same bot even
+        # when another process sends them (e.g. vigia-status cleaning up a dead supervisor). None = default.
+        "webhook_env": webhook_env_from_environ(),
     }
+
+    conv = C.Transcript(paths["conversation"], a.name, a.task, a.tool, info.get("model"), info.get("prompt"), paths["prompt"])
 
     def save():
         st["checked_at"] = V.now_iso()
-        V.write_json_atomic(paths["status"], st)
+        try:
+            if an is not None:
+                if an.model and not st.get("model"):
+                    st["model"] = conv.model = an.model
+                    conv.dirty = True
+            if conv.last_reply:
+                st["reply_preview"] = C.preview(conv.last_reply)
+            conv.flush()
+        except Exception:
+            pass
+        with V.run_lock(paths["status"]):  # same lock as the watchdog: checking the mark and writing is atomic
+            if (V.read_json(paths["status"]) or {}).get("watchdog"):
+                return False  # the watchdog took over this run (the supervisor had stopped watching): do not overwrite
+            V.write_json_atomic(paths["status"], C.redact_obj(st))
+        return True
+
+    def notify(event, state, prev=None, detail=None, dedupe_key=None):
+        if notifier is not None:
+            try:
+                notifier.send(event, state, prev, detail, dedupe_key)
+            except Exception:
+                pass
+
+    an = None
 
     # subreaper: orphaned descendants are re-parented here (so they can be tracked and killed even if they leave the group)
     try:
@@ -449,12 +566,17 @@ def supervise(a, paths, key):
     pgid = proc.pid
     pstat = V.proc_stat(proc.pid) or {}
     st.update(pid=proc.pid, pgid=pgid, pid_start=pstat.get("start"))
-    save()
-
     an = Analyzer(a)
-    ev_tail, hk_tail = Tailer(paths["events"]), Tailer(paths["hooks"])
+    an.conv = conv
+    save()
+    notify("started", "running", "starting", dedupe_key="started")
+    alerts_sent = set()
+    ev_tail, hk_tail, err_tail = Tailer(paths["events"]), Tailer(paths["hooks"]), Tailer(paths["stderr"])
     t0 = time.monotonic()
-    last_alive = time.monotonic()
+    w0 = time.time()  # the cap (max-min) is wall-clock time: it also counts time the box was suspended
+    w_prev, m_prev = w0, t0
+    suspended = 0.0
+    last_alive = last_byte = time.monotonic()
     st["last_event_at"] = V.now_iso()
     size_prev = (0, 0, 0)
     cpu_prev = None
@@ -478,6 +600,21 @@ def supervise(a, paths, key):
         for ln in hk_tail.new_lines():
             an.rec(ln, "hooks")
         an.codex_reconcile()
+        for ln in err_tail.new_lines():
+            stderr_alert(an, a, ln)
+        # box suspended (VM paused): monotonic time stops, wall clock jumps
+        w_now, m_now = time.time(), time.monotonic()
+        jump = (w_now - w_prev) - (m_now - m_prev)
+        if jump > SUSPEND_SEC:
+            suspended += jump
+            st["suspended_sec"] = int(suspended)
+            an.alerts.append(f"box suspended ~{int(jump // 60)} min during the run ({V.iso_from(w_prev)} -> "
+                             f"{V.iso_from(w_now)}): nothing ran meanwhile; the wall-clock cap counts this time")
+        w_prev, m_prev = w_now, m_now
+        try:
+            os.utime(paths["status"])  # supervisor heartbeat (the watchdog looks at the mtime)
+        except OSError:
+            pass
 
         sizes = (ev_tail.file_size(), hk_tail.file_size(), os.path.getsize(paths["stderr"]) if os.path.exists(paths["stderr"]) else 0)
         alive_pids, procs = V.members(pgid, [proc.pid])
@@ -486,6 +623,7 @@ def supervise(a, paths, key):
         busy = cpu_prev is not None and (cpu - cpu_prev) >= CPU_TICKS_BUSY
         if grew:
             st["last_event_at"] = V.now_iso()
+            last_byte = time.monotonic()
         if grew or busy:
             last_alive = time.monotonic()
         size_prev, cpu_prev = sizes, cpu
@@ -496,6 +634,11 @@ def supervise(a, paths, key):
                        "idle_sec": int(time.monotonic() - last_alive)}
         st["session_id"] = an.session_id
         st["alerts"] = an.alerts
+        for al in an.alerts:
+            if al not in alerts_sent:
+                alerts_sent.add(al)
+                save()
+                notify("alert", "running", "running", al, "alert|" + V.h(al))
 
         if rc is not None:
             break
@@ -503,11 +646,19 @@ def supervise(a, paths, key):
             reason = "killed"; st["summary"] = f"received signal {term_state['signal']} (vigia-stop?)"
         elif an.loop:
             reason = "loop"; st["loop_reason"] = an.loop; st["summary"] = "loop: " + an.loop
-        elif time.monotonic() - t0 > a.max_min * 60:
-            reason = "timeout"; st["summary"] = f"exceeded {a.max_min:g} min of wall-clock time"
+        elif time.time() - w0 > a.max_min * 60:
+            reason = "timeout"; st["summary"] = f"exceeded {a.max_min:g} min of wall-clock time" + \
+                (f" (box suspended ~{int(suspended // 60)} min meanwhile)" if suspended else "")
         elif time.monotonic() - last_alive > a.stall_min * 60:
             reason = "stalled"; st["summary"] = f"no new bytes and no CPU for {a.stall_min:g} min"
+        elif time.monotonic() - last_byte > STALL_CPU_MULT * a.stall_min * 60:
+            reason = "stalled"; st["summary"] = (f"no new bytes for {STALL_CPU_MULT * a.stall_min:g} min "
+                                                 f"({STALL_CPU_MULT:g}x stall-min) even with CPU")
         if reason:
+            # detected: notify now (killing + evidence still take a few seconds)
+            st["stopping"] = {"reason": reason, "detail": st["summary"], "at": V.now_iso()}
+            if save():  # False: the watchdog already took over and sent its own detected; just go on to the kill (idempotent)
+                notify("detected", "running", "running", f"{reason}: {st['summary']}", "detected|" + reason)
             break
         if time.monotonic() - last_save > 15 or grew:
             save(); last_save = time.monotonic()
@@ -531,6 +682,16 @@ def supervise(a, paths, key):
         for ln in hk_tail.new_lines():
             an.rec(ln, "hooks")
         an.codex_reconcile(end=True)
+        for ln in err_tail.new_lines() + ([err_tail.buf] if err_tail.buf else []):
+            stderr_alert(an, a, ln)
+        if info.get("reply_file") and os.path.isfile(info["reply_file"]):
+            try:
+                with open(info["reply_file"], errors="replace") as f:
+                    conv.add("final", f.read(200_000))
+            except OSError:
+                pass
+        elif an.last_msg and not conv.final:
+            conv.add("final", an.last_msg)
         st["alerts"] = an.alerts
         st["stats"].update(turns=an.turn_count, tool_calls=an.calls, files_edited=len(an.files))
         # anything left in the group (background server etc.)? kill it and record it
@@ -552,7 +713,14 @@ def supervise(a, paths, key):
             st["state"] = "failed"
     st["exit_code"] = rc
     st["ended_at"] = V.now_iso()
-    st["duration_sec"] = int(time.monotonic() - t0)
+    st["duration_sec"] = int(time.time() - w0)       # wall clock
+    st["active_sec"] = int(time.monotonic() - t0)    # only the time the box was awake
+    if not reason and a.max_min and time.time() - w0 > a.max_min * 60:
+        al = f"finished after the cap: {int((time.time() - w0) // 60)} min of wall clock > max-min {a.max_min:g}"
+        if al not in an.alerts:
+            an.alerts.append(al)
+        st["alerts"] = an.alerts
+    incomplete = lead_without_summary(a, w0) if st["state"] == "done" else None
     if an.result:
         r = an.result
         st["result"] = {k: r.get(k) for k in ("subtype", "is_error", "num_turns", "total_cost_usd", "duration_ms") if k in r}
@@ -567,9 +735,45 @@ def supervise(a, paths, key):
         st["summary"] = re.sub(r"\s+", " ", str(base)).strip()[:300]
     if st["alerts"]:
         st["summary"] = (st["summary"] + " | ALERT: " + "; ".join(st["alerts"][:3]))[:500]
+    if incomplete:
+        st["state"] = "incomplete"
+        st["incomplete_reason"] = incomplete
+        st["summary"] = "INCOMPLETE: " + incomplete + " | " + (st["summary"] or "")
     st["summary"] = re.sub(r"\s+", " ", st["summary"] or "").strip()[:500]
-    save()
+    if not save():
+        # the watchdog ended this run while the supervisor was not watching: wait for it to record the kill (up to
+        # 60 awake seconds) so 'finished' goes out complete, and return its status without overwriting it
+        end = time.monotonic() + 60
+        while time.monotonic() < end and not isinstance((V.read_json(paths["status"]) or {}).get("kill"), dict):
+            time.sleep(0.5)
+        return V.read_json(paths["status"]) or st
+    for al in an.alerts:  # alerts that only showed up at the end (stderr, cap)
+        if al not in alerts_sent:
+            alerts_sent.add(al)
+            notify("alert", "running", "running", al, "alert|" + V.h(al))
+    if incomplete:
+        notify("detected", "incomplete", "running", "incomplete: " + incomplete, "detected|incomplete")
     return st
+
+
+def stderr_alert(an, a, ln):
+    if V.STDERR_ALERT_RE.search(ln or "") or (a.tool == "claude" and V.ALERT_RE.search(ln or "")):
+        m = "stderr: " + re.sub(r"\s+", " ", ln).strip()[:200]
+        if m not in an.alerts and len(an.alerts) < 12:
+            an.alerts.append(m)
+
+
+def lead_without_summary(a, start_wall):
+    """Fleet lead (name fleet-*-lead-*) that exited without leaving this run's T/FINAL-SUMMARY.md: reason, else None."""
+    if not V.LEAD_RE.fullmatch(a.name):
+        return None
+    f = os.path.join(a.task_dir, "FINAL-SUMMARY.md")
+    try:
+        if os.path.getsize(f) > 0 and os.path.getmtime(f) >= start_wall - 2:
+            return None
+        return "fleet lead exited without a fresh T/FINAL-SUMMARY.md (the existing one predates this run or is empty)"
+    except OSError:
+        return "fleet lead exited without writing T/FINAL-SUMMARY.md"
 
 
 def verify(pgid, pid):
@@ -657,7 +861,7 @@ def freeze_evidence(paths, pgid, pid, st):
                          ",".join(map(str, sorted(alive_pids))) or str(pid)], capture_output=True, text=True).stdout
     with open(os.path.join(d, "ps.txt"), "w") as f:
         f.write(f"# captured at {V.now_iso()} pgid={pgid}\n{ps}")
-    V.write_json_atomic(os.path.join(d, "status-at-capture.json"), st)
+    V.write_json_atomic(os.path.join(d, "status-at-capture.json"), C.redact_obj(st))
 
 
 # ======================= main / detach =======================
@@ -672,10 +876,15 @@ def main():
     os.makedirs(runs, exist_ok=True)
     b = os.path.join(runs, a.name)
     paths = {"status": b + ".status.json", "events": b + ".events.jsonl", "stderr": b + ".stderr.log",
-             "hooks": b + ".hooks.jsonl", "evidence": b + ".evidence", "supervisor_log": b + ".vigia.log"}
+             "hooks": b + ".hooks.jsonl", "evidence": b + ".evidence", "supervisor_log": b + ".vigia.log",
+             "prompt": b + ".prompt.md", "conversation": b + ".conversation.md"}
     key = V.h(a.task_dir, a.name)
     entry = os.path.join(V.ACTIVE_DIR, f"{a.name}-{key}.json")
 
+    try:
+        V.watch_active()  # cheap watchdog: runs whose supervisor stopped watching / went past the cap
+    except Exception as e:
+        print(f"vigia-run: watchdog failed: {e}", file=sys.stderr)
     with V.Lock():
         V.cleanup_dead()
         active = V.active_entries()
@@ -717,7 +926,8 @@ def main():
 
     if a.foreground:
         st = run_supervisor(a, paths, key, entry)
-        print(json.dumps({"name": a.name, "state": st["state"], "status_path": paths["status"]}, ensure_ascii=False))
+        print(json.dumps({"name": a.name, "state": st["state"], "status_path": paths["status"],
+                          "prompt_path": paths["prompt"], "conversation_path": paths["conversation"]}, ensure_ascii=False))
         return
     # wait for the supervisor to record the command's pid (up to 10s) so we can return something useful
     st = None
@@ -728,7 +938,9 @@ def main():
         time.sleep(0.1)
     print(json.dumps({"name": a.name, "tool": a.tool, "state": (st or {}).get("state", "starting"),
                       "supervisor_pid": sup_pid, "pid": (st or {}).get("pid"), "pgid": (st or {}).get("pgid"),
-                      "status_path": paths["status"], "events_path": paths["events"]}, ensure_ascii=False))
+                      "task": a.task, "model": (st or {}).get("model"),
+                      "status_path": paths["status"], "events_path": paths["events"],
+                      "prompt_path": paths["prompt"], "conversation_path": paths["conversation"]}, ensure_ascii=False))
 
 
 def _entry(a, paths, key, sup_pid):
@@ -738,29 +950,57 @@ def _entry(a, paths, key, sup_pid):
             "registered_at": V.now_iso()}
 
 
+def webhook_env_from_environ():
+    """VIGIA_WEBHOOK_ENV from the environment (absolute path), "" if empty (= no webhook), None if unset (= default)."""
+    v = os.environ.get("VIGIA_WEBHOOK_ENV")
+    if v is None:
+        return None
+    v = v.strip()
+    return os.path.abspath(os.path.expanduser(v)) if v else ""
+
+
 def run_supervisor(a, paths, key, entry):
     st = None
+    notifier = None
+    script = os.path.join(V.BIN, "vigia-notify")
     try:
-        st = supervise(a, paths, key)
-    except Exception as e:
+        try:
+            notifier = C.Notifier(script, paths["status"])
+        except Exception as e:
+            print(f"notifier did not start: {e}", file=sys.stderr)
+        st = supervise(a, paths, key, notifier)
+    except BaseException as e:
         import traceback
         traceback.print_exc()
-        st = V.read_json(paths["status"]) or {"name": a.name, "tool": a.tool, "task_dir": a.task_dir, "paths": paths}
-        if st.get("pgid"):
-            st["kill"] = kill_group(st["pgid"], st.get("pid"))
-        st.update(state="failed", ended_at=V.now_iso(), summary=f"internal Vigia error: {e}")
-        V.write_json_atomic(paths["status"], st)
+        try:
+            st = V.read_json(paths["status"]) or {"name": a.name, "tool": a.tool, "task_dir": a.task_dir, "task": a.task,
+                                                  "paths": paths, "prompt_path": paths["prompt"]}
+            if st.get("watchdog"):
+                raise RuntimeError("the watchdog already ended the run")  # do not overwrite
+            if st.get("pgid") and st.get("state") == "running":
+                st["kill"] = kill_group(st["pgid"], st.get("pid"))
+            st.update(state="failed", ended_at=V.now_iso(), summary=C.redact(f"internal Vigia error: {e}"))
+            V.write_json_atomic(paths["status"], C.redact_obj(st))
+        except Exception:
+            traceback.print_exc()
     finally:
-        with V.Lock():
-            try:
-                os.unlink(entry)
-            except FileNotFoundError:
-                pass
-    try:
-        subprocess.run([os.path.join(V.BIN, "vigia-notify"), paths["status"]], timeout=90,
-                       stdin=subprocess.DEVNULL)
-    except Exception as e:
-        print(f"vigia-notify failed: {e}", file=sys.stderr)
+        try:
+            with V.Lock():
+                try:
+                    os.unlink(entry)
+                except FileNotFoundError:
+                    pass
+        except Exception:
+            pass
+        # end notification: exactly one (vigia-notify also dedupes per run), after pending notifications
+        try:
+            if notifier is not None:
+                notifier.drain(60)
+            final = (st or {}).get("state") or "failed"
+            subprocess.run([script, paths["status"], "--event", "finished", "--state", str(final), "--prev", "running"],
+                           timeout=90, stdin=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"vigia-notify failed: {e}", file=sys.stderr)
     return st
 
 

@@ -1,0 +1,9 @@
+{
+  "criteria": [
+    {"id": "C1", "description": "add(2, 3) returns 5 and add accepts negatives", "command": "python3 -m pytest -q test_calc.py -k add", "expect": "exit 0", "passes": false},
+    {"id": "C2", "description": "...", "command": "...", "expect": "exit 0", "passes": false}
+  ],
+  "critical_tests": [
+    {"id": "T1", "description": "add with negatives and zero", "file": "test_calc.py"}
+  ]
+}

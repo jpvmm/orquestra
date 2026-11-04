@@ -5,6 +5,30 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.0] - unreleased
+
+### Added
+- Retro loop v0.2.0: `fleet-retro-cycle` (cycle runner, `prompts/retro-routine.md`; empty cycle = 0 model calls),
+  `fleet-skill-judge` (paired behavioural check, judge memory in `skill/judge-log.jsonl`), `fleet-skill-eval` (probes),
+  `fleet-retro-shadow`, rules index (`skill/rules-index.json`, overlap/contradiction check), merge-guard, probation with
+  automatic revert, and `skill/retro-policy.json` (owner name, quotas, budgets, cycle, judge memory, eval, probation).
+- Token budget: `budget.tokens_per_cycle` hard cap (default 25000), reserved before each call, usage read from the
+  stream-json result. Typical cycle estimate <= ~25k tokens.
+- `install.sh` installs all loop tools and the policy; records `skill/.install-baseline.json`.
+- `tests/test_oss_port.py` and the other v0.2.0 test files.
+- Shadow-run numbers (T8): _placeholder, filled in by the operator before release_.
+
+### Changed
+- Re-install never overwrites a skill/config/agent file that differs from its recorded baseline (written as
+  `<file>.upstream` and reported) nor any bookkeeping file (ledgers, archive, evals, judge log, rules index, retro state,
+  `LESSONS.md`, `learnings.md`).
+- One path resolver (`ORQUESTRA_HOME`, default `~/.orquestra`) for every loop tool; no `/workspace`, `/home/` or
+  personal names in shipped files. `docs/fleet.md` retro section rewritten.
+
+### Deferred (not in 0.2.0)
+DSPy/GEPA, embeddings, full replay in worktrees, autonomous edits of the Orquestra profile, per-run retro, per-rule usage
+counters, pruning by inactivity, 3 samples per probe, turning `judge_memory.near_suppress` on.
+
 ## [0.1.0] - 2026-11-03
 
 ### Added
@@ -42,5 +66,6 @@ All notable changes to this project are documented here. The format is based on
 - `install.sh` also installs the fleet into `$ORQUESTRA_HOME/fleet/` and `vigia-routine.md`; the setup skill
   smoke-tests the fleet with `fleet-run --dry-run` and documents per-bot webhooks.
 
-[Unreleased]: https://github.com/jpvmm/orquestra/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jpvmm/orquestra/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jpvmm/orquestra/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jpvmm/orquestra/releases/tag/v0.1.0

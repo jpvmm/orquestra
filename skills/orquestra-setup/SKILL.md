@@ -24,6 +24,8 @@ if [ -d ~/src/orquestra/.git ]; then git -C ~/src/orquestra pull --ff-only; else
 ```
 Confirm `~/.orquestra/bin/vigia-run` and `~/.orquestra/fleet/bin/fleet-run` exist.
 
+The install also ships the retro loop tools (`fleet-retro-cycle`, `fleet-skill-*`) and `fleet/skill/retro-policy.json`. It is safe to re-run to upgrade: skill/config/agent files you or the loop edited are kept (the new version lands next to them as `<file>.upstream`; tell the user if any are reported), and ledgers, archive, judge log, `LESSONS.md` and `learnings.md` are never touched. No scheduler is created; the cron is documented in `docs/fleet.md`.
+
 Smoke-test the fleet without launching anything (a temp git repo, `--dry-run`):
 ```bash
 d=$(mktemp -d) && git -C "$d" init -q && echo 'x = 1' > "$d/a.py" && git -C "$d" add . && git -C "$d" -c user.name=t -c user.email=t@t commit -qm base

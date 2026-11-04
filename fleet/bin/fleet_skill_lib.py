@@ -14,7 +14,7 @@ EDITABLE = ("skill/", ".claude/agents/")
 # bookkeeping under skill/: never a patch target (history, lock, backups, proposals, archive, lint output)
 RESERVED = ("skill/ledger", "skill/ledger-backups/", "skill/proposals/", "skill/archive/", "skill/lint-report.md",
             "skill/retro-state.json", "skill/retro-batches/", "skill/rules-index.json", "skill/judge-log.jsonl",
-            "skill/evals/", "skill/retro-policy.json", "skill/usage")
+            "skill/evals/", "skill/retro-policy.json", "skill/usage", "skill/.install-baseline.json")
 NOT_PROJECTS = {"fleet", "bin", "vigia", "skill", "tmp"}   # default of policy ignore_dirs (see valid_project)
 LESSONS_FILE = "LESSONS.md"
 LESSONS_CAP = 4000

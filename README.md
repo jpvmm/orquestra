@@ -226,10 +226,10 @@ The prompt assumes: a shared machine where the CLIs are logged in with your acco
 ```
 bin/            vigia-run, vigia-status, vigia-stop, vigia-notify, hooks, vigia_lib.py, vigia_comms.py,
                 claude-hooks.json.template
-fleet/          bin/ (fleet-run, fleet-wt, fleet-codex, codex-dev, codex-reviewer, fleet-wait),
+fleet/          bin/ (fleet-run, fleet-wt, fleet-codex, codex-dev, codex-reviewer, fleet-wait, retro loop tools),
                 .claude/agents/ (team-lead, dev, reviewer-claude, security), skill/fleet-sdd/ (flow, briefs, templates)
 docs/           vigia.md (Vigia reference), fleet.md (fleet reference)
-prompts/        orquestra.md (the bot instructions), vigia-routine.md (webhook routine instruction)
+prompts/        orquestra.md (the bot instructions), vigia-routine.md (webhook routine), retro-routine.md (retro cycle)
 skills/         orquestra-setup/SKILL.md (self-install skill for Grok Bot)
 tests/          unittest scripts (no LLM, temp dirs only)
 install.sh      installer (into $ORQUESTRA_HOME, default ~/.orquestra)
@@ -250,6 +250,9 @@ for t in tests/test_*.py; do python3 "$t"; done
 - `test_vigia_watchdog.py`: wall-clock cap across suspension, stall with CPU, `incomplete`, watchdog, PID reuse
 - `test_fleet.py`: fleet-wt waves/integration/conflicts and `fleet-run --dry-run`
 - `test_retro_loop.py`: fleet-retro, fleet-skill-apply (apply/revert/ledger) and fleet-skill-lint, no LLM
+- `test_retro_policy.py`, `test_rules_index.py`, `test_judge.py`, `test_probes.py`, `test_prune_merge.py`, `test_probation.py`,
+  `test_retro_cycle.py`: retro loop v0.2.0 (policy, rules index, judge memory, probes, merge-guard, probation, cycle runner), stubbed model
+- `test_oss_port.py`: no hardcoded paths/names, `install.sh` fresh and re-install (local edits kept as `.upstream`, reserved files untouched)
 
 ## Security notes
 

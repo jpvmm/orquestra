@@ -148,15 +148,18 @@ class TestRetro(Base):
         r = self.run_cli([RETRO, "--task-dir", self.T, "--run", "fleet-T-lead-010101"], FLEET_RETRO_STUB_OUTPUT=self.stub(ans))
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout)
-        self.assertEqual((out["proposals"], out["rejected"]), (1, 3))
+        # quota counts only valid proposals (T1): the valid 4th generic one is accepted, 2 invalid are rejected
+        self.assertEqual((out["proposals"], out["rejected"]), (2, 2))
         self.assertEqual(rbytes(self.skill), before, "the retro must not apply anything")
         txt = open(os.path.join(self.T, "retro.md")).read()
-        for needle in ("verdict: 1 item(s) (1 proposal(s), 0 profile)", "applies cleanly", "- rule: List every file",
-                       "- skill step: Step 1.1", "contains a date", "generic target must be a .md file under skill/",
-                       "over the limit of 3"):
+        for needle in ("verdict: 2 item(s) (2 proposal(s), 0 profile)", "applies cleanly", "- rule: List every file",
+                       "- skill step: Step 1.1", "contains a date", "generic target must be a .md file under skill/"):
             self.assertIn(needle, txt)
-        diff = open(out["diffs"][0]).read(); self.assertEqual(len(out["diffs"]), 1)
-        self.assertIn("+++ b/skill/fleet-sdd/SKILL.md", diff); self.assertNotIn("retry-notes", diff)
+        # T6: each generic candidate for an always-loaded file is its own diff (one rule per ledger entry)
+        self.assertEqual(len(out["diffs"]), 2)
+        for d in out["diffs"]:
+            diff = open(d).read()
+            self.assertIn("+++ b/skill/fleet-sdd/SKILL.md", diff); self.assertNotIn("retry-notes", diff)
 
     def test_duplicate_append_and_ambiguous_anchor_rejected(self):
         self.add_run("fleet-T-lead-010101")
@@ -200,7 +203,9 @@ class TestRetro(Base):
 
 class TestApply(Base):
     def make_diff(self):
-        """Proposal diff via the real retro path: edit SKILL.md (no final newline) + create a references file."""
+        """Proposal diffs via the real retro path: edit SKILL.md (no final newline) + create a references file.
+        T6 gives every generic behavioural candidate its own diff, so this fixture joins the two retro diffs into ONE
+        multi-file diff (test-local) for the multi-file apply/revert roundtrip these tests check."""
         self.add_run("fleet-T-lead-010101")
         ans = {"verdict": "proposals", "proposals": [
             {"scope": "generic", "rule": "r1", "why": "w", "skill_step": "Rules", "target": "skill/fleet-sdd/SKILL.md",
@@ -209,7 +214,10 @@ class TestApply(Base):
              "edit": {"old": "", "new": "# Integration\n- Resolve mechanical conflicts in the integration worktree."}}]}
         r = self.run_cli([RETRO, "--task-dir", self.T, "--run", "fleet-T-lead-010101"], FLEET_RETRO_STUB_OUTPUT=self.stub(ans))
         self.assertEqual(r.returncode, 0, r.stderr)
-        d = json.loads(r.stdout)["diffs"][0]
+        diffs = json.loads(r.stdout)["diffs"]
+        self.assertEqual(len(diffs), 2)
+        d = os.path.join(self.tmp, "joined.diff")
+        write(d, "".join(open(x).read() for x in diffs))
         return d
 
     def ledger(self):
@@ -285,7 +293,7 @@ class TestLint(Base):
         return sorted(os.path.relpath(os.path.join(d, f), self.root) for d, _, fs in os.walk(self.root) for f in fs
                       if not f.startswith("ledger") and f != "lint-report.md")
 
-    def test_duplicates_stale_and_archive_moves_never_deletes(self):
+    def test_duplicates_stale_and_archive_only_names_candidates(self):
         refs = os.path.join(self.root, "skill", "fleet-sdd", "references")
         write(os.path.join(refs, "claude-permissions.md"),
               "# Claude permissions\n- Never touch a test without saying so.\n"
@@ -304,13 +312,16 @@ class TestLint(Base):
         self.assertIn("OVER CAP 40", rep)
         self.assertIn("old-topic.md: 40 days, not referenced", rep)
         self.assertTrue(os.path.exists(old), "no move without --archive")
+        # age only NAMES a candidate (PLAN F2): --archive lists the stale file, moves nothing, writes no ledger line
         r = self.run_cli([LINT, "--archive"]); self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertFalse(os.path.exists(old))
-        moved = [p for p in self.all_files() if p.startswith("skill/archive/") and p.endswith("old-topic.md")]
-        self.assertEqual(len(moved), 1); self.assertEqual(rbytes(os.path.join(self.root, moved[0])), old_bytes)
-        self.assertEqual(len(self.all_files()), n_before, "archive moves files; it never deletes")
+        s = json.loads(r.stdout)
+        self.assertEqual(s["archived"], 0)
+        self.assertEqual([c["file"] for c in s["archive_candidates"]], ["skill/fleet-sdd/references/old-topic.md"])
+        self.assertIn("Archive candidates (named only, nothing moved)", open(s["report"]).read())
+        self.assertEqual(rbytes(old), old_bytes)
+        self.assertEqual(len(self.all_files()), n_before, "lint never moves nor deletes")
         self.assertTrue(os.path.exists(self.skill)); self.assertTrue(os.path.exists(self.lessons))
-        self.assertIn('"op": "archive"', open(os.path.join(self.root, "skill", "ledger.jsonl")).read())
+        self.assertFalse(os.path.exists(os.path.join(self.root, "skill", "ledger.jsonl")))
 
     def test_near_duplicates(self):
         write(os.path.join(self.root, "skill", "fleet-sdd", "references", "x.md"),
@@ -374,12 +385,15 @@ class TestRouting(Base):
              "edit": {"old": "", "new": "- A project rule long enough to count as a rule."}}
         r = self.retro({"verdict": "proposals", "proposals": [p]}, T=self.T)   # T is not under a project folder
         self.assertIn("no analyzed task folder is under a project folder", rd(os.path.join(self.T, "retro.md")))
-        ps = [dict(p, edit={"old": "", "new": f"- Project rule number {w} long enough to count."}) for w in ("one", "two", "three", "four")]
+        # four distinct rules (T2: near-identical candidates in one batch are refused as conflicts before the quota)
+        ps = [dict(p, edit={"old": "", "new": f"- {w}"}) for w in (
+            "Seed the database with `make seed` before the integration suite.", "Keep migrations reversible: every up step needs a down step.",
+            "Pin the Node version in `.nvmrc` so CI and laptops build alike.", "Name feature flags after the ticket area, not the person.")]
         g = {"scope": "generic", "rule": "g", "why": "w", "skill_step": "s", "target": "skill/fleet-sdd/references/x.md",
              "edit": {"old": "", "new": "- A generic rule that is long enough."}}
         out = json.loads(self.retro({"verdict": "proposals", "proposals": ps + [g]}).stdout)
         self.assertEqual((out["proposals"], out["rejected"]), (4, 1))   # 3 project + 1 generic; the 4th project is cut
-        self.assertIn("over the limit of 3 proposals for the project loop", rd(os.path.join(self.PT, "retro.md")))
+        self.assertIn("over the limit of 3 proposals for project:acme", rd(os.path.join(self.PT, "retro.md")))
 
     def test_project_lessons_cap_forces_consolidation(self):
         write(os.path.join(self.tmp, "acme", "LESSONS.md"), "# acme\n" + "- filler rule line that takes space\n" * 110)

@@ -22,6 +22,7 @@ VIGIA_BASE (default $ORQUESTRA_HOME/vigia; ORQUESTRA_HOME defaults to this insta
 Output: JSON with name, status_path, conversation_path. Exit codes: 2 invalid input, 3 Vigia cap full,
 4 name in use, 5 command not found."""
 import argparse, json, os, re, subprocess, sys, time
+sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))          # .../fleet
 BIN = os.path.join(HERE, "bin")
@@ -41,6 +42,20 @@ MODELS = {"claude": {"top": "opus", "mid": "sonnet", "cheap": "haiku"},
 # security keywords (English plus a few Portuguese ones, for plans written in Portuguese)
 SEC_WORDS = re.compile(r"\b(auth|login|senha|password|token|segredo|secret|credential|credencia|oauth|jwt|cookie|session|sess[aã]o|"
                        r"http|rede|network|socket|url|upload|user input|entrada do usu|input|sql|webhook|api key)", re.I)
+
+
+def ignore_dirs():
+    """Folders under the Orquestra root that are not projects: policy ignore_dirs (skill/retro-policy.json), with the
+    built-in default when the policy or the lib is missing or broken."""
+    try:
+        sys.path.insert(0, BIN)
+        import fleet_skill_lib
+        return fleet_skill_lib.ignore_set(fleet_skill_lib.load_policy(HERE))
+    except Exception:
+        return {"fleet", "bin", "vigia", "skill", "tmp"}
+    finally:
+        if sys.path and sys.path[0] == BIN:
+            sys.path.pop(0)
 
 
 def fail(msg, code=2):
@@ -225,8 +240,7 @@ def main():
     # lead and the briefs read a stable snapshot. No retro hook here: retros run in the every-2-days batch.
     orq = ORQUESTRA_HOME
     parts = os.path.relpath(T, orq).split(os.sep)
-    project = parts[0] if len(parts) >= 2 and parts[0] != ".." and parts[0] not in (
-        "fleet", "bin", "vigia", "skill", "tmp") else None
+    project = parts[0] if len(parts) >= 2 and parts[0] != ".." and parts[0] not in ignore_dirs() else None
     lessons_src = os.path.join(orq, project, "LESSONS.md") if project else None
     project_lessons = None
     if lessons_src and os.path.isfile(lessons_src) and not os.path.islink(lessons_src):

@@ -1,60 +1,31 @@
 #!/usr/bin/env python3
 """fleet-skill-lint — deterministic housekeeping (run by `fleet-retro --batch` every two days) of the fleet skill and lessons (no LLM, stdlib only).
 
-  fleet-skill-lint [--days 30] [--cap 4000] [--skill-cap 12000] [--lessons PATH] [--report PATH] [--archive]
+  fleet-skill-lint [--days 30] [--cap N] [--skill-cap N] [--lessons PATH] [--report PATH] [--archive] [--json] [--no-report]
 
 Reports: SKILL.md size; duplicate and near-duplicate rules (normalized text) across SKILL.md, brief-*.md,
 references/*.md and learnings.md (generic loop) and inside each ORQ_ROOT/<project>/LESSONS.md (project loop);
 a lesson that appears in 2+ projects' LESSONS.md → "promote to generic"; reference files not referenced from SKILL.md
 and not touched (ledger or mtime) in --days days; project lessons untouched for --days days; learnings.md and every
 LESSONS.md over the cap. Writes FLEET_ROOT/skill/lint-report.md (or --report). LESSONS.md files are only read.
---archive MOVES the stale references/*.md files to FLEET_ROOT/skill/archive/<stamp>/ (ledger line op=archive).
-Nothing is ever deleted; SKILL.md, brief templates and learnings.md are never moved. Exit 0 always (it is a report)."""
-import argparse, datetime, difflib, glob, json, os, re, shutil, sys, time
+--archive only NAMES the stale references/*.md files as archive candidates (report section + "archive_candidates"
+[{file, reason}] in the JSON summary): age is never a reason to archive, so the lint moves and deletes nothing (an
+archive needs redundancy / supersession / error + evidence: fleet-retro op archive, fleet-skill-apply --op archive).
+"archived" in the summary is always 0 (kept for old readers). Exit 0 always (it is a report).
+Budgets default to the policy (skill/retro-policy.json "budgets"); --cap/--skill-cap override. The last line printed is a
+JSON summary; --json adds "findings" (what fleet-retro --batch puts into its prompt BEFORE generating proposals):
+  {"near_duplicates": [{"ratio", "a": {"file","line","text"}, "b": {...}}], "duplicates": [{"locations": [...], "text"}],
+   "over_budget": [{"file", "chars", "budget"}], "old_entries": [{"file", "days", "kind"}],
+   "promote_to_generic": [{"projects", "text"}]}   (file paths are relative to the fleet root when inside it)
+--no-report skips writing the report file (a read-only run)."""
+import argparse, datetime, glob, json, os, re, sys, time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import fleet_skill_lib as L
 
-NEAR = 0.88
-
-
-def rules_of(path):
-    """[(line_no, raw, normalized)] for bullet / numbered lines and plain sentences long enough to be a rule."""
-    out, fence = [], False
-    try:
-        lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
-    except OSError:
-        return out
-    for i, raw in enumerate(lines, 1):
-        if raw.strip().startswith("```"):
-            fence = not fence; continue
-        if fence or raw.lstrip().startswith(("#", "|", "---")):
-            continue
-        n = L.normalize_rule(raw)
-        if len(n) >= 25:
-            out.append((i, raw.strip(), n))
-    return out
-
-
-def find_dups(files):
-    items = [(f, i, raw, n) for f in files for (i, raw, n) in rules_of(f)]
-    exact, near, seen = [], [], {}
-    for it in items:
-        seen.setdefault(it[3], []).append(it)
-    for n, group in seen.items():
-        if len(group) > 1:
-            exact.append(group)
-    uniq = [g[0] for g in seen.values()]
-    for a in range(len(uniq)):
-        ta = set(uniq[a][3].split())
-        for b in range(a + 1, len(uniq)):
-            tb = set(uniq[b][3].split())
-            if not ta or not tb or len(ta & tb) / len(ta | tb) < 0.5:
-                continue   # cheap prefilter
-            r = difflib.SequenceMatcher(None, uniq[a][3], uniq[b][3]).ratio()
-            if r >= NEAR:
-                near.append((r, uniq[a], uniq[b]))
-    return exact, sorted(near, key=lambda x: -x[0])
+NEAR = L.NEAR
+# rule splitter and near-duplicate helpers live in fleet_skill_lib (shared with fleet_rules_index)
+rules_of, find_dups = L.rules_of, L.find_dups
 
 
 def last_touch(path, root, ledger):
@@ -76,21 +47,7 @@ def _ts(e):
         return 0
 
 
-def find_promotions(per_project):
-    """[(sorted projects, sample text)] for lessons that appear (normalized or near-duplicate) in 2+ projects."""
-    items = [(proj, raw, n) for proj, rules in per_project.items() for (_, raw, n) in rules]
-    groups = []   # [ [set(projects), representative normalized, sample raw] ]
-    for proj, raw, n in items:
-        tn = set(n.split())
-        for g in groups:
-            tg = set(g[1].split())
-            if n == g[1] or (tn and tg and len(tn & tg) / len(tn | tg) >= 0.5
-                             and difflib.SequenceMatcher(None, n, g[1]).ratio() >= NEAR):
-                g[0].add(proj)
-                break
-        else:
-            groups.append([{proj}, n, raw])
-    return [(sorted(g[0]), g[2]) for g in groups if len(g[0]) >= 2]
+find_promotions = L.find_promotions
 
 
 def loc(f, root, i):
@@ -100,13 +57,19 @@ def loc(f, root, i):
 def main():
     ap = argparse.ArgumentParser(prog="fleet-skill-lint")
     ap.add_argument("--days", type=int, default=30)
-    ap.add_argument("--cap", type=int, default=4000, help="learnings.md cap in chars")
-    ap.add_argument("--skill-cap", type=int, default=12000, help="SKILL.md size warning in chars")
+    ap.add_argument("--cap", type=int, default=None, help="lessons files cap in chars (default: policy budgets)")
+    ap.add_argument("--skill-cap", type=int, default=None, help="SKILL.md size warning in chars (default: policy budgets)")
     ap.add_argument("--lessons", default=L.lessons_default())
     ap.add_argument("--report")
     ap.add_argument("--archive", action="store_true")
+    ap.add_argument("--json", action="store_true", help="include the actionable findings in the JSON summary")
+    ap.add_argument("--no-report", action="store_true", help="do not write the report file")
     a = ap.parse_args()
     root = L.fleet_root()
+    bud = L.load_policy(root)["budgets"]
+    cap_learn, cap_proj = (a.cap or bud["learnings_chars"]), (a.cap or bud["lessons_chars"])
+    a.skill_cap = a.skill_cap or bud["skill_md_chars"]
+    over, old = [], []
     sk = L.skill_dir(root)
     skill_md = os.path.join(sk, "fleet-sdd", "SKILL.md")
     refs = sorted(glob.glob(os.path.join(sk, "fleet-sdd", "references", "*.md")))
@@ -123,10 +86,19 @@ def main():
         if os.path.exists(p):
             n = len(open(p, encoding="utf-8").read())
             rep.append(f"- {os.path.relpath(p, root)}: {n} chars" + (f" — OVER {a.skill_cap}: move occasional detail to references/" if n > a.skill_cap else ""))
+            if n > a.skill_cap:
+                over.append({"file": os.path.relpath(p, root), "chars": n, "budget": a.skill_cap})
     if os.path.exists(a.lessons):
         n = len(open(a.lessons, encoding="utf-8").read())
-        rep.append(f"- {a.lessons}: {n} chars" + (f" — OVER CAP {a.cap}: consolidate before adding" if n > a.cap else f" (cap {a.cap})"))
-    rep.append(f"- references: {len(refs)} file(s); ledger entries: {len(ledger)}")
+        rep.append(f"- {a.lessons}: {n} chars" + (f" — OVER CAP {cap_learn}: consolidate before adding" if n > cap_learn else f" (cap {cap_learn})"))
+        if n > cap_learn:
+            over.append({"file": loc(a.lessons, root, 0).rsplit(":", 1)[0], "chars": n, "budget": cap_learn})
+    ref_total = sum(L.references_sizes(root).values())
+    rep.append(f"- references: {len(refs)} file(s), {ref_total} chars total" +
+               (f" — OVER {bud['references_total_chars']}: consolidate or archive" if ref_total > bud["references_total_chars"] else "") +
+               f"; ledger entries: {len(ledger)}")
+    if ref_total > bud["references_total_chars"]:
+        over.append({"file": "skill/fleet-sdd/references/ (total)", "chars": ref_total, "budget": bud["references_total_chars"]})
 
     # duplicates
     exact, near = find_dups(files)
@@ -145,8 +117,12 @@ def main():
         txt = open(p, encoding="utf-8", errors="replace").read()
         pled = L.read_ledger(L.project_scope(proj))
         age = (now - max([os.path.getmtime(p)] + [_ts(e) for e in pled])) / 86400
-        flag = f" — OVER CAP {a.cap}: consolidate before adding" if len(txt) > a.cap else ""
+        flag = f" — OVER CAP {cap_proj}: consolidate before adding" if len(txt) > cap_proj else ""
         flag += f" — untouched for {age:.0f} days: review" if age >= a.days else ""
+        if len(txt) > cap_proj:
+            over.append({"file": os.path.relpath(p, L.orq_root()), "chars": len(txt), "budget": cap_proj})
+        if age >= a.days:
+            old.append({"file": os.path.relpath(p, L.orq_root()), "days": int(age), "kind": "project lessons untouched"})
         rep.append(f"- {p}: {len(txt)} chars, {len(pled)} ledger entr{'y' if len(pled) == 1 else 'ies'}{flag}")
         pe, pn = find_dups([p])
         for g in pe:
@@ -163,57 +139,53 @@ def main():
 
     # staleness
     skill_txt = open(skill_md, encoding="utf-8").read() if os.path.exists(skill_md) else ""
-    stale, moved = [], []
+    stale = []
     rep += ["", f"## Stale lessons (not referenced from SKILL.md and untouched for {a.days}+ days)"]
     for p in refs:
         age = (now - last_touch(p, root, ledger)) / 86400
         referenced = os.path.basename(p) in skill_txt
         if not referenced and age >= a.days:
             stale.append(p)
+            old.append({"file": os.path.relpath(p, root), "days": int(age), "kind": "reference not referenced from SKILL.md"})
             rep.append(f"- {os.path.relpath(p, root)}: {age:.0f} days, not referenced")
         elif not referenced:
             rep.append(f"- (info) {os.path.relpath(p, root)} is not referenced from SKILL.md ({age:.0f} days old)")
     if os.path.exists(a.lessons):
         age = (now - os.path.getmtime(a.lessons)) / 86400
         if age >= a.days:
+            old.append({"file": os.path.basename(a.lessons), "days": int(age), "kind": "generic lessons untouched"})
             rep.append(f"- {a.lessons}: untouched for {age:.0f} days — review whether its rules still hold (never archived automatically)")
     if not stale:
         rep.append("- none to archive")
 
-    # archive (move only)
-    if stale:
-        if a.archive:
-            dest = os.path.join(sk, "archive", time.strftime("%Y%m%d-%H%M%S"))
-            moved = []
-            with L.LedgerLock(L.generic_scope()):
-                ledger = L.read_ledger(L.generic_scope())   # re-read: an apply may have landed meanwhile
-                skill_now = open(skill_md, encoding="utf-8").read() if os.path.exists(skill_md) else ""
-                for p in stale:
-                    if (not os.path.isfile(p) or os.path.islink(p) or os.path.basename(p) in skill_now
-                            or (time.time() - last_touch(p, root, ledger)) / 86400 < a.days):
-                        continue   # no longer eligible
-                    rel = os.path.relpath(p, root)
-                    d = os.path.join(dest, rel)
-                    L.ensure_dir(root, os.path.relpath(os.path.dirname(d), root))
-                    h = L.sha256_file(p)
-                    shutil.move(p, d)
-                    moved.append({"path": rel, "sha256_before": h, "sha256_after": None, "archived_to": os.path.relpath(d, root)})
-                if moved:
-                    L.append_ledger({"id": L.next_id(L.generic_scope()), "ts": L.now_iso(), "op": "archive",
-                                     "scope": "generic", "base": root, "run": "fleet-skill-lint", "files": moved,
-                                     "reason": f"stale > {a.days} days and not referenced", "diff_path": None},
-                                    L.generic_scope())
-            rep += ["", f"## Archived (moved, not deleted) → {os.path.relpath(dest, root)}: {len(moved)}"] + [f"- {m['path']}" for m in moved]
-        else:
-            rep += ["", "Run with --archive to move the stale files to skill/archive/ (never deleted)."]
+    # archive candidates (named only: age is never a reason to archive; nothing is moved)
+    candidates = [{"file": os.path.relpath(p, root), "reason": f"stale > {a.days} days and not referenced from SKILL.md"}
+                  for p in stale]
+    if stale and a.archive:
+        rep += ["", f"## Archive candidates (named only, nothing moved): {len(candidates)}"]
+        rep += [f"- {c['file']}" for c in candidates]
+        rep.append("  → archive needs redundancy / supersession / error + evidence: propose op archive via fleet-retro, "
+                   "applied with fleet-skill-apply --op archive (revertible).")
 
     out = os.path.abspath(a.report or os.path.join(sk, "lint-report.md"))
     inside = os.path.commonpath([out, os.path.abspath(root)]) == os.path.abspath(root)
-    L.safe_write(*((root, os.path.relpath(out, root)) if inside else (os.path.dirname(out), os.path.basename(out))),
-                 "\n".join(rep) + "\n")
-    print(json.dumps({"report": out, "duplicates": len(exact), "near_duplicates": len(near), "stale": len(stale),
-                      "archived": len(moved) if (a.archive and stale) else 0, "project_lessons": len(plf),
-                      "promote_to_generic": len(promote)}))
+    if not a.no_report:
+        L.safe_write(*((root, os.path.relpath(out, root)) if inside else (os.path.dirname(out), os.path.basename(out))),
+                     "\n".join(rep) + "\n")
+    summary = {"report": None if a.no_report else out, "duplicates": len(exact), "near_duplicates": len(near),
+               "stale": len(stale), "archived": 0, "project_lessons": len(plf),
+               "promote_to_generic": len(promote)}
+    if a.archive:
+        summary["archive_candidates"] = candidates
+    if a.json:
+        def item(it):
+            return {"file": loc(it[0], root, it[1]).rsplit(":", 1)[0], "line": it[1], "text": it[2][:200]}
+        summary["findings"] = {
+            "near_duplicates": [{"ratio": round(r, 3), "a": item(x), "b": item(y)} for r, x, y in near[:20]],
+            "duplicates": [{"locations": [loc(f, root, i) for f, i, _, _ in g], "text": g[0][2][:200]} for g in exact[:20]],
+            "over_budget": over, "old_entries": old[:20],
+            "promote_to_generic": [{"projects": projs, "text": raw[:200]} for projs, raw in promote[:10]]}
+    print(json.dumps(summary))
 
 
 if __name__ == "__main__":

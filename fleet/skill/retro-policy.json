@@ -22,7 +22,8 @@
   },
   "budget": {
     "tokens_per_cycle": 25000,
-    "output_allowance_tokens": 4000
+    "output_allowance_tokens": 4000,
+    "outstanding_max_age_hours": 168
   },
   "cycle": {
     "due_hours": 48,

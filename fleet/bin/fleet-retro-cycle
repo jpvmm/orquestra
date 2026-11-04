@@ -76,6 +76,8 @@ class Budget:
     def __init__(self, limit, carry=0):
         """carry: tokens an earlier cycle overshot; charged first (what does not fit stays carried)."""
         self.limit, self.reservations, self.overshoot = int(limit), [], 0
+        self.late_total = 0   # late reconciliation charges taken at the start of this cycle
+        self.settled = {}   # outstanding run name -> (tokens charged this cycle, run finished); written by save_last_cycle
         carry = max(0, int(carry or 0))
         self.spent = min(carry, self.limit)
         self.carry_in, self.carry_rest = carry, carry - self.spent
@@ -97,6 +99,7 @@ class Budget:
     def charge_late(self, extra):
         """Late reconciliation of an earlier cycle's call: its real usage exceeded what was charged then by `extra`."""
         extra = max(0, int(extra))
+        self.late_total += extra
         self.overshoot += max(0, extra - self.left)
         self.spent += extra
 
@@ -105,6 +108,7 @@ class Budget:
         used = real if real > 0 else est
         self.overshoot += max(0, used - self.left)
         self.spent += used
+        return used
 
 
 def read_json(path, default):
@@ -420,7 +424,7 @@ def real_cycle(a, RT, root, pol, st, report, now):
     runs = []
 
     # 0. generation runs that outlived an earlier wait: reconcile their real usage exactly once, before any new call
-    reconcile_outstanding(RT, root, bud, usage)
+    reconcile_outstanding(RT, root, bud, usage, pol, now)
 
     # 1. pending batch whose model run outlived an earlier wait (or whose cycle crashed before finalizing).
     #    Its candidates.json is written BEFORE the task state advances; they come back through previous_pending().
@@ -441,7 +445,7 @@ def real_cycle(a, RT, root, pol, st, report, now):
     if not dirs and not carried and not P.probation_entries():
         rep = P.run(root=root, policy=pol)   # 0 tokens: crash recovery only
         if not (rep["reverted"] or rep["activated"] or rep["recovered"]):
-            save_last_cycle(RT, root, started, bud)
+            save_last_cycle(RT, root, started, bud, empty=True)
             report.update(empty=True, notice=build_notice([], rep, 0, report["late_hours"]))
             finalize_empty(report, root, brel, usage, bud)
             return report
@@ -475,13 +479,14 @@ def real_cycle(a, RT, root, pol, st, report, now):
                    "projects": projects, "skipped_active": skipped, "deferred": deferred,
                    "dirs": [{"task_dir": T, "run": r, "project": p, "latest": by_dir[T][3]} for T, r, p in dirs]}
             save_json(root, os.path.join(brel, "manifest.json"), man)
+            reserve_outstanding(RT, root, name, brel, est, run)   # on disk BEFORE the run starts (crash-safe)
             g = generate(RT, bdir, name, run, prompt, dirs, a)
             usage["calls"]["generation"] += 1
             add_tokens(usage, g["usage"])
-            bud.settle(est, real_total(g["usage"]))
-            if g["state"] == "running":   # keep the reservation: the late result is reconciled when it is collected
-                set_outstanding(RT, root, outstanding_of(RT, root) + [{"name": name, "batch": brel, "reserved": est,
-                                                                        "charged": est}])
+            used = bud.settle(est, real_total(g["usage"]))
+            # the debit becomes durable only in save_last_cycle (one atomic write): a finished run's entry is dropped
+            # there, a still-running one gets charged=used. A crash before that leaves charged=0 → full reconcile.
+            bud.settled[name] = (used, g["state"] != "running")
             if g["state"] == "running" or g["error"]:
                 note.append(f"generation: {g['error']}")
                 usage["errors"].append(str(g["error"])[:200])
@@ -556,47 +561,114 @@ def outstanding_of(RT, root):
     return [o for o in RT.load_state(root).get("outstanding_reservations") or [] if isinstance(o, dict)]
 
 
-def set_outstanding(RT, root, items):
+def write_state(RT, root, st):
+    save_json(root, os.path.relpath(RT.state_path(root), root), st)
+
+
+def commit_outstanding(RT, root, items, carry_add=0, expired=()):
+    """ONE atomic retro-state write (temp + os.replace, the cycle holds the batch lock): the new list of outstanding
+    reservations, the tokens that must be carried (`budget_carry` += carry_add) and the expiry records. A charge and the
+    removal of the entry that justifies it therefore always land together: after a crash the entry is either still
+    there (charged on the rerun) or gone with its charge persisted — never lost, never twice."""
     st = RT.load_state(root)
     if items:
         st["outstanding_reservations"] = items
     else:
         st.pop("outstanding_reservations", None)
-    save_json(root, os.path.relpath(RT.state_path(root), root), st)
+    if carry_add > 0:
+        st["budget_carry"] = max(0, int(st.get("budget_carry") or 0)) + int(carry_add)
+    if expired:
+        old = [e for e in st.get("expired_reservations") or [] if isinstance(e, dict)]
+        st["expired_reservations"] = (old + list(expired))[-20:]
+    write_state(RT, root, st)
 
 
-def reconcile_outstanding(RT, root, bud, usage):
-    """A generation run that was still running when its cycle stopped waiting was charged only its reservation (run
-    name + reserved tokens are kept in retro-state `outstanding_reservations`). Once its run is final, charge the
-    difference between its real usage and what was charged (overshoot is recorded and carried forward) and drop the
-    entry — persisted at once, so a reconciliation happens exactly once. A run still running keeps its entry."""
-    items, keep = outstanding_of(RT, root), []
+def reserve_outstanding(RT, root, name, brel, est, run):
+    """Written BEFORE the generation run is launched: a crash/kill from here on leaves the reservation on disk.
+    charged=0: nothing is durably debited yet (save_last_cycle sets it with the cycle's end-of-cycle write).
+    Idempotent per run name."""
+    items = [o for o in outstanding_of(RT, root) if o.get("name") != name]
+    items.append({"name": name, "run": run, "batch": brel, "reserved": est, "charged": 0, "created": L.now_iso()})
+    commit_outstanding(RT, root, items)
+
+
+def reconcile_outstanding(RT, root, bud, usage, pol, now=None):
+    """A generation run is recorded in retro-state `outstanding_reservations` (run name + reserved tokens, charged=0)
+    before it is launched, and stays there while it may still be running. At the start of every real cycle:
+    * status final → charge real usage (events `result`; the reservation when none) minus `charged`; drop the entry;
+    * status missing / invalid → NOT final: if the events log has a final `result` with usage, reconcile from it;
+      else keep the entry until it is older than policy `budget.outstanding_max_age_hours`, then drop it charging
+      reserved minus charged, never refunding (retro-state + usage `expired_reservations`);
+    * status running → keep (same expiry).
+    `charged` is what an earlier cycle durably debited (set by save_last_cycle). Charges are persisted (budget_carry) in
+    the same atomic write that drops the entries, so a rerun after a crash never double-charges and never loses one."""
+    now = time.time() if now is None else now
+    max_age = float(pol["budget"]["outstanding_max_age_hours"]) * 3600
+    items, keep, extra_total, changed, expired = outstanding_of(RT, root), [], 0, False, []
     for o in items:
         name, brel = str(o.get("name") or ""), str(o.get("batch") or "")
+        reserved, charged = int(o.get("reserved") or 0), int(o.get("charged") or 0)
         runs = os.path.join(root, brel, "runs")
         try:
             with open(os.path.join(runs, name + ".status.json"), encoding="utf-8") as f:
                 state = json.load(f).get("state")
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
             state = None
-        if state is not None and state not in RT.FINAL_STATES:
+        state = state if isinstance(state, str) else None
+        ev = os.path.join(runs, name + ".events.jsonl")
+        real_usage = J.parse_usage(J.scan_events(ev)[1])
+        has_result = any(real_usage.values())
+        final = state in RT.FINAL_STATES or (state is None and has_result)
+        if not final:
+            created = parse_ts(o.get("created"))
+            if created is None:   # entry from an older version: its age starts now
+                o = dict(o, created=iso(now))
+                changed = True
+            elif now - created > max_age:
+                extra = max(0, reserved - charged)
+                rec = {"name": name, "batch": brel, "reserved": reserved, "charged_now": extra, "expired_at": iso(now)}
+                RT.retire_batch(root, os.path.join(root, brel))   # BEFORE the entry is dropped: a rerun retires nothing twice
+                expired.append(rec)
+                usage.setdefault("expired_reservations", []).append(rec)
+                if extra:
+                    bud.charge_late(extra)
+                    extra_total += extra
+                changed = True
+                continue
             keep.append(o)
             continue
-        real = real_total(J.parse_usage(J.scan_events(os.path.join(runs, name + ".events.jsonl"))[1]))
-        extra = real - int(o.get("charged") or 0)
+        extra = (real_total(real_usage) if has_result else reserved) - charged
         if extra > 0:
             bud.charge_late(extra)
+            extra_total += extra
             usage["late_reconciled_tokens"] = usage.get("late_reconciled_tokens", 0) + extra
         usage.setdefault("reconciled_runs", []).append(name)
-    if len(keep) != len(items):
-        set_outstanding(RT, root, keep)
+        changed = True
+    if changed or len(keep) != len(items):
+        commit_outstanding(RT, root, keep, extra_total, expired)
 
 
-def save_last_cycle(RT, root, started, bud):
+def save_last_cycle(RT, root, started, bud, empty=False):
+    """End-of-cycle state write (ONE atomic write): the carry, and the durable debit of this cycle's own generation run:
+    a finished run's entry is dropped (its overshoot is in the carry), a still-running one is charged=what was charged."""
     st = RT.load_state(root)
     st["last_cycle"] = started
     st["budget_carry"] = bud.carry_out   # tokens a call overshot: charged to the next cycle
-    save_json(root, os.path.relpath(RT.state_path(root), root), st)
+    if empty:   # no call used this cycle's budget: a late/expired charge stays visible in the carry (next cycle pays it)
+        st["budget_carry"] = bud.carry_rest + bud.late_total
+    items = []
+    for o in st.get("outstanding_reservations") or []:
+        if not isinstance(o, dict):
+            continue
+        done = bud.settled.get(o.get("name"))
+        if done and done[1]:
+            continue
+        items.append(dict(o, charged=done[0]) if done else o)
+    if items:
+        st["outstanding_reservations"] = items
+    else:
+        st.pop("outstanding_reservations", None)
+    write_state(RT, root, st)
 
 
 def finalize_empty(report, root, brel, usage, bud):

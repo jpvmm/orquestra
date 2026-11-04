@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [0.2.0] - unreleased
 
+### Fixed
+- `fleet-retro` / `fleet-retro-cycle`: abandoned batches no longer block generation. `collect_pending` treats a missing/broken
+  status plus a final `result` event as final; expiry of a reservation retires its batch (finalized as failed, task state not
+  advanced, before the entry is dropped); an uncollected batch without an entry is retired after `budget.outstanding_max_age_hours`.
+- `fleet-retro-cycle`: budget reservations are crash-safe and idempotent. The outstanding entry is written before the
+  generation run starts (`charged: 0`); the debit becomes durable in the end-of-cycle state write, and a charge and the
+  removal of its entry are one atomic retro-state write. A missing or invalid status file keeps the reservation charged
+  until `budget.outstanding_max_age_hours` (default 168), then it expires without refund (`expired_reservations` in
+  retro-state, last 20, and in `usage.json`).
+- `fleet-retro-shadow`: the source policy lookup refuses a symlinked `fleet/` or `skill/` ancestor.
+
 ### Added
 - Retro loop v0.2.0: `fleet-retro-cycle` (cycle runner, `prompts/retro-routine.md`; empty cycle = 0 model calls),
   `fleet-skill-judge` (paired behavioural check, judge memory in `skill/judge-log.jsonl`), `fleet-skill-eval` (probes),

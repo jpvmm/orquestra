@@ -1062,6 +1062,25 @@ class TestShadow(Base):
             env = mod.shadow_env(dest, name)
         self.assertEqual(env["FLEET_LESSONS"], os.path.join(dest, "CUSTOM-LESSONS.md"))
 
+    def test_custom_lessons_name_ignores_a_symlinked_fleet_or_skill_ancestor(self):
+        mod = load_mod(SHADOW, "fleet_retro_shadow_anc")
+        for which in ("fleet", "skill"):
+            with self.subTest(link=which):
+                src = os.path.join(self.tmp, "src-anc-" + which)
+                outside = os.path.join(self.tmp, "outside-" + which)
+                write(os.path.join(outside, "skill", "retro-policy.json"),
+                      json.dumps({"lessons_file": "EVIL.md"}))
+                os.makedirs(src)
+                if which == "fleet":
+                    os.symlink(outside, os.path.join(src, "fleet"))
+                else:
+                    os.makedirs(os.path.join(src, "fleet"))
+                    os.symlink(os.path.join(outside, "skill"), os.path.join(src, "fleet", "skill"))
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("FLEET_LESSONS_NAME", None)
+                    self.assertNotEqual(mod.source_lessons_name(src), "EVIL.md")
+                    self.assertEqual(mod.source_lessons_name(src), mod.L.lessons_name())
+
     def test_vigia_bin_is_resolved_before_roots_are_redirected(self):
         mod = load_mod(SHADOW, "fleet_retro_shadow_vbin")
         dest = os.path.join(self.tmp, "dest-vbin")

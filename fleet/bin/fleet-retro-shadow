@@ -136,7 +136,12 @@ def source_lessons_name(source):
     """Lessons file name the SOURCE home uses: FLEET_LESSONS_NAME env, else <source>/fleet/skill/retro-policy.json, else default."""
     if os.environ.get("FLEET_LESSONS_NAME"):
         return os.environ["FLEET_LESSONS_NAME"]
-    pol = os.path.join(source, "fleet", "skill", "retro-policy.json")
+    global SOURCE_ROOT
+    SOURCE_ROOT = os.path.realpath(source)   # same containment rule as the copier (build_shadow resets it)
+    fleet_d = os.path.join(source, "fleet")
+    pol = os.path.join(fleet_d, "skill", "retro-policy.json")
+    if not (safe_dir(fleet_d) and safe_dir(os.path.dirname(pol))):   # no symlinked ancestor, nothing outside SOURCE
+        return L.lessons_name()
     try:
         if os.path.isfile(pol) and not os.path.islink(pol) and os.path.getsize(pol) < 1_000_000:
             with open(pol, encoding="utf-8") as f:

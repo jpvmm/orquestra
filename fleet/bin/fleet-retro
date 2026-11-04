@@ -1458,8 +1458,26 @@ class BatchLock:
         os.close(self.fd)
 
 
+def events_have_final_result(path):
+    """True when the events log has a final `result` event carrying usage (same rule as the cycle's reconciliation)."""
+    return any(J.parse_usage(J.scan_events(path)[1]).values())
+
+
+def retire_batch(root, bdir, man=None):
+    """Finalize an abandoned batch as failed, exactly like a generation error: task state NOT advanced (its task dirs are
+    selected again later), manifest marked collected. Idempotent: an already collected batch is left untouched."""
+    mp = os.path.join(bdir, "manifest.json")
+    man = _manifest(mp) if man is None else man
+    if not man or man.get("collected") or not man.get("dirs"):
+        return False
+    finalize_batch(root, bdir, man, {"ok": True, "proposals": 0, "diffs": [], "profile": None, "parsed": False})
+    return True
+
+
 def collect_pending(root, before_finalize=None):
     """Collect the newest uncollected batch whose model run is final (caller holds the batch lock).
+    A missing/broken status file with a final `result` event in the events log counts as final. A batch that is not final,
+    has no outstanding reservation and is older than policy budget.outstanding_max_age_hours is abandoned: retired.
     → ("none", None) | ("running", {state, name}) | ("collected", {"result": finalize_batch output, "bdir": dir})"""
     bds = sorted(glob.glob(os.path.join(L.skill_dir(root), "retro-batches", "*", "manifest.json")))
     for mp in reversed(bds):
@@ -1467,14 +1485,35 @@ def collect_pending(root, before_finalize=None):
         if man.get("collected") or not man.get("dirs"):
             continue
         bdir = os.path.dirname(mp)
+        evp = os.path.join(bdir, "runs", man["name"] + ".events.jsonl")
         try:
             with open(os.path.join(bdir, "runs", man["name"] + ".status.json")) as f:
                 stv = json.load(f)
         except (OSError, ValueError):
             stv = {}
+        if not isinstance(stv, dict):
+            stv = {}
         if stv.get("state") not in FINAL_STATES:
-            return "running", {"state": stv.get("state"), "name": man["name"]}
-        txt, tools, used = scan_events(os.path.join(bdir, "runs", man["name"] + ".events.jsonl"))
+            if not isinstance(stv.get("state"), str) and events_have_final_result(evp):
+                # status missing/broken but the run delivered its result: final. An error result (is_error or a
+                # non-success subtype) is finalized as failed, so the task state is NOT advanced.
+                stv = {"state": "done"} if J.scan_events(evp)[4] is None else {"state": "error"}
+            else:
+                brel = os.path.relpath(bdir, root)
+                held = any(isinstance(o, dict) and o.get("batch") == brel
+                           for o in load_state(root).get("outstanding_reservations") or [])
+                max_age = float(L.load_policy(root)["budget"]["outstanding_max_age_hours"]) * 3600
+                started = _ts(man.get("started"), None)
+                if not held and started is not None and time.time() - started > max_age:
+                    retire_batch(root, bdir, man)   # abandoned (e.g. made by an older version): never blocks forever
+                    continue
+                return "running", {"state": stv.get("state"), "name": man["name"]}
+        if stv.get("state") != "done":   # failed run (status or event-only error result): nothing is collected or
+            # persisted — finalized like a generation error, task state NOT advanced, no candidates
+            res = {"ok": True, "proposals": 0, "diffs": [], "profile": None, "parsed": False,
+                   "retro_state": stv.get("state")}
+            return "collected", {"result": finalize_batch(root, bdir, man, res), "bdir": bdir, "manifest": man}
+        txt, tools, used = scan_events(evp)
         res = collect(bdir, man["run"], txt, man["name"], root, man["projects"], tools, used,
                       [d.get("run") for d in man["dirs"]])
         res["retro_state"] = stv.get("state")

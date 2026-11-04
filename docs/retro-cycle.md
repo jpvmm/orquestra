@@ -77,3 +77,30 @@ Reading the numbers it prints:
 
 `--json` prints the same numbers as a JSON object. The dry-run report and its model run stay inside
 `<dest>/shadow-out`. Remove `<dest>` when you are done.
+
+## Budget reservations are crash-safe
+
+Every generation call is reserved first and tracked in `skill/retro-state.json` → `outstanding_reservations`
+(run name, batch, `reserved` = the estimate, `charged`, `created`). The entry is written **before** the run is launched,
+with `charged: 0` (nothing is durably debited yet), so a crash or kill during the wait never loses the reservation.
+
+The debit becomes durable only in the cycle's end-of-cycle state write (ONE atomic write: temp file + `os.replace`):
+a run that finished inside its cycle has its entry dropped there (an overshoot is in `budget_carry`); a run still running
+gets `charged` = what the cycle charged. A crash before that write leaves `charged: 0`.
+
+At the start of every real cycle (never in `--dry-run`) leftovers are reconciled; the charge and the removal of the entry
+are again ONE atomic write, so a rerun after a crash at any point never double-charges and never loses a charge:
+
+* status final → real usage (events `result`; the reserved amount when there is none) minus `charged` is carried
+  (`late_reconciled_tokens` in `usage.json`);
+* status file missing or invalid JSON → the entry is **not** treated as final: it stays outstanding (counted at its
+  reserved amount), unless the events log has a final `result` with usage, which is then used;
+* an entry older than `budget.outstanding_max_age_hours` (default `168`, in `retro-policy.json`) is dropped; `reserved -
+  charged` is charged and nothing is ever refunded. The record `{name, batch, reserved, charged_now, expired_at}` is
+  written to retro-state `expired_reservations` (last 20) in the same write, and to `usage.json` when one is written.
+  Expiry also **retires the entry's batch**: it is finalized as failed (exactly like a generation error), the task state is
+  not advanced and its task dirs are selected again; the batch is retired before the entry is dropped, so a crash in between
+  is harmless on rerun. A status file that is missing/broken but whose events log has a final `result` counts as final, and
+  `fleet-retro --batch --collect` / the cycle collect the batch from its events. An uncollected batch with no outstanding
+  entry (older version) and a bad/missing status is retired by the same age limit, from the manifest `started`.
+  An otherwise empty cycle writes only retro-state (and carries the charge in `budget_carry`).

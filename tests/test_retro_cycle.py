@@ -797,10 +797,7 @@ class TestResume(Base):
         self.crash_run("finalize")
         b = os.path.join(self.root, "skill", "retro-batches", self.batch_dirs()[-1])
         self.assertTrue(os.path.exists(os.path.join(b, "candidates.json")))
-        self.assertFalse(
-            os.path.exists(os.path.join(self.root, "skill", "retro-state.json")),
-            "task state not advanced",
-        )
+        self.assertNotIn("seen", self.state(), "task state not advanced")
         self.assertFalse(
             json.loads(rd(os.path.join(b, "manifest.json"))).get("collected")
         )
@@ -901,6 +898,549 @@ class TestNotice(Base):
         self.assertEqual(
             len(mod.build_notice([], {"reverted": [{"id": "5"}]}, 0, None)), 1
         )
+
+
+def cycle_args(**over):
+    import argparse
+
+    d = dict(
+        dry_run=False,
+        force=True,
+        with_model=False,
+        out=None,
+        model="sonnet",
+        judge_model=None,
+        max_min=15,
+        wait_sec=1,
+    )
+    d.update(over)
+    return argparse.Namespace(**d)
+
+
+class TestOutstandingReservations(Base):
+    """T10: reserve -> launch -> charge -> release is crash-safe and idempotent; a missing/broken status keeps the charge."""
+
+    BREL = os.path.join("skill", "retro-batches", "20990101-000000-000001aa")
+
+    def setUp(self):
+        super().setUp()
+        self.mod = load_mod(CYCLE, "fleet_retro_cycle_t10")
+        p = unittest.mock.patch.dict(os.environ, self.env())
+        p.start()
+        self.addCleanup(p.stop)
+        self.RT = self.mod.load_retro()
+        self.pol = self.mod.L.load_policy(self.root)
+
+    def entry(self, name="retro-batch-x", reserved=1000, charged=1000, created=None):
+        return {
+            "name": name,
+            "batch": self.BREL,
+            "reserved": reserved,
+            "charged": charged,
+            "created": created or self.mod.L.now_iso(),
+        }
+
+    def put_state(self, items, carry=0):
+        st = {"outstanding_reservations": items}
+        if carry:
+            st["budget_carry"] = carry
+        write(os.path.join(self.root, "skill", "retro-state.json"), json.dumps(st))
+
+    def put_run(self, name, state="done", status_text=None, usage=None):
+        runs = os.path.join(self.root, self.BREL, "runs")
+        if status_text is None and state is not None:
+            status_text = json.dumps({"state": state})
+        if status_text is not None:
+            write(os.path.join(runs, name + ".status.json"), status_text)
+        if usage is not None:
+            ev = json.dumps(
+                {"type": "result", "subtype": "success", "result": "x", "usage": usage}
+            )
+            write(os.path.join(runs, name + ".events.jsonl"), ev + "\n")
+
+    def reconcile(self, now=None):
+        bud = self.mod.Budget(25000, self.state().get("budget_carry"))
+        usage = self.mod.fresh_usage("s", 25000)
+        self.mod.reconcile_outstanding(self.RT, self.root, bud, usage, self.pol, now)
+        return bud, usage
+
+    def test_final_run_charged_once_across_reruns(self):
+        self.put_state([self.entry()])
+        self.put_run(
+            "retro-batch-x", usage={"input_tokens": 3000, "output_tokens": 500}
+        )
+        bud, usage = self.reconcile()
+        self.assertEqual(usage["late_reconciled_tokens"], 2500)
+        self.assertEqual(
+            self.state()["budget_carry"],
+            2500,
+            "charge persisted with the entry removal",
+        )
+        self.assertNotIn("outstanding_reservations", self.state())
+        for _ in range(2):
+            bud, usage = self.reconcile()
+            self.assertNotIn("late_reconciled_tokens", usage)
+            self.assertEqual(self.state()["budget_carry"], 2500)
+
+    def test_crash_before_the_atomic_write_loses_nothing(self):
+        self.put_state([self.entry()], carry=100)
+        self.put_run(
+            "retro-batch-x", usage={"input_tokens": 3000, "output_tokens": 500}
+        )
+        with unittest.mock.patch.object(
+            self.mod, "commit_outstanding", side_effect=KeyboardInterrupt
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.reconcile()
+        self.assertEqual(len(self.state()["outstanding_reservations"]), 1)
+        self.assertEqual(self.state()["budget_carry"], 100)
+        bud, usage = self.reconcile()
+        self.assertEqual(usage["late_reconciled_tokens"], 2500)
+        self.assertEqual(self.state()["budget_carry"], 2600)
+        bud, usage = self.reconcile()
+        self.assertEqual(self.state()["budget_carry"], 2600, "no double charge")
+
+    def test_crash_after_the_atomic_write_keeps_the_charge(self):
+        self.put_state([self.entry()])
+        self.put_run(
+            "retro-batch-x", usage={"input_tokens": 3000, "output_tokens": 500}
+        )
+        real = self.mod.commit_outstanding
+
+        def commit_then_die(*a, **k):
+            real(*a, **k)
+            raise KeyboardInterrupt
+
+        with unittest.mock.patch.object(
+            self.mod, "commit_outstanding", side_effect=commit_then_die
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.reconcile()
+        self.assertEqual(self.state()["budget_carry"], 2500)
+        self.assertNotIn("outstanding_reservations", self.state())
+        bud, usage = self.reconcile()
+        self.assertEqual(bud.carry_in, 2500, "the next cycle pays it, once")
+        self.assertNotIn("late_reconciled_tokens", usage)
+        self.assertEqual(self.state()["budget_carry"], 2500)
+
+    def test_entry_is_on_disk_before_the_run_and_survives_a_crash_during_the_wait(
+        self,
+    ):
+        self.mk()
+        seen = {}
+
+        def dying_generate(RT, task_dir, name, run, prompt, dirs, a):
+            seen["out"] = self.state()["outstanding_reservations"]
+            raise KeyboardInterrupt
+
+        with unittest.mock.patch.object(
+            self.mod, "generate", side_effect=dying_generate
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.mod.cycle(cycle_args())
+        (o,) = seen["out"]
+        self.assertGreater(o["reserved"], 0)
+        self.assertEqual(o["charged"], 0, "nothing is durably debited yet")
+        self.assertTrue(o["name"].startswith("retro-batch-") and o["batch"])
+        self.assertEqual(self.state()["outstanding_reservations"], [o])
+        self.assertEqual(self.calls(), 0)
+
+    def crash_during_wait(self, run_finishes):
+        """Cycle 1 dies while waiting for the generation (after the run did or did not produce its result)."""
+        real_gen = self.mod.generate
+
+        def dying_generate(RT, task_dir, name, run, prompt, dirs, a):
+            if run_finishes:
+                real_gen(RT, task_dir, name, run, prompt, dirs, a)
+            raise KeyboardInterrupt
+
+        with unittest.mock.patch.object(
+            self.mod, "generate", side_effect=dying_generate
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.mod.cycle(cycle_args())
+        (o,) = self.state()["outstanding_reservations"]
+        return o
+
+    def test_restart_after_crash_during_generation_charges_the_real_usage_once(self):
+        # real == est, real > est, real < est
+        for label, real_of in (
+            ("equal", lambda est: est),
+            ("above", lambda est: est + 7000),
+            ("below", lambda est: 100),
+        ):
+            with self.subTest(real=label):
+                shutil.rmtree(os.path.join(self.root, "skill", "retro-batches"), True)
+                write(os.path.join(self.root, "skill", "retro-state.json"), "{}")
+                T = self.mk()
+                os.makedirs(self.ativos, exist_ok=True)
+                est_probe = self.crash_during_wait(False)["reserved"]
+                shutil.rmtree(os.path.join(self.root, "skill", "retro-batches"), True)
+                write(os.path.join(self.root, "skill", "retro-state.json"), "{}")
+                real = real_of(est_probe)
+                self.usage("gen", input_tokens=real, output_tokens=0)
+                o = self.crash_during_wait(True)
+                self.assertEqual(o["charged"], 0)
+                durable = self.state().get(
+                    "budget_carry", 0
+                )  # persisted by the crashed cycle: nothing
+                self.assertEqual(durable, 0)
+                bud, usage = self.reconcile()
+                durable += usage.get("late_reconciled_tokens", 0)
+                self.assertEqual(durable, real, "charged exactly once")
+                self.assertEqual(self.state().get("budget_carry", 0), real)
+                self.assertNotIn("outstanding_reservations", self.state())
+                for _ in range(2):
+                    bud, usage = self.reconcile()
+                    self.assertNotIn("late_reconciled_tokens", usage)
+                    self.assertEqual(self.state().get("budget_carry", 0), real)
+                shutil.rmtree(T, True)
+
+    def test_full_restart_cycle_after_crash_charges_real_once(self):
+        self.mk()
+        self.usage("gen", input_tokens=9000, output_tokens=1000)
+        self.crash_during_wait(True)
+        self.mod.cycle(
+            cycle_args()
+        )  # the restart: reconciles at startup (this one has no other work)
+        self.assertNotIn("outstanding_reservations", self.state())
+        self.assertEqual(self.state()["budget_carry"], 10000, "real usage, once")
+        self.mod.cycle(
+            cycle_args()
+        )  # the next cycle pays the carry once; nothing is reconciled again
+        self.assertNotIn("outstanding_reservations", self.state())
+        self.assertEqual(self.state().get("budget_carry", 0), 0)
+        self.mod.cycle(cycle_args())
+        self.assertEqual(self.state().get("budget_carry", 0), 0)
+        self.assertEqual(
+            self.calls("gen"), 1, "only the crashed cycle's run; no re-charge call"
+        )
+
+    def test_running_then_finished_run_totals_the_real_usage_once(self):
+        for label, real_of in (
+            ("equal", lambda est: est),
+            ("above", lambda est: est + 7000),
+            ("below", lambda est: 100),
+        ):
+            with self.subTest(real=label):
+                shutil.rmtree(os.path.join(self.root, "skill", "retro-batches"), True)
+                write(os.path.join(self.root, "skill", "retro-state.json"), "{}")
+                self.mk()
+                with unittest.mock.patch.dict(os.environ, {"FAKE_STATE": "running"}):
+                    self.mod.cycle(cycle_args())
+                (o,) = self.state()["outstanding_reservations"]
+                est = o["charged"]
+                self.assertEqual(est, o["reserved"], "end-of-cycle write debits est")
+                self.assertEqual(self.usage_json()["budget"]["spent"], est)
+                real = real_of(est)
+                ev = os.path.join(self.root, o["batch"], "runs", o["name"])
+                lines = rd(ev + ".events.jsonl").splitlines()
+                res = json.loads(lines[-1])
+                res["usage"] = {"input_tokens": real, "output_tokens": 0}
+                write(
+                    ev + ".events.jsonl",
+                    "\n".join(lines[:-1] + [json.dumps(res)]) + "\n",
+                )
+                write(ev + ".status.json", json.dumps({"state": "done"}))
+                bud, usage = self.reconcile()
+                late = usage.get("late_reconciled_tokens", 0)
+                self.assertEqual(est + late, max(real, est), "debited once")
+                self.assertNotIn("outstanding_reservations", self.state())
+
+    def test_crash_during_wait_without_a_result_expires_at_the_reserved_amount(self):
+        self.mk()
+        o = self.crash_during_wait(False)
+        bud, usage = self.reconcile()
+        self.assertEqual(len(self.state()["outstanding_reservations"]), 1, "kept")
+        self.assertEqual(self.state().get("budget_carry", 0), 0)
+        bud, usage = self.reconcile(now=time.time() + 169 * 3600)
+        self.assertEqual(self.state()["budget_carry"], o["reserved"])
+        (ex,) = self.state()["expired_reservations"]
+        self.assertEqual(ex["charged_now"], o["reserved"])
+        bud, usage = self.reconcile(now=time.time() + 170 * 3600)
+        self.assertEqual(self.state()["budget_carry"], o["reserved"], "once")
+
+    def test_normal_cycle_releases_the_entry(self):
+        self.mk()
+        self.mod.cycle(cycle_args())
+        self.assertNotIn("outstanding_reservations", self.state())
+        self.assertEqual(self.usage_json()["calls"]["generation"], 1)
+
+    def test_overshoot_inside_the_cycle_is_persisted_with_the_release(self):
+        self.mk()
+        self.usage("gen", input_tokens=30000, output_tokens=0)
+        self.answer("gen", {"verdict": "nothing_to_save", "proposals": []})
+        pol = self.policy(budget={"tokens_per_cycle": 10000})
+        with unittest.mock.patch.dict(os.environ, pol):
+            self.mod.cycle(cycle_args())
+        self.assertNotIn("outstanding_reservations", self.state())
+        self.assertEqual(
+            self.state()["budget_carry"], self.usage_json()["carry_out_tokens"]
+        )
+        self.assertGreater(self.state()["budget_carry"], 0)
+
+    def test_still_running_run_keeps_its_entry_charged_at_the_reservation(self):
+        self.mk()
+        with unittest.mock.patch.dict(os.environ, {"FAKE_STATE": "running"}):
+            self.mod.cycle(cycle_args())
+        (o,) = self.state()["outstanding_reservations"]
+        self.assertEqual(o["reserved"], o["charged"], "end-of-cycle write debits it")
+        self.assertEqual(self.usage_json()["budget"]["spent"], o["charged"])
+
+    def test_missing_status_without_result_stays_outstanding(self):
+        self.put_state([self.entry()])
+        bud, usage = self.reconcile()
+        self.assertEqual(len(self.state()["outstanding_reservations"]), 1)
+        self.assertNotIn("reconciled_runs", usage)
+        self.assertEqual(bud.spent, 0)
+
+    def test_broken_status_without_result_stays_outstanding(self):
+        self.put_state([self.entry()])
+        self.put_run("retro-batch-x", state=None, status_text="{not json")
+        bud, usage = self.reconcile()
+        self.assertEqual(len(self.state()["outstanding_reservations"]), 1)
+        self.assertNotIn("expired_reservations", usage)
+
+    def test_status_without_state_key_stays_outstanding(self):
+        self.put_state([self.entry()])
+        self.put_run("retro-batch-x", state=None, status_text="[1]")
+        self.reconcile()
+        self.assertEqual(len(self.state()["outstanding_reservations"]), 1)
+
+    def test_missing_or_broken_status_with_final_result_reconciles_from_events(self):
+        for status_text in (None, "{broken"):
+            with self.subTest(status=status_text):
+                self.put_state([self.entry()])
+                self.put_run(
+                    "retro-batch-x",
+                    state=None,
+                    status_text=status_text,
+                    usage={
+                        "input_tokens": 1800,
+                        "output_tokens": 200,
+                        "cache_read_input_tokens": 100,
+                    },
+                )
+                bud, usage = self.reconcile()
+                self.assertEqual(usage["late_reconciled_tokens"], 1100)
+                self.assertNotIn("outstanding_reservations", self.state())
+                self.assertEqual(self.state()["budget_carry"], 1100)
+                write(os.path.join(self.root, "skill", "retro-state.json"), "{}")
+
+    def test_expiry_drops_the_entry_but_never_refunds(self):
+        old = self.mod.iso(time.time() - 200 * 3600)
+        self.put_state(
+            [self.entry(created=old, charged=400), self.entry(name="fresh")], carry=700
+        )
+        bud, usage = self.reconcile()
+        self.assertEqual(
+            [o["name"] for o in self.state()["outstanding_reservations"]], ["fresh"]
+        )
+        (ex,) = usage["expired_reservations"]
+        self.assertEqual((ex["name"], ex["charged_now"]), ("retro-batch-x", 600))
+        self.assertEqual(ex["reserved"], 1000)
+        self.assertEqual(self.state()["expired_reservations"], [ex])
+        self.assertEqual(
+            self.state()["budget_carry"], 1300, "reserved minus charged, no refund"
+        )
+        self.assertNotIn("late_reconciled_tokens", usage)
+
+    def test_expired_records_are_capped_at_twenty(self):
+        old = self.mod.iso(time.time() - 200 * 3600)
+        self.put_state([self.entry(name=f"n{i}", created=old) for i in range(3)])
+        st = self.state()
+        st["expired_reservations"] = [{"name": f"e{i}"} for i in range(19)]
+        write(os.path.join(self.root, "skill", "retro-state.json"), json.dumps(st))
+        self.reconcile()
+        names = [e["name"] for e in self.state()["expired_reservations"]]
+        self.assertEqual(len(names), 20)
+        self.assertEqual(names[-3:], ["n0", "n1", "n2"])
+        self.assertEqual(names[0], "e2")
+
+    def test_empty_cycle_keeps_the_expiry_evidence_in_retro_state(self):
+        old = self.mod.iso(time.time() - 200 * 3600)
+        self.put_state([self.entry(created=old, charged=0)])
+        self.mod.cycle(cycle_args())
+        st = self.state()
+        self.assertNotIn("outstanding_reservations", st)
+        (ex,) = st["expired_reservations"]
+        self.assertEqual(
+            (ex["name"], ex["reserved"], ex["charged_now"]),
+            ("retro-batch-x", 1000, 1000),
+        )
+        self.assertIn("expired_at", ex)
+        self.assertEqual(st["budget_carry"], 1000, "reserved minus charged is carried")
+        self.assertEqual(self.batch_dirs(), [], "an empty cycle writes no usage file")
+        self.assertEqual(self.calls(), 0)
+
+    def test_expiry_age_comes_from_policy_and_legacy_entries_start_aging_now(self):
+        self.assertEqual(self.pol["budget"]["outstanding_max_age_hours"], 168)
+        legacy = {"name": "old", "batch": self.BREL, "reserved": 5, "charged": 5}
+        self.put_state([legacy])
+        self.reconcile()
+        (o,) = self.state()["outstanding_reservations"]
+        self.assertIn("created", o)
+        bud, usage = self.reconcile(now=time.time() + 169 * 3600)
+        self.assertNotIn("outstanding_reservations", self.state())
+        self.assertEqual(usage["expired_reservations"][0]["name"], "old")
+
+
+class TestAbandonedBatches(TestOutstandingReservations):
+    """T10 round 2: an expired / orphaned / event-final batch never blocks generation forever."""
+
+    def age_entry(self, hours=200):
+        st = self.state()
+        for o in st["outstanding_reservations"]:
+            o["created"] = self.mod.iso(time.time() - hours * 3600)
+        write(os.path.join(self.root, "skill", "retro-state.json"), json.dumps(st))
+
+    def manifests(self):
+        base = os.path.join(self.root, "skill", "retro-batches")
+        out = []
+        for b in self.batch_dirs():
+            mp = os.path.join(base, b, "manifest.json")
+            if os.path.exists(mp):
+                out.append(json.loads(rd(mp)))
+        return out
+
+    def test_crash_before_launch_then_max_age_retires_batch_and_generates_again(self):
+        self.mk()
+        o = self.crash_during_wait(False)
+        self.mod.cycle(cycle_args())
+        self.assertEqual(
+            self.calls("gen"), 0, "young entry: the batch is still pending"
+        )
+        self.assertEqual(len(self.state()["outstanding_reservations"]), 1)
+        self.age_entry()
+        self.mod.cycle(cycle_args())
+        self.assertEqual(self.calls("gen"), 1, "retired + a new generation ran")
+        st = self.state()
+        self.assertNotIn("outstanding_reservations", st)
+        self.assertEqual([e["name"] for e in st["expired_reservations"]], [o["name"]])
+        old = [m for m in self.manifests() if m["name"] == o["name"]][0]
+        self.assertTrue(old["collected"])
+        self.assertTrue(st["last_batch"].startswith("retro-batch-"))
+        self.assertNotEqual(
+            st["last_batch"], o["name"], "the task state advanced by the NEW batch"
+        )
+
+    def test_status_missing_with_result_event_collects_the_batch_and_next_cycle_generates(
+        self,
+    ):
+        self.mk()
+        self.answer("gen", {"verdict": "proposals", "proposals": [PROJECT]})
+        o = self.crash_during_wait(True)
+        os.remove(
+            os.path.join(self.root, o["batch"], "runs", o["name"] + ".status.json")
+        )
+        self.mod.cycle(cycle_args())
+        self.assertEqual(
+            self.calls("gen"), 1, "collected from events, no new generation"
+        )
+        self.assertIn("make all", rd(os.path.join(self.tmp, "acme", "LESSONS.md")))
+        self.assertEqual(self.state()["last_batch"], o["name"])
+        self.assertTrue(
+            [m for m in self.manifests() if m["name"] == o["name"]][0]["collected"]
+        )
+        self.assertNotIn("outstanding_reservations", self.state())
+        T2 = self.mk(task="t2")
+        later = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(time.time() + 30))
+        write(
+            os.path.join(T2, "runs", "fleet-t2-lead-010101.status.json"),
+            json.dumps({"state": "done", "ended_at": later}),
+        )
+        self.mod.cycle(cycle_args())
+        self.assertEqual(self.calls("gen"), 2)
+
+    def test_collect_pending_treats_broken_status_with_result_as_final(self):
+        self.mk()
+        o = self.crash_during_wait(True)
+        write(
+            os.path.join(self.root, o["batch"], "runs", o["name"] + ".status.json"),
+            "{broken",
+        )
+        state, res = self.RT.collect_pending(self.root)
+        self.assertEqual(state, "collected")
+
+    def test_status_missing_with_error_result_event_is_finalized_as_failed(self):
+        self.mk()
+        self.answer("gen", {"verdict": "proposals", "proposals": [PROJECT]})
+        o = self.crash_during_wait(True)
+        runs = os.path.join(self.root, o["batch"], "runs")
+        os.remove(os.path.join(runs, o["name"] + ".status.json"))
+        ev = os.path.join(runs, o["name"] + ".events.jsonl")
+        lines = []
+        for line in rd(ev).splitlines():
+            e = json.loads(line)
+            if isinstance(e, dict) and e.get("type") == "result":
+                e.update(subtype="error_during_execution", is_error=True)
+            lines.append(json.dumps(e))
+        write(ev, "\n".join(lines) + "\n")
+        self.mod.cycle(cycle_args())   # full cycle: recovery + judge/apply of anything pending
+        man = [m for m in self.manifests() if m["name"] == o["name"]][0]
+        self.assertTrue(man["collected"], "an error result is final, not stuck as running")
+        self.assertNotEqual(self.state().get("last_batch"), o["name"], "error result must NOT advance the task state")
+        cands = os.path.join(self.root, o["batch"], "candidates.json")
+        self.assertFalse(os.path.exists(cands) and json.loads(rd(cands)).get("segments"),
+                         "no candidates persisted from a failed run")
+        # the failed batch's task dirs are analyzed again by a NEW generation (whose answer may be applied normally)
+        self.assertEqual(self.calls("gen"), 2)
+
+    def test_old_version_orphan_batch_is_retired_after_max_age(self):
+        self.mk()
+        o = self.crash_during_wait(False)
+        st = self.state()
+        st.pop("outstanding_reservations")  # an older version never wrote entries
+        write(os.path.join(self.root, "skill", "retro-state.json"), json.dumps(st))
+        mp = os.path.join(self.root, o["batch"], "manifest.json")
+        man = json.loads(rd(mp))
+        self.mod.cycle(cycle_args())
+        self.assertEqual(self.calls("gen"), 0, "young orphan still blocks")
+        man["started"] = self.mod.iso(time.time() - 200 * 3600)
+        write(mp, json.dumps(man))
+        self.mod.cycle(cycle_args())
+        self.assertEqual(self.calls("gen"), 1)
+        self.assertTrue(
+            [m for m in self.manifests() if m["name"] == o["name"]][0]["collected"]
+        )
+        self.assertNotIn("expired_reservations", self.state())
+
+    def test_crash_between_retire_and_entry_drop_charges_once_and_retires_once(self):
+        self.mk()
+        o = self.crash_during_wait(False)
+        self.age_entry()
+        retired = []
+        real_retire = self.RT.retire_batch
+
+        def counting(root, bdir, man=None):
+            r = real_retire(root, bdir, man)
+            retired.append(r)
+            return r
+
+        with (
+            unittest.mock.patch.object(self.RT, "retire_batch", side_effect=counting),
+            unittest.mock.patch.object(self.mod, "load_retro", return_value=self.RT),
+        ):
+            with unittest.mock.patch.object(
+                self.mod, "commit_outstanding", side_effect=KeyboardInterrupt
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.mod.cycle(cycle_args())
+            self.assertEqual(len(self.state()["outstanding_reservations"]), 1)
+            self.assertEqual(self.state().get("budget_carry", 0), 0)
+            self.mod.cycle(cycle_args())
+            self.mod.cycle(cycle_args())
+        self.assertEqual(retired[0], True)
+        self.assertEqual(
+            retired.count(True), 1, "retired once; the rerun finds it collected"
+        )
+        self.assertEqual(len(self.state()["expired_reservations"]), 1)
+        (ex,) = self.state()["expired_reservations"]
+        self.assertEqual(
+            ex["charged_now"], o["reserved"], "reserved amount charged once"
+        )
+        self.assertNotIn("outstanding_reservations", self.state())
+        self.assertEqual(self.calls("gen"), 1)
 
 
 if __name__ == "__main__":

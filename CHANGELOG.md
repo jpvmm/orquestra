@@ -16,13 +16,14 @@ All notable changes to this project are documented here. The format is based on
   stream-json result. Typical cycle estimate <= ~25k tokens.
 - `install.sh` installs all loop tools and the policy; records `skill/.install-baseline.json`.
 - `tests/test_oss_port.py` and the other v0.2.0 test files.
-- Shadow-run numbers (T8): _placeholder, filled in by the operator before release_.
+- Shadow-run numbers (T8, dry run on a copy of a real home, no model call): 20 tasks / 3 projects / 1037 files copied
+  (no Vigia folder, no `.env` files), 10 tasks selected, 1 skipped as active, estimated 18,428 tokens (fits the 25k cap).
 
 ### Changed
 - Re-install never overwrites a skill/config/agent file that differs from its recorded baseline (written as
   `<file>.upstream` and reported) nor any bookkeeping file (ledgers, archive, evals, judge log, rules index, retro state,
   `LESSONS.md`, `learnings.md`).
-- One path resolver (`ORQUESTRA_HOME`, default `~/.orquestra`) for every loop tool; no `/workspace`, `/home/` or
+- One path resolver (`ORQ_ROOT`, then `ORQUESTRA_HOME`, then the folder above `fleet/`) for every loop tool and `fleet-run`; no `/workspace`, `/home/` or
   personal names in shipped files. `docs/fleet.md` retro section rewritten.
 
 ### Deferred (not in 0.2.0)

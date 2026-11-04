@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""fleet-skill-apply — apply a retro proposal diff (generic skill or project lessons), with a ledger and exact revert.
+
+  fleet-skill-apply DIFF --run RUN --reason "why"            check, back up, apply, append a ledger line
+  fleet-skill-apply --revert ID [--scope S] [--reason "why"]  restore the exact bytes recorded before ledger entry ID
+  options: --check (only check), --scope generic|project:<name> (assert/choose the ledger; default: from the diff
+           paths), --allow-active (apply to always-loaded files while a fleet lead runs), --force (revert after drift)
+
+Scopes (picked from the diff's paths; one scope per diff):
+  generic  skill/... and .claude/agents/... (relative to the fleet root), learnings.md (relative to the Orquestra
+           root) → FLEET_ROOT/skill/ledger.jsonl, backups FLEET_ROOT/skill/ledger-backups/<id>/
+  project  <project>/LESSONS.md (relative to the Orquestra root) → ORQ_ROOT/<project>/lessons-ledger.jsonl,
+           backups ORQ_ROOT/<project>/lessons-backups/<id>/
+Ledger line: {id, ts, op, scope, base, run, files:[{path, sha256_before, sha256_after}], reason, diff_path}.
+Refused: renames/copies/mode changes/binary/deletions, headerless git sections, bookkeeping paths (ledger, lock,
+backups, proposals, archive), symlinked targets. The diff is snapshotted once to a private temp file and every step
+(validation, check, apply, backup copy) uses that snapshot, under the ledger lock.
+Exit: 0 ok, 1 refused/not clean, 2 usage."""
+import argparse, json, os, re, shutil, sys, tempfile
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fleet_skill_lib as L
+
+ALWAYS_LOADED = ("skill/fleet-sdd/SKILL.md", ".claude/agents/team-lead.md")
+
+
+class Refuse(Exception):
+    def __init__(self, obj, code=1):
+        self.obj, self.code = obj, code
+
+
+def out(obj, code=0):
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+    sys.exit(code)
+
+
+def plan(snapshot, forced_scope):
+    """Validate the snapshot → (scope, [rel]). Raises Refuse."""
+    with open(snapshot, encoding="utf-8", errors="strict") as f:
+        text = f.read()
+    probs = L.patch_problems(text)
+    if probs:
+        raise Refuse({"ok": False, "error": "unsupported patch", "problems": probs[:10]})
+    scope, rels = None, []
+    for rel, is_new, is_del in L.diff_files(text):
+        if is_del:
+            raise Refuse({"ok": False, "error": f"diff deletes a file ({rel}); deletions are not allowed — archive instead"})
+        sc, norm = L.scope_for_path(rel)
+        if sc is None:
+            raise Refuse({"ok": False, "error": norm})
+        if scope is not None and (sc.key != scope.key or sc.base != scope.base):
+            raise Refuse({"ok": False, "error": "diff mixes scopes/roots (split it: one diff per ledger)",
+                          "files": rels + [norm]})
+        scope = sc
+        if norm in rels:
+            raise Refuse({"ok": False, "error": f"file appears twice in the diff: {norm}"})
+        rels.append(norm)
+        link = L.symlink_in_path(scope.base, norm)
+        if link:
+            raise Refuse({"ok": False, "error": f"refusing symlinked path component {link}"})
+    if forced_scope is not None and forced_scope.key != scope.key:
+        raise Refuse({"ok": False, "error": f"--scope {forced_scope.label()} does not match the diff ({scope.label()})"})
+    paths, summary = L.git_patch_paths(snapshot, scope.base)
+    if paths is None:
+        raise Refuse({"ok": False, "error": "git cannot parse the diff", "detail": summary})
+    created_ok = {f"create mode 100644 {r}" for r in rels}
+    extra = [p for p in paths if p not in rels] + [s for s in summary if s not in created_ok]
+    if extra or len(paths) != len(rels):
+        raise Refuse({"ok": False, "error": "git would touch more than the validated files", "detail": extra[:10]})
+    for d in (scope.ledger_dir, scope.backups):
+        link = L.symlink_in_path(scope.anchor, scope.rel(d))
+        if link:
+            raise Refuse({"ok": False, "error": f"refusing symlinked bookkeeping path {link}"})
+    return scope, rels
+
+
+def apply(a, forced_scope):
+    if not os.path.isfile(a.diff):
+        out({"ok": False, "error": f"diff not found: {a.diff}"}, 2)
+    tmpd = tempfile.mkdtemp(prefix="fleet-skill-apply-")
+    try:
+        snap = os.path.join(tmpd, "change.diff")
+        with open(a.diff, "rb") as src, open(snap, "wb") as dst:   # one read; every later step uses these bytes
+            dst.write(src.read())
+        try:
+            scope, rels = plan(snap, forced_scope)
+        except Refuse as r:
+            out(r.obj, r.code)
+        ok, msg = L.git_apply(snap, scope.base, check_only=True)
+        if not ok:
+            out({"ok": False, "error": "diff does not apply cleanly", "detail": msg[-1500:]}, 1)
+        if a.check:
+            out({"ok": True, "check_only": True, "scope": scope.label(), "files": rels})
+        hot = [r for r in rels if r in ALWAYS_LOADED and scope.base == L.fleet_root()]
+        leads = L.active_leads()
+        if leads and hot and not a.allow_active:
+            out({"ok": False, "error": "a fleet lead is running and the diff touches an always-loaded file; retry when it "
+                 "ends or pass --allow-active", "active": leads, "files": hot}, 1)
+        with L.LedgerLock(scope):
+            ok, msg = L.git_apply(snap, scope.base, check_only=True)   # re-check under the lock (files may have moved)
+            if not ok:
+                out({"ok": False, "error": "diff no longer applies cleanly", "detail": msg[-1500:]}, 1)
+            lid = L.next_id(scope)
+            bdir = L.ensure_dir(scope.anchor, scope.rel(os.path.join(scope.backups, lid)))
+            entry_files = []
+            for rel in rels:
+                src = os.path.join(scope.base, rel)
+                before = L.sha256_file(src)
+                if before is not None:
+                    with open(src, "rb") as f:
+                        L.safe_write(bdir, os.path.join("before", rel), f.read())
+                entry_files.append({"path": rel, "sha256_before": before})
+            with open(snap, "rb") as f:
+                L.safe_write(bdir, "change.diff", f.read())
+            ok, msg = L.git_apply(snap, scope.base, check_only=False)
+            if not ok:   # should not happen after the check; restore what we saved
+                restore(scope, bdir, entry_files)
+                out({"ok": False, "error": "git apply failed after a clean check; files restored", "detail": msg[-1500:]}, 1)
+            for f in entry_files:
+                f["sha256_after"] = L.sha256_file(os.path.join(scope.base, f["path"]))
+            entry = {"id": lid, "ts": L.now_iso(), "op": "apply", "scope": scope.label(), "base": scope.base,
+                     "run": a.run, "files": entry_files, "reason": a.reason,
+                     "diff_path": os.path.abspath(a.diff), "diff_copy": os.path.join(bdir, "change.diff")}
+            L.append_ledger(entry, scope)
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    out({"ok": True, "ledger": entry})
+
+
+def restore(scope, bdir, files, base=None):
+    base = base or scope.base
+    for f in files:
+        dst = os.path.join(base, f["path"])
+        if f["sha256_before"] is None:
+            if os.path.lexists(dst):   # created by the change: keep a copy, never just delete it
+                L.ensure_dir(bdir, os.path.dirname(os.path.join("reverted-created", f["path"])))
+                shutil.move(dst, os.path.join(bdir, "reverted-created", f["path"]))
+        else:
+            with open(os.path.join(bdir, "before", f["path"]), "rb") as fh:
+                L.safe_write(base, f["path"], fh.read())
+
+
+def revert(a, scope):
+    with L.LedgerLock(scope):   # read, validate, restore and append under one lock
+        led = L.read_ledger(scope)
+        target = next((e for e in led if str(e.get("id")) == str(a.revert)), None)
+        if not target or target.get("op") != "apply":
+            out({"ok": False, "error": f"no apply entry with id {a.revert} in {scope.ledger}"}, 1)
+        if any(e.get("op") == "revert" and str(e.get("reverts")) == str(a.revert) for e in led):
+            out({"ok": False, "error": f"entry {a.revert} was already reverted"}, 1)
+        base = target.get("base") or scope.base
+        if base not in (L.fleet_root(), L.orq_root()):
+            out({"ok": False, "error": f"ledger entry base {base} is not the fleet or Orquestra root"}, 1)
+        for f in target["files"]:
+            sc, norm = L.scope_for_path(f["path"])
+            if sc is None or sc.key != scope.key or norm != f["path"]:
+                out({"ok": False, "error": f"ledger path not in this scope: {f['path']}"}, 1)
+            link = L.symlink_in_path(base, f["path"])
+            if link:
+                out({"ok": False, "error": f"refusing symlinked path component {link}"}, 1)
+        drift = [f["path"] for f in target["files"] if L.sha256_file(os.path.join(base, f["path"])) != f["sha256_after"]]
+        if drift and not a.force:
+            out({"ok": False, "error": "files changed after this entry (a later apply or a manual edit); revert later "
+                 "entries first or pass --force", "files": drift}, 1)
+        bdir = os.path.join(scope.backups, str(target["id"]))
+        for f in target["files"]:
+            if f["sha256_before"] is not None:
+                b = os.path.join(bdir, "before", f["path"])
+                if os.path.islink(b) or L.sha256_file(b) != f["sha256_before"]:
+                    out({"ok": False, "error": f"backup missing or corrupt for {f['path']}"}, 1)
+        lid = L.next_id(scope)
+        cur = [{"path": f["path"], "sha256_before": L.sha256_file(os.path.join(base, f["path"]))} for f in target["files"]]
+        restore(scope, bdir, target["files"], base)
+        for c in cur:
+            c["sha256_after"] = L.sha256_file(os.path.join(base, c["path"]))
+        entry = {"id": lid, "ts": L.now_iso(), "op": "revert", "reverts": str(target["id"]), "scope": scope.label(),
+                 "base": base, "run": target.get("run"), "files": cur, "reason": a.reason or f"revert {target['id']}",
+                 "diff_path": target.get("diff_path")}
+        L.append_ledger(entry, scope)
+    out({"ok": True, "ledger": entry})
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="fleet-skill-apply")
+    ap.add_argument("diff", nargs="?")
+    ap.add_argument("--run")
+    ap.add_argument("--reason")
+    ap.add_argument("--revert", metavar="ID")
+    ap.add_argument("--scope", help="generic | project:<name> (default: from the diff; required for a project revert)")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--allow-active", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    a = ap.parse_args()
+    try:
+        forced = L.parse_scope_flag(a.scope) if a.scope else None
+    except ValueError as e:
+        ap.error(str(e))
+    if a.revert:
+        return revert(a, forced or L.generic_scope())
+    if not a.diff or (not a.check and (not a.run or not a.reason)):
+        ap.error("DIFF --run RUN --reason TEXT are required (or --revert ID)")
+    apply(a, forced)
+
+
+if __name__ == "__main__":
+    main()

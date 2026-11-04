@@ -96,6 +96,22 @@ inside the lead do NOT count (practical limit ~20). Hence `max_parallel=4`: lead
 - The lead does NOT use the Vigia's `--protect-tests` (devs write tests first on purpose).
 - Vigia secret redaction may turn text like `pwd: ...` into `***` in conversation.md (false positive).
 
+## Retro loop (v0.1.x, ported from the live install)
+Both loops run **once every two days in one batch** from the owner's scheduler (suggested cron `0 6 */2 * *`). There is
+no end-of-run hook.
+- `fleet-retro --batch` finds task folders `$ORQUESTRA_HOME/<project>/<task>/` whose runs finished since the last batch
+  (`skill/retro-state.json`), skips folders with a run still active (`$VIGIA_BASE/active`), takes at most 10 and analyzes
+  them in ONE read-only Claude call under vigia-run (muted, tools limited to Read/Grep/Glob). Then it runs
+  `fleet-skill-lint`. `--dry-run` changes nothing; exit 5 = another batch holds the lock, exit 4 = collect pending.
+- The model only answers JSON; the script validates it and writes diffs to `skill/proposals/`. Nothing is applied.
+- **Loop 1, per project** → `$ORQUESTRA_HOME/<p>/LESSONS.md` (~4000 chars), ledger `<p>/lessons-ledger.jsonl`. fleet-run
+  copies it to `T/.fleet/project-lessons.md`; the lead pastes the relevant rules into every brief.
+- **Loop 2, generic** → `skill/fleet-sdd/SKILL.md`, `references/<topic>.md`, `$ORQUESTRA_HOME/learnings.md`
+  (`FLEET_LESSONS_NAME` renames it); ledger `skill/ledger.jsonl`.
+- `fleet-skill-apply <diff> --run R --reason "..."` applies with a backup and a ledger entry;
+  `fleet-skill-apply --revert ID` restores the exact bytes. `fleet-skill-lint` writes `skill/lint-report.md` (never deletes).
+- Paths: `FLEET_ROOT` (default the fleet folder), `ORQ_ROOT` (default `$ORQUESTRA_HOME`), `VIGIA_BIN`, `VIGIA_BASE`.
+
 ## Tests
-`python3 tests/test_fleet.py` (plus the Vigia tests in `tests/`). Tested with Claude Code 2.1.x · codex-cli 0.166 ·
+`python3 tests/test_fleet.py`, `python3 tests/test_retro_loop.py` (plus the Vigia tests in `tests/`). Tested with Claude Code 2.1.x · codex-cli 0.166 ·
 Python 3 stdlib.

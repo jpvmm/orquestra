@@ -27,7 +27,7 @@ sed "s|@VIGIA_BIN@|$BIN|g" "$REPO/bin/claude-hooks.json.template" > "$BIN/claude
 
 # Fleet kit: scripts, agent definitions and the fleet-sdd skill (prompts resolve @FLEET_HOME@ at run time).
 mkdir -p "$FLEET/bin" "$FLEET/.claude/agents" "$FLEET/skill/fleet-sdd"
-for f in fleet-run fleet-wt fleet-codex codex-dev codex-reviewer fleet-wait; do
+for f in fleet-run fleet-wt fleet-codex codex-dev codex-reviewer fleet-wait fleet-retro fleet-skill-apply fleet-skill-lint fleet_skill_lib.py; do
   cp "$REPO/fleet/bin/$f" "$FLEET/bin/$f"
   chmod 755 "$FLEET/bin/$f"
 done

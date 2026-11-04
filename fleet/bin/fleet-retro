@@ -27,6 +27,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import fleet_skill_lib as L
 import fleet_rules_index as R
+import fleet_eval_lib as E
+import fleet_judge_lib as J
+import fleet_probation as P
 
 VIGIA_BIN = os.path.expanduser(os.environ.get("VIGIA_BIN") or os.path.join(os.path.dirname(L.fleet_root()), "bin"))
 FINAL_STATES = {"done", "failed", "killed", "timeout", "stalled", "loop", "incomplete", "error", "lost"}
@@ -222,12 +225,17 @@ FORMAT = """Answer with ONE JSON object in a ```json fence and nothing after it:
     "sources": ["<merge only: the exact blocks to merge, each occurring once in the target>"],
     "archive_reason": "redundancy" | "supersession" | "error",
     "evidence": "<archive only: what shows the block is redundant / superseded / wrong>",
+    "failure": {"situation": "<the concrete situation where the failure happened, as a future run would meet it>",
+                "expected": "<what a run should have done there>", "forbidden": "<what it must not do, or empty>",
+                "source_run": "<one of the analyzed run names>"},
     "target": "<project: LESSONS.md | generic: path RELATIVE to the fleet root (e.g. skill/fleet-sdd/SKILL.md) or learnings.md>",
     "edit": {"old": "<exact text currently in the target to replace, copied verbatim WITHOUT Read's line-number prefixes; must occur exactly once; empty string = append to the end / create the file>",
              "new": "<replacement text (or the text to append), Markdown, same style as the file>"}}
  ],
  "profile": [{"change": "<one-line change to Orquestra's own profile>", "why": "<the mechanism>"}],
  "notes": "<optional, one line: why nothing to save, or what you left out>"}
+"failure" is the frozen failure probe written from what went wrong, BEFORE the rule: a proposal that adds or rewrites a
+rule without it stays pending (the judge needs it); an archive needs none. Never paste secrets into it.
 Keep edits minimal: replace one sentence or bullet, or add one bullet next to the related step.
 "relation" defaults to "new" when omitted; "drops" is optional (default: none). "op" defaults to add when edit.old is empty,
 else edit. merge: edit.new = the merged block (relation new); archive: edit.old = the block, edit.new = "" (empty)."""
@@ -289,6 +297,29 @@ def related_section(dirs, root, policy):
     return ("## Related existing rules (use these ids in \"relation\"; ids never go into the files)\n" + "\n".join(out))
 
 
+REJECTIONS_SECTION_CAP = 3000
+
+
+def rejections_section(dirs, root, policy):
+    """Prompt section with the judge's recent rejections (fleet_judge_lib.rejections_block) per scope + target, so the
+    model does not re-propose them. "" when there are none (the prompt does not grow). Capped as a whole."""
+    out = []
+    for scope in ["generic"] + [f"project:{p}" for p in sorted({p for _, _, p in dirs if p})]:
+        try:
+            targets = sorted({e.get("target") for e in J.read_log(root, scope=scope) if e.get("target")})
+        except (OSError, ValueError):
+            targets = []
+        for tgt in targets:
+            try:
+                blk = J.rejections_block(scope, tgt, root=root, policy=policy)
+            except (OSError, ValueError):
+                blk = ""
+            if blk:
+                out.append(blk)
+    txt = "\n\n".join(out)
+    return txt if len(txt) <= REJECTIONS_SECTION_CAP else txt[:REJECTIONS_SECTION_CAP] + "\n[... more rejections cut ...]"
+
+
 LINT_SECTION_CAP = 2500
 
 
@@ -343,6 +374,9 @@ def build_batch_prompt(dirs, root=None, scale=1.0, policy=None, lint=None):
     rel = related_section(dirs, root, policy)
     if rel:
         parts.append(rel)
+    rej = rejections_section(dirs, root, policy)
+    if rej:
+        parts.append(rej)
     parts += [task_section(t, r, p, scale) for t, r, p in dirs]
     parts.append(render(FORMAT, policy))
     return "\n\n".join(parts)
@@ -1080,7 +1114,7 @@ def _check_segment(dpath, base, files, disk):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def collect(T, run, answer_text, name=None, root=None, projects=(), tools=None, used=()):
+def collect(T, run, answer_text, name=None, root=None, projects=(), tools=None, used=(), source_runs=()):
     root = root or L.fleet_root()
     obj = parse_answer(answer_text)
     slug = re.sub(r"[^A-Za-z0-9._-]", "-", run)
@@ -1089,7 +1123,7 @@ def collect(T, run, answer_text, name=None, root=None, projects=(), tools=None, 
     lines = [f"# Retro — {run}", "", f"retro run: {name or '(stub)'}",
              f"projects: {', '.join(projects) if projects else '(none: no task folder under a project folder)'}"]
     violation = tool_violation(tools, used)
-    accepted, rejected, changes, written, profile = [], [], {}, [], []
+    accepted, rejected, changes, written, profile, seg_info = [], [], {}, [], [], []
     if violation:
         lines += [f"verdict: DISCARDED — {violation} (nothing written; check the launch flags)", "diffs: none"]
         obj = None
@@ -1098,6 +1132,8 @@ def collect(T, run, answer_text, name=None, root=None, projects=(), tools=None, 
     if obj is not None:
         props = obj.get("proposals") if obj.get("verdict") == "proposals" else []
         accepted, rejected, changes = validate(props, root, projects, L.load_policy(root))
+        record_failure_probes(accepted, run, source_runs, root)   # frozen BEFORE the rule is judged
+        record_rejected_occurrences(rejected, run, source_runs, projects, root)   # a repeat is a repeat, rule or not
         disk = {(k[1], k[2]): v[0] for k, v in changes.items()}
         segs, withheld = [], set()
         for gk, relation, members, files in diff_segments(accepted):
@@ -1131,6 +1167,8 @@ def collect(T, run, answer_text, name=None, root=None, projects=(), tools=None, 
             for _, t in members:
                 t["meta"]["diff"] = dpath
             written.append((dpath, ok, msg, out, relation, count[(out, base)] > 1, apply_flags(members)))
+            seg_info.append({"diff": dpath, "applies": ok, "group": out or "generic", "relation": relation,
+                             "flags": shlex.split(apply_flags(members)), "ns": [t["meta"].get("n") for _, t in members]})
         for item in (obj.get("profile") or [])[:MAX_PROFILE]:
             if isinstance(item, dict) and str(item.get("change", "")).strip():
                 if has_secret(str(item.get("change"))) or has_secret(str(item.get("why", ""))):
@@ -1178,8 +1216,78 @@ def collect(T, run, answer_text, name=None, root=None, projects=(), tools=None, 
     return {"ok": True, "retro": os.path.join(T, "retro.md"), "projects": list(projects),
             "diffs": [w[0] for w in written], "profile": os.path.join(pdir, f"profile-{slug}.md") if profile else None,
             "proposals": len(accepted), "rejected": len(rejected), "discarded": violation,
-            "candidates": [{k: v for k, v in t["meta"].items() if k != "view"} for _, t in accepted],
+            "candidates": [candidate_of(p, t) for p, t in accepted], "segments": seg_info,
             "parsed": obj is not None, "all_apply": all(w[1] for w in written)}
+
+
+def candidate_of(p, t):
+    """The judge's input for an accepted proposal: the validated meta plus the texts the judge reads."""
+    edit = p.get("edit") if isinstance(p.get("edit"), dict) else {}
+    c = {k: v for k, v in t["meta"].items() if k != "view"}
+    c.update(rule=str(p.get("rule", "")), edit={"old": str(edit.get("old", "")), "new": str(edit.get("new", ""))},
+             area=str(p.get("skill_step", ""))[:120], failure_id=p.get("failure_id"))
+    if p.get("probe_error"):
+        c["probe_error"] = p["probe_error"]
+    return c
+
+
+def record_failure_probes(accepted, run, source_runs, root):
+    """Freeze the failure probe each accepted rule-changing proposal carries (T4, before the judge). The probe's scope is
+    the proposal's scope; source_run must be one of the analyzed runs (else the only/first analyzed run). A refused
+    probe (secret, bad shape) leaves the proposal without failure_id: the judge answers pending:no_probe."""
+    runs = [r for r in source_runs if r] or [run]
+    for p, t in accepted:
+        f = p.get("failure")
+        if not isinstance(f, dict) or t["meta"].get("op") == "archive":
+            continue
+        src = str(f.get("source_run") or "")
+        scope = t["meta"]["scope"]
+        area = str(p.get("skill_step") or t["meta"].get("anchor") or "")
+        try:
+            r = E.record_failure(f.get("situation", ""), f.get("expected", ""), f.get("forbidden", ""),
+                                 src if src in runs else runs[0], scope=scope, area=area, root=root)
+            p["failure_id"] = r["probe"]["id"]
+            # EVERY analysed failure counts for probation recurrence, also when the probe already existed (dedup keeps
+            # the FIRST source_run, so the occurrence log is what shows a repeat from another run)
+            P.record_occurrence(p["failure_id"], src if src in runs else runs[0], root=root)
+        except (E.ProbeError, OSError, ValueError, KeyError, TypeError) as e:
+            p["probe_error"] = clean(str(e), 160)
+
+
+def record_rejected_occurrences(rejected, run, source_runs, projects, root):
+    """Probation recurrence does not depend on the rule being accepted: a rejected proposal (e.g. a duplicate of an
+    already-applied rule) still carries valid failure evidence from an analysed run. When its failure probe is valid
+    (same refusals as record_failure_probes: secret, bad shape), freeze/dedup the probe and log the occurrence.
+    Proposals refused for a secret-like string or without a usable scope are skipped."""
+    runs = [r for r in source_runs if r] or [run]
+    for p, why in rejected:
+        f = p.get("failure") if isinstance(p, dict) else None
+        if not isinstance(f, dict) or str(p.get("op") or "").strip().lower() == "archive" or "secret-like" in str(why):
+            continue
+        scope = quota_scope(p, projects)
+        if scope != "generic" and not (scope.startswith("project:") and scope[len("project:"):].strip()):
+            continue
+        src = str(f.get("source_run") or "")
+        try:
+            r = E.record_failure(f.get("situation", ""), f.get("expected", ""), f.get("forbidden", ""),
+                                 src if src in runs else runs[0], scope=scope, area=str(p.get("skill_step") or ""), root=root)
+            P.record_occurrence(r["probe"]["id"], src if src in runs else runs[0], root=root)
+        except (E.ProbeError, OSError, ValueError, KeyError, TypeError):
+            pass
+
+
+def record_batch_successes(dirs, root):
+    """Success probes from the batch's done runs whose criteria all pass (T4 bank), per generic + project scope.
+    Idempotent; anything that is not a clean success is skipped. → number of probes stored or already known."""
+    n = 0
+    for T, run, project in dirs:
+        for scope in ["generic"] + ([f"project:{project}"] if project else []):
+            try:
+                E.record_success(T, scope=scope, run=None, root=root)
+                n += 1
+            except (E.ProbeError, OSError, ValueError, KeyError, TypeError):
+                pass
+    return n
 
 
 # ------------------------------------------------------------------ batch (every two days)
@@ -1350,6 +1458,32 @@ class BatchLock:
         os.close(self.fd)
 
 
+def collect_pending(root, before_finalize=None):
+    """Collect the newest uncollected batch whose model run is final (caller holds the batch lock).
+    → ("none", None) | ("running", {state, name}) | ("collected", {"result": finalize_batch output, "bdir": dir})"""
+    bds = sorted(glob.glob(os.path.join(L.skill_dir(root), "retro-batches", "*", "manifest.json")))
+    for mp in reversed(bds):
+        man = _manifest(mp)
+        if man.get("collected") or not man.get("dirs"):
+            continue
+        bdir = os.path.dirname(mp)
+        try:
+            with open(os.path.join(bdir, "runs", man["name"] + ".status.json")) as f:
+                stv = json.load(f)
+        except (OSError, ValueError):
+            stv = {}
+        if stv.get("state") not in FINAL_STATES:
+            return "running", {"state": stv.get("state"), "name": man["name"]}
+        txt, tools, used = scan_events(os.path.join(bdir, "runs", man["name"] + ".events.jsonl"))
+        res = collect(bdir, man["run"], txt, man["name"], root, man["projects"], tools, used,
+                      [d.get("run") for d in man["dirs"]])
+        res["retro_state"] = stv.get("state")
+        if before_finalize:   # the caller persists recoverable state BEFORE the task state advances
+            before_finalize(bdir, res)
+        return "collected", {"result": finalize_batch(root, bdir, man, res), "bdir": bdir, "manifest": man}
+    return "none", None
+
+
 def batch_main(a, root):
     if a.dry_run and not a.collect:
         return batch_body(a, root)
@@ -1359,26 +1493,12 @@ def batch_main(a, root):
 
 def batch_body(a, root):
     if a.collect:
-        bds = sorted(glob.glob(os.path.join(L.skill_dir(root), "retro-batches", "*", "manifest.json")))
-        for mp in reversed(bds):
-            with open(mp) as f:
-                man = json.load(f)
-            if man.get("collected") or not man.get("dirs"):
-                continue
-            bdir = os.path.dirname(mp)
-            sp = os.path.join(bdir, "runs", man["name"] + ".status.json")
-            try:
-                with open(sp) as f:
-                    stv = json.load(f)
-            except (OSError, ValueError):
-                stv = {}
-            if stv.get("state") not in FINAL_STATES:
-                print(json.dumps({"ok": False, "state": stv.get("state"), "name": man["name"]})); sys.exit(4)
-            txt, tools, used = scan_events(os.path.join(bdir, "runs", man["name"] + ".events.jsonl"))
-            res = collect(bdir, man["run"], txt, man["name"], root, man["projects"], tools, used)
-            res["retro_state"] = stv.get("state")
-            print(json.dumps(finalize_batch(root, bdir, man, res), indent=2)); return
-        sys.exit("fleet-retro: no uncollected batch")
+        state, res = collect_pending(root)
+        if state == "none":
+            sys.exit("fleet-retro: no uncollected batch")
+        if state != "collected":
+            print(json.dumps({"ok": False, "state": res["state"], "name": res["name"]})); sys.exit(4)
+        print(json.dumps(res["result"], indent=2)); return
     pending = [mp for mp in glob.glob(os.path.join(L.skill_dir(root), "retro-batches", "*", "manifest.json"))
                if not _manifest(mp).get("collected") and _manifest(mp).get("dirs")]
     if pending and not a.dry_run:
@@ -1391,6 +1511,8 @@ def batch_body(a, root):
     dirs = [(T, run, project) for T, run, project, _ in sel]
     projects = sorted({p for _, _, p in dirs})
     scale = 1.0 if len(dirs) <= 2 else max(0.35, 2.0 / len(dirs))
+    if dirs and not a.dry_run:
+        record_batch_successes(dirs, root)   # success bank: done runs with every criterion passing
     lint = run_lint(["--json", "--no-report"]) if dirs else {}   # lint BEFORE generating: findings go into the same prompt
     prompt = build_batch_prompt(dirs, root, scale, lint=lint) if dirs else ""
     if a.dry_run:
@@ -1417,7 +1539,7 @@ def batch_body(a, root):
     stub = os.environ.get("FLEET_RETRO_STUB_OUTPUT")
     if stub:
         with open(stub, encoding="utf-8") as f:
-            res = collect(bdir, run, f.read(), None, root, projects)
+            res = collect(bdir, run, f.read(), None, root, projects, source_runs=[d[1] for d in dirs])
         print(json.dumps(finalize_batch(root, bdir, man, res), indent=2)); return
     cmd = launch_cmd(bdir, name, run, prompt, root, a.max_min, a.model, [d[0] for d in dirs])
     st = launch_and_wait(cmd, a)
@@ -1425,7 +1547,7 @@ def batch_body(a, root):
         print(json.dumps({"ok": False, "state": "running", "name": name, "then": "fleet-retro --batch --collect"})); sys.exit(4)
     info, stv = st
     txt, tools, used = scan_events(info["events_path"])
-    res = collect(bdir, run, txt, name, root, projects, tools, used)
+    res = collect(bdir, run, txt, name, root, projects, tools, used, [d[1] for d in dirs])
     res["retro_state"] = stv.get("state")
     print(json.dumps(finalize_batch(root, bdir, man, res), indent=2))
 

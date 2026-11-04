@@ -152,15 +152,42 @@ def probation_slot_free(target_file, root=None, policy=None, ledger=None):
     return len(probation_holders(target_file, ledger)) < int(pol["probation"]["max_per_always_loaded_file"])
 
 
-def gate_candidates(candidates, *, now=None, root=None, policy=None, ledger=None, task_dirs=None):
+def take_slot(c, slots, *, root=None, policy=None, ledger=None):
+    """Reserve a probation slot for candidate c in the shared map `slots` {always-loaded file: free slots} (filled lazily
+    from the ledger). → True when c needs none (not generic / not an always-loaded file) or one was free and is now
+    taken; False when the file has no free slot left. release_slot gives it back."""
+    pol = policy or L.load_policy(root)
+    tgt, scope = str(c.get("target") or ""), str(c.get("scope") or "generic")
+    if scope != "generic" or tgt not in pol["always_loaded"]:
+        return True
+    if tgt not in slots:
+        slots[tgt] = int(pol["probation"]["max_per_always_loaded_file"]) - len(probation_holders(tgt, _ledger(ledger)))
+    if slots[tgt] <= 0:
+        return False
+    slots[tgt] -= 1
+    return True
+
+
+def release_slot(c, slots, *, policy=None, root=None):
+    """Give back a slot taken by take_slot for a candidate that will not be applied."""
+    pol = policy or L.load_policy(root)
+    tgt = str(c.get("target") or "")
+    if str(c.get("scope") or "generic") == "generic" and tgt in pol["always_loaded"] and tgt in slots:
+        slots[tgt] += 1
+
+
+def gate_candidates(candidates, *, now=None, root=None, policy=None, ledger=None, task_dirs=None, slots=None):
     """Code gate BEFORE the judge (0 tokens) → (to_judge, held). A generic candidate in cooldown (cooldown_state of its
     cand_fp / lineage) is held with status "cooldown"; a generic candidate for an always-loaded file is held with status
     "waiting" when the file has no free probation slot, counting the slots already taken in the ledger and the earlier
     candidates of this list for the same file. Held candidates are never sent to the judge.
+    `slots` (optional, mutable {file: free slots}) is shared by several calls of one cycle (several origin batches): a slot
+    reserved by an earlier call is not free for a later one.
     held items: dict(candidate, status, reason[, cooldown])."""
     pol = policy or L.load_policy(root)
     led = _ledger(ledger)
-    free, to_judge, held = {}, [], []
+    free = slots if slots is not None else {}
+    to_judge, held = [], []
     for c in candidates or []:
         if not isinstance(c, dict):
             continue
@@ -171,14 +198,10 @@ def gate_candidates(candidates, *, now=None, root=None, policy=None, ledger=None
             if cd["cooldown"]:
                 held.append(dict(c, status="cooldown", reason=cd["reason"], cooldown=cd))
                 continue
-        if scope == "generic" and tgt in pol["always_loaded"]:
-            if tgt not in free:
-                free[tgt] = int(pol["probation"]["max_per_always_loaded_file"]) - len(probation_holders(tgt, led))
-            if free[tgt] <= 0:
-                held.append(dict(c, status="waiting", reason=f"{tgt} already has a rule in probation (max "
-                                 f"{pol['probation']['max_per_always_loaded_file']} per always-loaded file): waits"))
-                continue
-            free[tgt] -= 1
+        if not take_slot(c, free, root=root, policy=pol, ledger=led):
+            held.append(dict(c, status="waiting", reason=f"{tgt} already has a rule in probation (max "
+                             f"{pol['probation']['max_per_always_loaded_file']} per always-loaded file): waits"))
+            continue
         to_judge.append(c)
     return to_judge, held
 

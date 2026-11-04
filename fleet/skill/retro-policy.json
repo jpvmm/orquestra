@@ -21,7 +21,8 @@
     "references_total_chars": 40000
   },
   "budget": {
-    "tokens_per_cycle": 25000
+    "tokens_per_cycle": 25000,
+    "output_allowance_tokens": 4000
   },
   "cycle": {
     "due_hours": 48,

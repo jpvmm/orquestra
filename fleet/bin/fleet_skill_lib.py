@@ -36,7 +36,7 @@ DEFAULTS = {
               "read_cap_multiplier": 3},
     "budgets": {"lessons_chars": 4000, "learnings_chars": 4000, "skill_md_chars": 12000,
                 "references_total_chars": 40000},
-    "budget": {"tokens_per_cycle": 25000},
+    "budget": {"tokens_per_cycle": 25000, "output_allowance_tokens": 4000},
     "cycle": {"due_hours": 48, "late_hours": 60, "max_batch_dirs": 10, "first_batch_hours": 48},
     "judge_memory": {"block_days": 14, "cooldown_days": [30, 60, 90], "cooldown_window_days": 60,
                      "cooldown_reset_days": 90, "log_days": 90, "log_lines": 500, "max_precedents": 3,

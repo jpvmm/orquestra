@@ -610,9 +610,11 @@ def build_prompt(items, policy=None, nonce=None):
     return "\n".join(head + body) + "\n"
 
 
-def estimate_tokens(prompt, n_candidates):
-    """Reservation before the call: chars/4 of the prompt + the expected answer."""
-    return int(math.ceil(len(prompt) / 4.0)) + OUT_TOKENS_BASE + OUT_TOKENS_PER_CANDIDATE * n_candidates
+def estimate_tokens(prompt, n_candidates=0, policy=None):
+    """Reservation before the call: ceil(estimated input x 1.25) + the fixed output allowance
+    (policy budget.output_allowance_tokens, default 4000). n_candidates is kept for callers; the allowance is fixed."""
+    allow = int(((policy or {}).get("budget") or {}).get("output_allowance_tokens", 4000))
+    return int(math.ceil(math.ceil(len(prompt) / 4.0) * 1.25)) + allow
 
 
 # ------------------------------------------------------------------ model call (vigia-run, muted, no tools)
@@ -932,7 +934,7 @@ def judge(candidates, *, batch_stamp, batch_runs, budget_left, now=None, root=No
                       "did": did, "rejudge": blk["rejudge"], "new_evidence": blk["new_evidence"]})
 
     prompt = build_prompt(items, pol) if items else ""
-    est = estimate_tokens(prompt, len(items)) if items else 0
+    est = estimate_tokens(prompt, len(items), pol) if items else 0
     usage["estimated"] = est
     if items and budget_left is not None and est > budget_left:
         for it in items:

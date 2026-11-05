@@ -4,7 +4,7 @@ description: Install and configure Orquestra (Vigia supervisor + bot prompt for 
 ---
 # Orquestra setup
 
-Goal: Orquestra installed in `~/.orquestra`, Claude Code and/or Codex ready, a webhook routine named **Vigia** waking the bot that runs the work, and one test run proving the wake-up works. Do every step yourself; stop for the user only where marked **USER**. Re-running is safe (the installer never touches `webhook.env` or run state).
+Goal: Orquestra installed in `~/.orquestra`, Claude Code and/or Codex ready, **two routines on the bot that runs the work** (**Vigia**, webhook: wakes it when a run ends; **Retro**, schedule `0 6 */2 * *`: the self-improvement cycle), and one test run proving the wake-up works. Nothing else to configure by hand. Do every step yourself; stop for the user only where marked **USER**. Re-running is safe (the installer never touches `webhook.env` or run state, and step 4 updates existing routines instead of duplicating them).
 
 Repo: https://github.com/jpvmm/orquestra (Apache 2.0).
 
@@ -24,6 +24,8 @@ if [ -d ~/src/orquestra/.git ]; then git -C ~/src/orquestra pull --ff-only; else
 ```
 Confirm `~/.orquestra/bin/vigia-run` and `~/.orquestra/fleet/bin/fleet-run` exist.
 
+The install also ships the retro loop tools (`fleet-retro-cycle`, `fleet-skill-*`) and `fleet/skill/retro-policy.json`. It is safe to re-run to upgrade: skill/config/agent files you or the loop edited are kept (the new version lands next to them as `<file>.upstream`; tell the user if any are reported), and ledgers, archive, judge log, `LESSONS.md` and `learnings.md` are never touched. The retro cycle's schedule is the **Retro** routine created in step 4.
+
 Smoke-test the fleet without launching anything (a temp git repo, `--dry-run`):
 ```bash
 d=$(mktemp -d) && git -C "$d" init -q && echo 'x = 1' > "$d/a.py" && git -C "$d" add . && git -C "$d" -c user.name=t -c user.email=t@t commit -qm base
@@ -42,13 +44,21 @@ codex exec "reply ok" --skip-git-repo-check   # Codex
 ```
 If one says it is not logged in: **USER** — the login is theirs. Start the CLI's login (`claude` then `/login`, or `codex login`), and hand them the screen or the login link so they finish it. Never ask for passwords in chat. Skip a CLI the user doesn't want.
 
-## 4. Create the Vigia routine
-On the bot that will run the work (usually yourself), create a routine with a **webhook** trigger (read the `routines` skill first):
+## 4. Create the two routines (Vigia + Retro)
+First pick the bot that will run the work: yourself, or, if the user wants a dedicated bot, create (or reuse, if one already exists) the "Orquestra" bot now as described in step 7. Create both routines on THAT bot only, and do steps 5–6 there too (read the `routines` skill first). **Idempotent:** first list this bot's routines; if one with the same name exists, read it and update it in place instead of creating a second one.
+
+**Vigia** (wake-up when a run changes state):
 - name: `Vigia`
 - trigger: `{ "type": "webhook" }`
 - prompt: the text after `---` in `~/.orquestra/vigia-routine.md` (relay rules + the fleet addendum).
 
-One routine per bot: by default every run notifies `~/.orquestra/vigia/webhook.env`. To send a run's notifications to a different bot, launch it with `VIGIA_WEBHOOK_ENV=/abs/path/other-webhook.env` (stored per run; `""` mutes it), or for the fleet `FLEET_WEBHOOK_ENV=/abs/path/other-webhook.env fleet-run ...`. Codex sub-runs of a fleet lead are muted unless `FLEET_NOTIFY_SUBRUNS=1`.
+**Retro** (the self-improvement cycle, every two days):
+- name: `Retro`
+- schedule: `0 6 */2 * *` (06:00 every second day, in the user's time zone); flexible timing is fine (the cycle checks itself that it is due, with a few hours of slack, so an early, late or extra fire is harmless)
+- prompt: the text after `---` in `~/.orquestra/retro-routine.md`.
+- An empty or not-due cycle prints nothing and costs 0 model tokens, so this routine is silent most of the time. It speaks only for an applied/auto-reverted change (one notice, which also mentions pending profile proposals) or `retro: scheduler late: Nh` (no cycle for more than `cycle.late_hours`, default 72 h; turn off with `"late_notice": false` under `cycle` in `~/.orquestra/fleet/skill/retro-policy.json`).
+
+One Vigia routine per bot: by default every run notifies `~/.orquestra/vigia/webhook.env`. To send a run's notifications to a different bot, launch it with `VIGIA_WEBHOOK_ENV=/abs/path/other-webhook.env` (stored per run; `""` mutes it), or for the fleet `FLEET_WEBHOOK_ENV=/abs/path/other-webhook.env fleet-run ...`. Codex sub-runs of a fleet lead are muted unless `FLEET_NOTIFY_SUBRUNS=1`.
 
 ## 5. Connect the webhook
 **USER**: the URL and key appear only in the routine's panel. Tell the user, in one short message: open the bot's info pane (click the bot's name in the chat header), open the **Vigia** routine, and copy its webhook URL and key. Then request each value with a masked secret request (never in plain chat):
@@ -70,9 +80,9 @@ Wait about 30 s, then check `~/.orquestra/vigia/notify.log` for an HTTP 2xx and 
 
 ## 7. Give the bot its rules
 The working rules are in `~/.orquestra/orquestra.md` (the part after `---`).
-- If the user wants a dedicated bot, offer to create one named "Orquestra" with that text as its instructions, then do steps 4–6 on that bot instead of yourself.
+- If the user wants a dedicated bot, create one named "Orquestra" (reuse it if it exists) with that text as its instructions. Do this before step 4, so steps 4–6 (both routines, Vigia and Retro) happen on that bot instead of yourself.
 - Otherwise, follow those rules yourself when the user asks for software work.
 The prompt is autonomous: the bot commits, pushes, opens PRs, merges and deploys itself after its own check. Keep its hard stops: never spend money or send external messages for the user, never force-push or rewrite main, never delete repos/branches/data it did not create, never touch secrets, `~/.ssh` or `~/.claude`. If the user wants an approval gate, apply the one-sentence change described in the prompt's header.
 
 ## 8. Report
-Tell the user in two or three sentences: what's installed (Vigia + fleet), which CLIs work, that the Vigia test woke the bot, and how to start ("ask for a coding task in a repo"). Mention that Codex runs use `--dangerously-bypass-hook-trust` for Vigia's per-run hooks (`VIGIA_CODEX_HOOKS=0` turns it off).
+Tell the user in two or three sentences: what's installed (Vigia + fleet), which CLIs work, that the Vigia test woke the bot, that the Retro routine runs the self-improvement cycle every two days at 06:00 (silent unless it changed something or the scheduler is late), and how to start ("ask for a coding task in a repo"). Mention that Codex runs use `--dangerously-bypass-hook-trust` for Vigia's per-run hooks (`VIGIA_CODEX_HOOKS=0` turns it off).

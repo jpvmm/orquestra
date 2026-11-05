@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""fleet-skill-eval: decision-probe store (frozen failure probes, success bank). Thin JSON wrapper over fleet_eval_lib.
+
+  fleet-skill-eval record-failure --situation T --expected T [--forbidden T] --source-run R [--scope S] [--area A]
+                                  [--tag X ...] [--corrected-from ID]
+  fleet-skill-eval record-success --task-dir DIR [--scope S] [--area A] [--tag X ...] [--run NAME]
+  fleet-skill-eval list [--kind failure|success] [--scope S]
+  fleet-skill-eval select --scope S [--area A] [--tag X ...] [--failure-id ID] [--now ISO]
+  fleet-skill-eval show ID
+Global: --root FLEET_ROOT (default fleet_root()), --now ISO (testing). Output is JSON on stdout; errors are
+{"error": ...} with exit 2. Nothing in a probe is ever executed.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fleet_eval_lib as E  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-skill-eval")
+    ap.add_argument("--root")
+    ap.add_argument("--now")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    f = sub.add_parser("record-failure")
+    f.add_argument("--situation", required=True)
+    f.add_argument("--expected", required=True)
+    f.add_argument("--forbidden", default="")
+    f.add_argument("--source-run", required=True)
+    f.add_argument("--corrected-from")
+    s = sub.add_parser("record-success")
+    s.add_argument("--task-dir", required=True)
+    s.add_argument("--run")
+    for p in (f, s):
+        p.add_argument("--scope", default="generic")
+        p.add_argument("--area", default="")
+        p.add_argument("--tag", action="append", default=[])
+    ls = sub.add_parser("list")
+    ls.add_argument("--kind", choices=["failure", "success"])
+    ls.add_argument("--scope")
+    se = sub.add_parser("select")
+    se.add_argument("--scope", default="generic")
+    se.add_argument("--area", default="")
+    se.add_argument("--tag", action="append", default=[])
+    se.add_argument("--failure-id")
+    sh = sub.add_parser("show")
+    sh.add_argument("id")
+    a = ap.parse_args(argv)
+    root = os.path.abspath(a.root) if a.root else None
+    try:
+        if a.cmd == "record-failure":
+            out = E.record_failure(a.situation, a.expected, a.forbidden, a.source_run, scope=a.scope, area=a.area,
+                                   tags=a.tag, corrected_from=a.corrected_from, root=root, now=a.now)
+        elif a.cmd == "record-success":
+            out = E.record_success(a.task_dir, scope=a.scope, area=a.area or None, tags=a.tag, run=a.run, root=root,
+                                   now=a.now)
+        elif a.cmd == "list":
+            out = {"probes": E.list_probes(root, kind=a.kind, scope=a.scope)}
+        elif a.cmd == "select":
+            out = E.select(a.scope, a.area, a.now, root=root, tags=a.tag, failure_id=a.failure_id)
+        else:
+            out = E.load_probe(a.id, root)
+    except (E.ProbeError, ValueError) as e:
+        print(json.dumps({"error": str(e)}))
+        return 2
+    print(json.dumps(out, indent=1, sort_keys=True, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

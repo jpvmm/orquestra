@@ -16,6 +16,9 @@ or return NEEDS_CONTEXT/BLOCKED.
 ## Context
 {CONTEXT: where this fits, interfaces the other tasks expect, repo conventions}
 
+## Project lessons (follow them)
+{PROJECT_LESSONS: the rules from T/.fleet/project-lessons.md that apply to this task, or "none"}
+
 ## How
 1. First write the test that proves each criterion and watch it fail.
 2. Implement the minimal GENERAL change that makes it pass (never test-specific).

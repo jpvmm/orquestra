@@ -18,17 +18,20 @@ exports VIGIA_WEBHOOK_ENV=that file (another bot's webhook). An inherited VIGIA_
 Every Claude run it launches gets --disallowedTools for git commit/push/merge/rebase, gh and `rm -rf`: the fleet
 works with patches and never publishes; Orquestra commits after checking the integration.
 Paths: VIGIA_BIN (default: the bin/ next to this fleet/ folder, i.e. $ORQUESTRA_HOME/bin once installed),
-VIGIA_BASE (default $ORQUESTRA_HOME/vigia; ORQUESTRA_HOME defaults to this install, else ~/.orquestra).
+VIGIA_BASE (default $ORQUESTRA_HOME/vigia; root = fleet_skill_lib.orq_root(): ORQ_ROOT, ORQUESTRA_HOME, else the folder above fleet/).
 Output: JSON with name, status_path, conversation_path. Exit codes: 2 invalid input, 3 Vigia cap full,
 4 name in use, 5 command not found."""
 import argparse, json, os, re, subprocess, sys, time
+sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))          # .../fleet
 BIN = os.path.join(HERE, "bin")
 INSTALL = os.path.dirname(HERE)                                                # the folder that holds fleet/ and bin/
 VIGIA_BIN = os.path.expanduser(os.environ.get("VIGIA_BIN") or os.path.join(INSTALL, "bin"))
-ORQUESTRA_HOME = os.path.expanduser(os.environ.get("ORQUESTRA_HOME") or (
-    INSTALL if os.path.exists(os.path.join(INSTALL, ".orquestra-home")) else "~/.orquestra"))
+sys.path.insert(0, BIN)
+import fleet_skill_lib as L   # noqa: E402  (the one resolver every loop tool uses)
+sys.path.pop(0)
+ORQUESTRA_HOME = L.orq_root()   # ORQ_ROOT -> ORQUESTRA_HOME -> parent of this fleet/ (an install resolves to itself)
 VIGIA_BASE = os.path.expanduser(os.environ.get("VIGIA_BASE") or os.path.join(ORQUESTRA_HOME, "vigia"))
 VIGIA_DEFAULT_WEBHOOK = os.path.join(VIGIA_BASE, "webhook.env")   # only documented; never read here
 # the fleet never publishes: Orquestra commits/pushes after checking the integration (see docs/fleet.md)
@@ -41,6 +44,20 @@ MODELS = {"claude": {"top": "opus", "mid": "sonnet", "cheap": "haiku"},
 # security keywords (English plus a few Portuguese ones, for plans written in Portuguese)
 SEC_WORDS = re.compile(r"\b(auth|login|senha|password|token|segredo|secret|credential|credencia|oauth|jwt|cookie|session|sess[aã]o|"
                        r"http|rede|network|socket|url|upload|user input|entrada do usu|input|sql|webhook|api key)", re.I)
+
+
+def ignore_dirs():
+    """Folders under the Orquestra root that are not projects: policy ignore_dirs (skill/retro-policy.json), with the
+    built-in default when the policy or the lib is missing or broken."""
+    try:
+        sys.path.insert(0, BIN)
+        import fleet_skill_lib
+        return fleet_skill_lib.ignore_set(fleet_skill_lib.load_policy(HERE))
+    except Exception:
+        return {"fleet", "bin", "vigia", "skill", "tmp"}
+    finally:
+        if sys.path and sys.path[0] == BIN:
+            sys.path.pop(0)
 
 
 def fail(msg, code=2):
@@ -93,6 +110,41 @@ def build_agents(roles, dest):
     with open(dest, "w") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
     return dest
+
+
+def snapshot_lessons(src, T):
+    """Copy src to T/.fleet/project-lessons.md without following symlinks: the source, T/.fleet and the leaf are opened
+    with O_NOFOLLOW, the copy is written to an O_EXCL temp file inside .fleet and renamed over the leaf (a symlinked
+    leaf is replaced, never written through)."""
+    nf = os.O_NOFOLLOW
+    sfd = os.open(src, os.O_RDONLY | nf)
+    with os.fdopen(sfd, "rb") as f:
+        data = f.read(64 * 1024)
+    tfd = os.open(T, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            os.mkdir(".fleet", 0o755, dir_fd=tfd)
+        except FileExistsError:
+            pass
+        dfd = os.open(".fleet", os.O_RDONLY | os.O_DIRECTORY | nf, dir_fd=tfd)   # raises if .fleet is a symlink
+    finally:
+        os.close(tfd)
+    try:
+        tmp = f".project-lessons.{os.getpid()}.{os.urandom(3).hex()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nf, 0o644, dir_fd=dfd)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, "project-lessons.md", src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
+    return os.path.join(T, ".fleet", "project-lessons.md")
 
 
 def vigia_run(args_vr, cmd, env, dry):
@@ -186,12 +238,32 @@ def main():
         if a.budget_usd: c += ["--max-budget-usd", str(a.budget_usd)]
         return c
 
+    # Loop 1 (per project): ORQ/<project>/LESSONS.md, when it exists, is copied to T/.fleet/project-lessons.md so the
+    # lead and the briefs read a stable snapshot. No retro hook here: retros run in the every-2-days batch.
+    orq = ORQUESTRA_HOME
+    parts = os.path.relpath(T, orq).split(os.sep)
+    project = parts[0] if len(parts) >= 2 and parts[0] != ".." and parts[0] not in ignore_dirs() else None
+    lessons_src = os.path.join(orq, project, "LESSONS.md") if project else None
+    project_lessons = None
+    if lessons_src and os.path.isfile(lessons_src) and not os.path.islink(lessons_src):
+        project_lessons = os.path.join(T, ".fleet", "project-lessons.md")
+        if a.dry_run:
+            project_lessons = lessons_src
+        else:
+            try:
+                project_lessons = snapshot_lessons(lessons_src, T)
+            except OSError as e:   # a symlinked .fleet/leaf or an unreadable source: run without lessons, say why
+                print(f"fleet-run: project lessons not copied ({e})", file=sys.stderr)
+                project_lessons = None
+    lessons_hint = (f"Project lessons: {project_lessons} — read it; its rules bind this task: paste the relevant ones into "
+                    f"every dev and reviewer brief. " if project_lessons else "")
+
     if cx in ("M", "G"):
         lead = roles["team-lead"]
         name = f"fleet-{base_name}-lead-{hhmmss}"
         prompt = (f"You are the fleet team-lead. Task folder T={T}. Task: {a.task}. Complexity {cx}. "
                   f"First read {SKILL} and follow it strictly, headless (nobody answers; a doubt becomes a BLOCKED entry in T/progress.md). "
-                  f"Integration (your cwd): {integ}. Tools: {BIN}. Write files in English. "
+                  f"Integration (your cwd): {integ}. Tools: {BIN}. Write files in English. {lessons_hint}"
                   f"Dispatch every Agent/Bash call in the foreground (run_in_background: false) and wait for its result; a reply "
                   f"without a tool call ENDS this headless session and kills pending subagents, so never reply with a status. "
                   f"If T/progress.md exists you are RESUMING: skip tasks fleet-state.json lists as integrated. "
@@ -221,7 +293,9 @@ def main():
             with open(brief, "w") as f:
                 f.write(f"<!-- generated by fleet-run (P) -->\nTask: {a.task}\nWorktree: {wt}\nReport: {rep}\n"
                         f"Full plan: {T}/plan.md  Criteria: {T}/criteria.json  (read both)\n"
-                        f"Allowed files: the ones in the plan.\n\nFollow the format below (the {{...}} fields are in the plan):\n\n" + template)
+                        f"Allowed files: the ones in the plan.\n" +
+                        (f"Project lessons (follow them): {project_lessons}\n" if project_lessons else "") +
+                        f"\nFollow the format below (the {{...}} fields are in the plan):\n\n" + template)
             name = f"fleet-{base_name}-dev-{hhmmss}"
             prompt = f"Read and execute the brief {brief}. Work only in the worktree {wt}. Write the report to {rep}."
             if dev["tool"] == "claude":

@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""fleet-retro-cycle — the unattended self-improvement cycle (PLAN F5). One command for a routine/cron.
+
+  fleet-retro-cycle [--dry-run [--with-model] [--out DIR]] [--force] [--json]
+
+Order: due check → pending batch → lint → generation (fleet-retro batch, ONE model call) → judge (ONE paired call, T5)
+→ apply the eligible candidates (fleet-skill-apply with --decision/--cand-fp/--relation, generic rules in probation) →
+probation pass (auto-reverts, txn recovery, T6) → quiet notice.
+
+* Holds the batch lock for the whole run: a second invocation exits 5.
+* Due check: runs only when >= policy cycle.due_hours minus cycle.due_slack_hours (default 48 - 6 = 42 h, so scheduler
+  jitter on a 2-day schedule never skips a cycle) passed since the last cycle (retro-state.json `last_cycle`), unless
+  --force (otherwise: "not due", exit 0, nothing done). Last completed cycle older than cycle.late_hours (default 72 =
+  the 48 h interval + 24 h grace) → `scheduler late: Nh`, a pure clock check (no model call); cycle.late_notice=false
+  turns it off.
+* Empty cycle (no finished task folder, nothing deferred from before) = 0 model calls and silent.
+* Budget: policy budget.tokens_per_cycle is RESERVED before each model call (ceil(chars/4 x 1.25) + the fixed
+  budget.output_allowance_tokens); a call whose reservation does not fit is not made — its folders/candidates stay pending.
+  ALL real tokens are charged (input + output + cache creation + cache read). If a call still ends above what was left,
+  `overshoot_tokens` is recorded, no further call is made that cycle and the overshoot is carried into the next cycle
+  (retro-state `budget_carry`). skill/retro-batches/<stamp>/usage.json holds reservations, real usage (stream-json
+  `result`), overshoot_tokens, would_suppress, blocked, deferred.
+* Crash safety: candidates.json (batch dir, atomic) is written BEFORE the task state advances and updated after the
+  judge and after every applied diff; the next cycle resumes an incomplete batch from it (judge verdicts are reused by
+  decision id, an applied diff is never applied twice).
+* Notice: only when something was applied or auto-reverted: 1-3 lines built by code (scope, count, undo id), printed on
+  stdout and saved as notice.txt in the batch dir; the caller forwards it. Profile proposals are never applied: they
+  queue in skill/proposals/profile-queue.md, mentioned only inside that notice. A late scheduler on an otherwise empty
+  cycle is ONE line: `retro: scheduler late: Nh` (a dead scheduler must be visible).
+* --dry-run: applies nothing, writes nothing outside --out DIR (no lock, no state, no probes, no ledger). Without
+  --with-model no model call at all; with it only the generation call is made (inside DIR) and its proposals are counted;
+  the judge only reports `would_judge`.
+Exit: 0 ok / not due / empty, 5 another cycle holds the lock, 1 error."""
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, BIN)
+import fleet_judge_lib as J  # noqa: E402
+import fleet_probation as P  # noqa: E402
+import fleet_skill_lib as L  # noqa: E402
+
+RETRY = ("new", "deferred", "waiting", "eligible")   # candidate statuses a later cycle picks up again
+JUDGE = ("new", "deferred", "waiting")                  # ... and of those, the ones that still need the judge
+PROFILE_QUEUE = os.path.join("skill", "proposals", "profile-queue.md")
+APPLY = os.path.join(BIN, "fleet-skill-apply")
+
+
+def load_retro():
+    path = os.path.join(BIN, "fleet-retro")
+    loader = importlib.machinery.SourceFileLoader("fleet_retro_mod", path)
+    spec = importlib.util.spec_from_loader("fleet_retro_mod", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def est_tokens(prompt, pol=None):
+    """Reservation for a call: ceil(estimated input x 1.25) + the fixed output allowance (policy)."""
+    return J.estimate_tokens(prompt, 0, pol)
+
+
+def real_total(u):
+    """Tokens charged to the budget from a parsed usage dict: ALL of them (cache reads and creation included)."""
+    return sum(int(u.get(k, 0)) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens",
+                                          "cache_read_input_tokens"))
+
+
+class Budget:
+    def __init__(self, limit, carry=0):
+        """carry: tokens an earlier cycle overshot; charged first (what does not fit stays carried)."""
+        self.limit, self.reservations, self.overshoot = int(limit), [], 0
+        self.late_total = 0   # late reconciliation charges taken at the start of this cycle
+        self.settled = {}   # outstanding run name -> (tokens charged this cycle, run finished); written by save_last_cycle
+        carry = max(0, int(carry or 0))
+        self.spent = min(carry, self.limit)
+        self.carry_in, self.carry_rest = carry, carry - self.spent
+
+    @property
+    def left(self):
+        return max(0, self.limit - self.spent)
+
+    @property
+    def carry_out(self):
+        return self.carry_rest + self.overshoot
+
+    def reserve(self, phase, est):
+        """True (and the reservation is recorded) only when est fits and no call overshot yet; else nothing is called."""
+        ok = est <= self.left and self.overshoot == 0
+        self.reservations.append({"phase": phase, "estimated": est, "granted": ok})
+        return ok
+
+    def charge_late(self, extra):
+        """Late reconciliation of an earlier cycle's call: its real usage exceeded what was charged then by `extra`."""
+        extra = max(0, int(extra))
+        self.late_total += extra
+        self.overshoot += max(0, extra - self.left)
+        self.spent += extra
+
+    def settle(self, est, real):
+        """Charge the real usage (the reservation when the run reported none). Above what was left → overshoot."""
+        used = real if real > 0 else est
+        self.overshoot += max(0, used - self.left)
+        self.spent += used
+        return used
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(root, rel, obj):
+    L.safe_write(root, rel, json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+
+
+def parse_ts(v):
+    try:
+        return datetime.datetime.fromisoformat(str(v)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def iso(ts):
+    return datetime.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+
+# ------------------------------------------------------------------ pieces
+def fresh_usage(stamp, limit):
+    return {"stamp": stamp, "budget": {"tokens_per_cycle": limit, "reserved": 0, "spent": 0, "left": limit},
+            "reservations": [], "calls": {"generation": 0, "judge": 0, "total": 0},
+            "tokens": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0,
+                       "cache_read_input_tokens": 0},
+            "would_suppress": 0, "blocked": 0, "deferred": {"folders": 0, "candidates": 0}, "refused": 0, "held": 0,
+            "judged": 0, "applied": 0, "apply_failed": 0, "reverted": 0, "activated": 0, "errors": [], "overshoot_tokens": 0}
+
+
+def add_tokens(usage, u):
+    for k in usage["tokens"]:
+        usage["tokens"][k] += int(u.get(k, 0))
+
+
+def finish_usage(usage, bud):
+    usage["budget"].update(reserved=sum(r["estimated"] for r in bud.reservations if r["granted"]), spent=bud.spent,
+                           left=bud.left)
+    usage["reservations"] = bud.reservations
+    usage["overshoot_tokens"] = bud.overshoot
+    usage["carry_in_tokens"] = bud.carry_in
+    usage["carry_out_tokens"] = bud.carry_out
+    usage["calls"]["total"] = usage["calls"]["generation"] + usage["calls"]["judge"]
+    return usage
+
+
+def queue_profile(root, res):
+    """Append the batch's profile proposals to the pending queue (idempotent per proposal file) → entries in queue."""
+    path = os.path.join(root, PROFILE_QUEUE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            cur = f.read()
+    except OSError:
+        cur = ""
+    pf = res.get("profile")
+    if pf:
+        mark = f"<!-- {os.path.basename(pf)} -->"
+        try:
+            with open(pf, encoding="utf-8") as f:
+                body = f.read()
+        except OSError:
+            body = ""
+        if mark not in cur and body.strip():
+            cur = (cur or "# Profile proposal queue (never applied automatically: the owner decides)\n\n") + \
+                mark + "\n" + body.rstrip("\n") + "\n\n"
+            L.safe_write(root, PROFILE_QUEUE, cur)
+    return cur.count("<!-- profile-")
+
+
+def batch_dirs(root):
+    d = os.path.join(L.skill_dir(root), "retro-batches")
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+def previous_pending(root, pol):
+    """Segments of the last pending_expire_batches batches that are not finished: candidates the budget deferred, that
+    wait for a probation slot, never got judged (crash) or were judged eligible but not applied (crash). They are
+    picked up again until their batch expires. Each comes back with origin (its batch stamp), run and runs."""
+    out = []
+    for stamp in reversed(batch_dirs(root)[-int(pol["pending_expire_batches"]):]):
+        data = read_json(os.path.join(L.skill_dir(root), "retro-batches", stamp, "candidates.json"), {})
+        for seg in data.get("segments") or []:
+            if seg.get("done") or not os.path.isfile(seg.get("diff", "")):
+                continue
+            if any(c.get("status") in RETRY for c in seg.get("candidates") or []):
+                out.append(dict(seg, origin=stamp, run=data.get("run"), runs=data.get("runs") or []))
+    return out
+
+
+def judge_segments(segs, stamp, runs, bud, usage, root, pol, a, dry_run=False, slots=None):
+    """Gate + judge the candidates of segs that still need it (archives need no judge). One judge call per batch of
+    origin (the batch stamp is part of the decision id, so a resumed batch reuses its logged verdicts). Sets
+    cand['status'|'verdict'|'decision_id'|'cand_fp']; persists via the caller.
+    `slots` is the cycle's ONE probation-slot map, shared by all origin batches: slots of candidates that are already
+    eligible (judged earlier, not yet applied) are reserved first; a candidate whose slot is taken stays `waiting`."""
+    slots = {} if slots is None else slots
+    groups = {}
+    for seg in segs:
+        for c in seg["candidates"]:
+            if c.get("status") == "eligible" and c.get("op") != "archive":
+                P.take_slot(c, slots, root=root, policy=pol)
+    for seg in segs:
+        for c in seg["candidates"]:
+            if c.get("op") == "archive" and c.get("status") in JUDGE:
+                c.update(status="eligible", verdict="archive")
+            elif c.get("status") in JUDGE:
+                groups.setdefault(seg.get("origin") or stamp, ([], seg.get("runs") or runs))[0].append(c)
+    for origin, (pending, bruns) in groups.items():
+        _judge_group(pending, origin, bruns, bud, usage, root, pol, a, dry_run, slots)
+
+
+def _judge_group(pending, stamp, runs, bud, usage, root, pol, a, dry_run, slots):
+    to_judge, held = P.gate_candidates(pending, root=root, policy=pol, slots=slots)
+    usage["held"] += len(held)
+    why = {h.get("cand_fp"): h.get("status") for h in held}   # cooldown | waiting (held items are copies)
+    for c in pending:
+        if not any(c is j for j in to_judge):
+            c["status"], c["verdict"] = why.get(c.get("cand_fp"), "held"), "held"
+    if not to_judge:
+        return
+    res = J.judge(to_judge, batch_stamp=stamp, batch_runs=runs, budget_left=bud.left, root=root, policy=pol,
+                  dry_run=dry_run, model=a.judge_model, wait_sec=a.wait_sec)
+    u = res["usage"]
+    if u.get("reserved"):
+        bud.reservations.append({"phase": "judge", "estimated": u["reserved"], "granted": True})
+    elif u.get("estimated"):
+        bud.reservations.append({"phase": "judge", "estimated": u["estimated"], "granted": False})
+    if u.get("calls"):
+        bud.settle(u.get("reserved", 0), real_total(u))
+    usage["calls"]["judge"] += u.get("calls", 0)
+    add_tokens(usage, u)
+    usage["would_suppress"] += u.get("would_suppress", 0)
+    usage["blocked"] += u.get("blocked", 0)
+    usage["refused"] += u.get("refused", 0)
+    usage["judged"] += u.get("judged", 0)
+    usage["deferred"]["candidates"] += u.get("deferred", 0)
+    usage["errors"] += [v["reason"] for v in res["verdicts"] if v and v.get("verdict") == "error"][:3]
+    for c, v in zip(to_judge, res["verdicts"]):
+        v = v or {}
+        c["verdict"], c["reason_code"] = v.get("verdict"), v.get("reason_code")
+        c["decision_id"], c["cand_fp"] = v.get("decision_id"), v.get("cand_fp") or c.get("cand_fp")
+        c["status"] = ("eligible" if v.get("verdict") == "accept" else "deferred" if v.get("verdict") == "deferred"
+                       and v.get("reason_code") == "budget" else v.get("verdict") or "error")
+        if c["status"] != "eligible":
+            P.release_slot(c, slots, root=root, policy=pol)   # will not be applied: the slot is free for the next origin
+
+
+def apply_segments(segs, run, root, usage, save=None):
+    """Apply, in order, each segment whose candidates are ALL eligible (a diff is all-or-nothing). Later segments of a
+    group whose earlier one was not applied are skipped (the diffs chain). `save` is called after every applied diff
+    (crash safety). → list of {scope, diff, id, rules}"""
+    applied, blocked_groups = [], set()
+    for seg in segs:
+        cands = seg["candidates"]
+        ok = bool(cands) and all(c.get("status") == "eligible" for c in cands) and seg.get("applies", True)
+        if not ok or seg["group"] in blocked_groups:
+            blocked_groups.add(seg["group"])
+            continue
+        c0 = cands[0]
+        rule = " / ".join(str(c.get("rule", ""))[:80] for c in cands)[:200]
+        cmd = [APPLY, seg["diff"], "--run", seg.get("run") or run, "--reason", f"retro {run}: {rule}"] + list(seg.get("flags") or [])
+        if seg.get("relation"):
+            cmd += ["--relation", seg["relation"]]
+        if len(cands) == 1 and c0.get("decision_id"):
+            cmd += ["--decision", c0["decision_id"]]
+        if len(cands) == 1 and c0.get("cand_fp"):
+            cmd += ["--cand-fp", c0["cand_fp"]]
+        generic_rule = (len(cands) == 1 and c0.get("scope") == "generic" and c0.get("behavioural")
+                        and c0.get("op") != "archive")
+        if generic_rule:
+            cmd += ["--probation"]
+            if c0.get("failure_id"):
+                cmd += ["--failure-probe", c0["failure_id"]]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            out = json.loads(r.stdout) if r.stdout.strip() else {}
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            r, out = None, {}
+        if r is not None and r.returncode == 0 and out.get("ok"):
+            lid = (out.get("ledger") or {}).get("id")
+            applied.append({"scope": c0.get("scope"), "diff": seg["diff"], "id": lid, "rules": len(cands),
+                            "probation": generic_rule})
+            seg["done"], seg["ledger_id"] = True, lid
+            for c in cands:
+                c["status"] = "applied"
+            usage["applied"] += len(cands)
+            if save:
+                save()
+        else:
+            usage["apply_failed"] += 1
+            blocked_groups.add(seg["group"])
+            for c in cands:
+                c["status"] = "apply_failed"
+            seg["apply_error"] = str((out or {}).get("error") or (r.stderr if r else "timeout"))[-300:]
+    return applied
+
+
+def build_notice(applied, rep, profile_n, late_h):
+    """1-3 lines, by code. Nothing unless something was applied or auto-reverted (a late scheduler alone: one line)."""
+    lines = []
+    if applied:
+        by = {}
+        for x in applied:
+            by[x["scope"] or "generic"] = by.get(x["scope"] or "generic", 0) + x["rules"]
+        n = sum(by.values())
+        ids = ", ".join(str(x["id"]) for x in applied if x["id"] is not None)
+        lines.append(f"retro: applied {n} change(s) [{', '.join(f'{k} {v}' for k, v in sorted(by.items()))}]"
+                     + (f"; undo: fleet-skill-apply --revert <id> (ids {ids})" if ids else ""))
+    if rep["reverted"]:
+        ids = ", ".join(str(r.get("id")) for r in rep["reverted"])
+        lines.append(f"retro: auto-reverted {len(rep['reverted'])} rule(s) in probation (ledger {ids}); "
+                     f"details in the ledger")
+    tail = []
+    if (applied or rep["reverted"]) and profile_n:
+        tail.append(f"{profile_n} profile proposal(s) pending in {PROFILE_QUEUE} (never applied)")
+    if late_h is not None:
+        tail.append(f"scheduler late: {late_h}h")
+    if tail:
+        lines.append("retro: " + "; ".join(tail))
+    return lines[:3]
+
+
+# ------------------------------------------------------------------ the cycle
+def cycle(a):
+    RT = load_retro()
+    root = L.fleet_root()
+    pol = L.load_policy(root)
+    now = time.time()
+    st = RT.load_state(root)
+    last = parse_ts(st.get("last_cycle"))
+    cyc = pol["cycle"]
+    age_h = None if last is None else (now - last) / 3600.0
+    report = {"ok": True, "dry_run": bool(a.dry_run), "due": True, "notice": [], "late_hours": None}
+    due_h = max(0.0, float(cyc["due_hours"]) - float(cyc.get("due_slack_hours", 0)))
+    if age_h is not None and not a.force and age_h < due_h:
+        report.update(due=False, reason=f"not due: last cycle {age_h:.1f}h ago (< {due_h:g}h)")
+        return report, 0
+    if cyc.get("late_notice", True) and age_h is not None and age_h > float(cyc["late_hours"]):
+        report["late_hours"] = int(age_h)
+    if a.dry_run:
+        return dry_run(a, RT, root, pol, st, report, now), 0
+    with RT.BatchLock(root):
+        return real_cycle(a, RT, root, pol, st, report, now), 0
+
+
+def dry_run(a, RT, root, pol, st, report, now):
+    sel, skipped, deferred = RT.batch_candidates(st)
+    dirs = [(T, r, p) for T, r, p, _ in sel]
+    bud = Budget(pol["budget"]["tokens_per_cycle"], st.get("budget_carry"))
+    probation = [P.evaluate_probation(e, now, root=root, policy=pol) for e in P.probation_entries()]
+    prompt = RT.build_batch_prompt(dirs, root, 1.0 if len(dirs) <= 2 else max(0.35, 2.0 / len(dirs)), pol) if dirs else ""
+    est = est_tokens(prompt, pol) if dirs else 0
+    report.update(selected=[d[0] for d in dirs], skipped_active=skipped, deferred_folders=deferred,
+                  prompt_chars=len(prompt), estimated_tokens=est, budget_left=bud.left,
+                  fits_budget=(est <= bud.left) if dirs else True, probation=[
+                      {"id": e["id"], "decision": e["decision"], "reason": e["reason"]} for e in probation],
+                  would_apply=[], would_judge=0, model_calls=0, would_revert=[e["id"] for e in probation
+                                                                              if e["decision"] == "revert"])
+    if dirs and a.with_model and est <= bud.left:
+        if not a.out:
+            report["note"] = "--with-model needs --out DIR (the model run is kept there)"
+        else:
+            gdir = os.path.join(os.path.abspath(a.out), "gen")
+            os.makedirs(gdir, exist_ok=True)
+            res = generate(RT, gdir, "dry", "dry-run", prompt, dirs, a)
+            report["model_calls"] = 1
+            report["usage"] = res["usage"]
+            obj = J.parse_answer(res["text"])
+            props = (obj or {}).get("proposals") if isinstance(obj, dict) and obj.get("verdict") == "proposals" else []
+            report["would_judge"] = len(props or [])
+    elif dirs and a.with_model:
+        report["note"] = "generation would not fit the budget"
+    if a.out:
+        os.makedirs(a.out, exist_ok=True)
+        with open(os.path.join(a.out, "report.json"), "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+    return report
+
+
+def generate(RT, task_dir, name, run, prompt, dirs, a):
+    """The generation call: fleet-retro's read-only launch. → {text, usage(parsed), state, ok, error}"""
+    cmd = RT.launch_cmd(task_dir, name, run, prompt, L.fleet_root(), a.max_min, a.model, [d[0] for d in dirs])
+    ns = argparse.Namespace(notify=False, wait_sec=a.wait_sec)
+    try:
+        got = RT.launch_and_wait(cmd, ns)
+    except SystemExit as e:   # vigia cap / launch failure
+        return {"text": None, "usage": {}, "state": None, "ok": False, "error": str(e.code), "tools": None, "used": ()}
+    if got is None:
+        return {"text": None, "usage": {}, "state": "running", "ok": False, "error": "still running", "tools": None,
+                "used": ()}
+    info, stv = got
+    txt, tools, used = RT.scan_events(info["events_path"])
+    usage = J.parse_usage(J.scan_events(info["events_path"])[1])
+    return {"text": txt, "usage": usage, "state": stv.get("state"), "ok": True, "error": None, "tools": tools,
+            "used": used, "info": info}
+
+
+def real_cycle(a, RT, root, pol, st, report, now):
+    started = L.now_iso()
+    stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{int(time.time() * 1e6) % 10**6:06d}{os.urandom(1).hex()}"   # sortable
+    bud = Budget(pol["budget"]["tokens_per_cycle"], st.get("budget_carry"))
+    usage = fresh_usage(stamp, bud.limit)
+    brel = os.path.join("skill", "retro-batches", stamp)
+    seg_store = []   # segments (diff + candidates) generated by this cycle
+    note = []
+    res_collected = None
+    gen_run = None
+    runs = []
+
+    # 0. generation runs that outlived an earlier wait: reconcile their real usage exactly once, before any new call
+    reconcile_outstanding(RT, root, bud, usage, pol, now)
+
+    # 1. pending batch whose model run outlived an earlier wait (or whose cycle crashed before finalizing).
+    #    Its candidates.json is written BEFORE the task state advances; they come back through previous_pending().
+    state, pend = RT.collect_pending(root, before_finalize=lambda bdir, r: persist_new(root, bdir, r))
+    if state == "running":
+        note.append(f"a previous batch is still running ({pend['name']}): no new generation")
+    elif state == "collected":
+        res_collected = pend["result"]
+        gen_run = pend["manifest"].get("run")
+    st = RT.load_state(root)
+
+    # 2. selection
+    sel, skipped, deferred = RT.batch_candidates(st)
+    dirs = [(T, r, p) for T, r, p, _ in sel]
+    carried = previous_pending(root, pol)
+    if state == "running":
+        dirs = []
+    if not dirs and not carried and not P.probation_entries():
+        rep = P.run(root=root, policy=pol)   # 0 tokens: crash recovery only
+        if not (rep["reverted"] or rep["activated"] or rep["recovered"]):
+            save_last_cycle(RT, root, started, bud, empty=True)
+            report.update(empty=True, notice=build_notice([], rep, 0, report["late_hours"]))
+            finalize_empty(report, root, brel, usage, bud)
+            return report
+        return finish(a, RT, root, pol, report, brel, usage, bud, [], rep, res_collected, started, note, [])
+
+    L.ensure_dir(root, brel)
+
+    # 3. lint + generation (one call, reserved first)
+    if dirs:
+        RT.record_batch_successes(dirs, root)
+        lint = RT.run_lint(["--json", "--no-report"])
+        scale = 1.0 if len(dirs) <= 2 else max(0.35, 2.0 / len(dirs))
+        prompt = RT.build_batch_prompt(dirs, root, scale, pol, lint=lint)
+        est = est_tokens(prompt, pol)
+        while len(dirs) > 1 and est > bud.left:   # drop the oldest folder: it stays pending (old cutoff kept)
+            deferred = [dirs.pop()[0]] + deferred
+            usage["deferred"]["folders"] += 1
+            prompt = RT.build_batch_prompt(dirs, root, 1.0 if len(dirs) <= 2 else max(0.35, 2.0 / len(dirs)), pol,
+                                           lint=lint)
+            est = est_tokens(prompt, pol)
+        if not bud.reserve("generation", est):
+            usage["deferred"]["folders"] += len(dirs)
+            note.append(f"generation deferred: reservation {est} tokens > {bud.left} left")
+        else:
+            projects = sorted({p for _, _, p in dirs})
+            name, run = f"retro-batch-{stamp}", f"batch-{stamp}"
+            bdir = os.path.join(root, brel)
+            by_dir = {d[0]: d for d in sel}
+            man = {"name": name, "run": run, "started": started,
+                   "cutoff": RT._ts(st.get("last_run"), time.time() - pol["cycle"]["first_batch_hours"] * 3600),
+                   "projects": projects, "skipped_active": skipped, "deferred": deferred,
+                   "dirs": [{"task_dir": T, "run": r, "project": p, "latest": by_dir[T][3]} for T, r, p in dirs]}
+            save_json(root, os.path.join(brel, "manifest.json"), man)
+            reserve_outstanding(RT, root, name, brel, est, run)   # on disk BEFORE the run starts (crash-safe)
+            g = generate(RT, bdir, name, run, prompt, dirs, a)
+            usage["calls"]["generation"] += 1
+            add_tokens(usage, g["usage"])
+            used = bud.settle(est, real_total(g["usage"]))
+            # the debit becomes durable only in save_last_cycle (one atomic write): a finished run's entry is dropped
+            # there, a still-running one gets charged=used. A crash before that leaves charged=0 → full reconcile.
+            bud.settled[name] = (used, g["state"] != "running")
+            if g["state"] == "running" or g["error"]:
+                note.append(f"generation: {g['error']}")
+                usage["errors"].append(str(g["error"])[:200])
+                if g["state"] != "running":   # nothing usable: finish the batch as failed (state not advanced)
+                    r0 = {"ok": True, "proposals": 0, "diffs": [], "profile": None, "parsed": False}
+                    RT.finalize_batch(root, bdir, man, r0)
+            else:
+                runs = [r for _, r, _ in dirs]
+                gen_run = run
+                r = RT.collect(bdir, run, g["text"], name, root, projects, g["tools"], g["used"], runs)
+                r["retro_state"] = g["state"]
+                persist_new(root, bdir, r)   # recoverable state first; only then the task state advances
+                res_collected = RT.finalize_batch(root, bdir, man, r)
+                seg_store = ingest_result(res_collected, run, stamp, runs)
+
+    # 4. judge + apply: this cycle's candidates plus everything an earlier batch left pending
+    segs = seg_store + carried
+    slots = {}   # probation slots reserved this cycle, shared by every origin batch
+    save = lambda: persist_all(root, segs)   # noqa: E731
+    if segs:
+        judge_segments(segs, stamp, runs or [gen_run or "cycle"], bud, usage, root, pol, a, slots=slots)
+        save()
+    applied = apply_segments(segs, gen_run or "cycle", root, usage, save) if segs else []
+    profile_n = queue_profile(root, res_collected or {})
+    if segs:
+        save()
+    return finish(a, RT, root, pol, report, brel, usage, bud, applied, None, res_collected, started, note, segs,
+                  profile_n)
+
+
+def ingest_result(res, run, origin, runs):
+    """Segments (diff + their candidates) of a collected batch result."""
+    by_n = {c.get("n"): dict(c, status="new") for c in res.get("candidates") or []}
+    segs = []
+    for s in res.get("segments") or []:
+        cs = [by_n[n] for n in s["ns"] if n in by_n]
+        segs.append(dict(s, candidates=cs, run=run, origin=origin, runs=list(runs)))
+    return segs
+
+
+def persist_new(root, bdir, res):
+    """Write the batch's recoverable candidates (candidates.json, atomic) the first time only: a file that exists is the
+    resume state (judged / applied marks) and wins over a re-collection of the same answer."""
+    brel = os.path.relpath(bdir, root)
+    rel = os.path.join(brel, "candidates.json")
+    if os.path.exists(os.path.join(root, rel)) or not res.get("segments"):
+        return
+    man = read_json(os.path.join(bdir, "manifest.json"), {})
+    runs = [d.get("run") for d in man.get("dirs") or []]
+    segs = ingest_result(res, man.get("run"), os.path.basename(bdir), runs)
+    save_json(root, rel, {"run": man.get("run"), "runs": runs, "segments": segs})
+
+
+def persist_all(root, segs):
+    """Write the segments' progress (candidate statuses, done, ledger id) into the candidates.json of their batch."""
+    by_origin = {}
+    for s in segs:
+        if s.get("origin"):
+            by_origin.setdefault(s["origin"], []).append(s)
+    for origin, ss in by_origin.items():
+        p = os.path.join("skill", "retro-batches", origin, "candidates.json")
+        data = read_json(os.path.join(root, p), {})
+        for o in data.get("segments") or []:
+            for s in ss:
+                if o.get("diff") == s["diff"]:
+                    o.update(done=bool(s.get("done")), candidates=s["candidates"], ledger_id=s.get("ledger_id"),
+                             apply_error=s.get("apply_error"))
+        save_json(root, p, data)
+
+
+def outstanding_of(RT, root):
+    return [o for o in RT.load_state(root).get("outstanding_reservations") or [] if isinstance(o, dict)]
+
+
+def write_state(RT, root, st):
+    save_json(root, os.path.relpath(RT.state_path(root), root), st)
+
+
+def commit_outstanding(RT, root, items, carry_add=0, expired=()):
+    """ONE atomic retro-state write (temp + os.replace, the cycle holds the batch lock): the new list of outstanding
+    reservations, the tokens that must be carried (`budget_carry` += carry_add) and the expiry records. A charge and the
+    removal of the entry that justifies it therefore always land together: after a crash the entry is either still
+    there (charged on the rerun) or gone with its charge persisted — never lost, never twice."""
+    st = RT.load_state(root)
+    if items:
+        st["outstanding_reservations"] = items
+    else:
+        st.pop("outstanding_reservations", None)
+    if carry_add > 0:
+        st["budget_carry"] = max(0, int(st.get("budget_carry") or 0)) + int(carry_add)
+    if expired:
+        old = [e for e in st.get("expired_reservations") or [] if isinstance(e, dict)]
+        st["expired_reservations"] = (old + list(expired))[-20:]
+    write_state(RT, root, st)
+
+
+def reserve_outstanding(RT, root, name, brel, est, run):
+    """Written BEFORE the generation run is launched: a crash/kill from here on leaves the reservation on disk.
+    charged=0: nothing is durably debited yet (save_last_cycle sets it with the cycle's end-of-cycle write).
+    Idempotent per run name."""
+    items = [o for o in outstanding_of(RT, root) if o.get("name") != name]
+    items.append({"name": name, "run": run, "batch": brel, "reserved": est, "charged": 0, "created": L.now_iso()})
+    commit_outstanding(RT, root, items)
+
+
+def reconcile_outstanding(RT, root, bud, usage, pol, now=None):
+    """A generation run is recorded in retro-state `outstanding_reservations` (run name + reserved tokens, charged=0)
+    before it is launched, and stays there while it may still be running. At the start of every real cycle:
+    * status final → charge real usage (events `result`; the reservation when none) minus `charged`; drop the entry;
+    * status missing / invalid → NOT final: if the events log has a final `result` with usage, reconcile from it;
+      else keep the entry until it is older than policy `budget.outstanding_max_age_hours`, then drop it charging
+      reserved minus charged, never refunding (retro-state + usage `expired_reservations`);
+    * status running → keep (same expiry).
+    `charged` is what an earlier cycle durably debited (set by save_last_cycle). Charges are persisted (budget_carry) in
+    the same atomic write that drops the entries, so a rerun after a crash never double-charges and never loses one."""
+    now = time.time() if now is None else now
+    max_age = float(pol["budget"]["outstanding_max_age_hours"]) * 3600
+    items, keep, extra_total, changed, expired = outstanding_of(RT, root), [], 0, False, []
+    for o in items:
+        name, brel = str(o.get("name") or ""), str(o.get("batch") or "")
+        reserved, charged = int(o.get("reserved") or 0), int(o.get("charged") or 0)
+        runs = os.path.join(root, brel, "runs")
+        try:
+            with open(os.path.join(runs, name + ".status.json"), encoding="utf-8") as f:
+                state = json.load(f).get("state")
+        except (OSError, ValueError, AttributeError):
+            state = None
+        state = state if isinstance(state, str) else None
+        ev = os.path.join(runs, name + ".events.jsonl")
+        real_usage = J.parse_usage(J.scan_events(ev)[1])
+        has_result = any(real_usage.values())
+        final = state in RT.FINAL_STATES or (state is None and has_result)
+        if not final:
+            created = parse_ts(o.get("created"))
+            if created is None:   # entry from an older version: its age starts now
+                o = dict(o, created=iso(now))
+                changed = True
+            elif now - created > max_age:
+                extra = max(0, reserved - charged)
+                rec = {"name": name, "batch": brel, "reserved": reserved, "charged_now": extra, "expired_at": iso(now)}
+                RT.retire_batch(root, os.path.join(root, brel))   # BEFORE the entry is dropped: a rerun retires nothing twice
+                expired.append(rec)
+                usage.setdefault("expired_reservations", []).append(rec)
+                if extra:
+                    bud.charge_late(extra)
+                    extra_total += extra
+                changed = True
+                continue
+            keep.append(o)
+            continue
+        extra = (real_total(real_usage) if has_result else reserved) - charged
+        if extra > 0:
+            bud.charge_late(extra)
+            extra_total += extra
+            usage["late_reconciled_tokens"] = usage.get("late_reconciled_tokens", 0) + extra
+        usage.setdefault("reconciled_runs", []).append(name)
+        changed = True
+    if changed or len(keep) != len(items):
+        commit_outstanding(RT, root, keep, extra_total, expired)
+
+
+def save_last_cycle(RT, root, started, bud, empty=False):
+    """End-of-cycle state write (ONE atomic write): the carry, and the durable debit of this cycle's own generation run:
+    a finished run's entry is dropped (its overshoot is in the carry), a still-running one is charged=what was charged."""
+    st = RT.load_state(root)
+    st["last_cycle"] = started
+    st["budget_carry"] = bud.carry_out   # tokens a call overshot: charged to the next cycle
+    if empty:   # no call used this cycle's budget: a late/expired charge stays visible in the carry (next cycle pays it)
+        st["budget_carry"] = bud.carry_rest + bud.late_total
+    items = []
+    for o in st.get("outstanding_reservations") or []:
+        if not isinstance(o, dict):
+            continue
+        done = bud.settled.get(o.get("name"))
+        if done and done[1]:
+            continue
+        items.append(dict(o, charged=done[0]) if done else o)
+    if items:
+        st["outstanding_reservations"] = items
+    else:
+        st.pop("outstanding_reservations", None)
+    write_state(RT, root, st)
+
+
+def finalize_empty(report, root, brel, usage, bud):
+    """Empty cycle: nothing is written except the state (no batch dir, no usage file)."""
+    report["usage"] = finish_usage(usage, bud)
+
+
+def finish(a, RT, root, pol, report, brel, usage, bud, applied, rep, res, started, note, segs, profile_n=0):
+    if rep is None:
+        rep = P.run(root=root, policy=pol)
+    usage["reverted"] = len(rep["reverted"])
+    usage["activated"] = len(rep["activated"])
+    lines = build_notice(applied, rep, profile_n, report["late_hours"])
+    L.ensure_dir(root, brel)
+    if lines:
+        L.safe_write(root, os.path.join(brel, "notice.txt"), "\n".join(lines) + "\n")
+    save_json(root, os.path.join(brel, "usage.json"), finish_usage(usage, bud))
+    save_last_cycle(RT, root, started, bud)
+    report.update(notice=lines, applied=applied, reverted=[r.get("id") for r in rep["reverted"]],
+                  activated=[r.get("id") for r in rep["activated"]], batch=os.path.join(root, brel), notes=note,
+                  usage=usage)
+    return report
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-retro-cycle")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true", help="skip the due check")
+    ap.add_argument("--json", action="store_true", help="print the full report as JSON instead of the notice")
+    ap.add_argument("--with-model", action="store_true", help="dry-run only: make the generation call (inside --out)")
+    ap.add_argument("--out", help="dry-run report folder (the only place a dry run writes)")
+    ap.add_argument("--model", default="sonnet")
+    ap.add_argument("--judge-model", default=None)
+    ap.add_argument("--max-min", type=float, default=15)
+    ap.add_argument("--wait-sec", type=int, default=540)
+    a = ap.parse_args(argv)
+    if a.with_model and not a.dry_run:
+        ap.error("--with-model only applies to --dry-run (a real cycle always uses the model when there is work)")
+    try:
+        report, code = cycle(a)
+    except OSError as e:
+        sys.exit(f"fleet-retro-cycle: refused to write: {e}")
+    if a.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+    elif a.dry_run:
+        print(dry_text(report))
+    elif not report.get("due", True):
+        print(report["reason"])
+    elif report.get("notice"):
+        print("\n".join(report["notice"]))
+    return code
+
+
+def dry_text(r):
+    if not r.get("due", True):
+        return r["reason"]
+    rows = [f"dry-run: {len(r.get('selected', []))} folder(s) selected, prompt {r.get('prompt_chars', 0)} chars, "
+            f"estimated {r.get('estimated_tokens', 0)} tokens of {r.get('budget_left', 0)} left, "
+            f"model calls {r.get('model_calls', 0)}",
+            f"would apply: {', '.join(map(str, r.get('would_apply') or [])) or 'nothing known without the model'}",
+            "probation: " + (", ".join("%s=%s" % (p["id"], p["decision"]) for p in r.get("probation", [])) or "none")]
+    if r.get("late_hours") is not None:
+        rows.append(f"scheduler late: {r['late_hours']}h")
+    return "\n".join(rows)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

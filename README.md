@@ -117,7 +117,7 @@ export PATH="$HOME/.orquestra/bin:$PATH"   # optional
 
 `install.sh` copies the scripts to `$ORQUESTRA_HOME/bin`, renders `claude-hooks.json` with absolute paths,
 creates `$ORQUESTRA_HOME/vigia/`, installs the fleet kit into `$ORQUESTRA_HOME/fleet/` (add `fleet/bin` to `PATH`),
-and copies the docs, the bot prompt and the Vigia routine instruction (`vigia-routine.md`). Re-run it to update. It never touches
+and copies the docs, the bot prompt and the two routine instructions (`vigia-routine.md`, `retro-routine.md`). Re-run it to update. It never touches
 `webhook.env` or run state. An installed copy finds its own home through a `.orquestra-home` marker, so
 `ORQUESTRA_HOME` only needs to be exported if you want to override it.
 
@@ -203,20 +203,44 @@ prompt as described in its header.
 
 1. Create a bot (e.g. "Orquestra") and paste the prompt (the part after the `---`) as its instructions.
 2. On the machine the bot uses, install Claude Code and Codex CLI, log in, then run `./install.sh`.
-3. Create a routine named **Vigia** with a **webhook** trigger on that bot, using the instruction in
-   [`prompts/vigia-routine.md`](prompts/vigia-routine.md) (relay rules + fleet follow-up).
-   Put its URL and key into `~/.orquestra/vigia/webhook.env` (`chmod 600`). The prompt allows the bot to write
-   that file itself.
+3. Create two routines on that bot:
+   - **Vigia**, **webhook** trigger, instruction [`prompts/vigia-routine.md`](prompts/vigia-routine.md) (relay rules +
+     fleet follow-up). Put its URL and key into `~/.orquestra/vigia/webhook.env` (`chmod 600`). The prompt allows the
+     bot to write that file itself.
+   - **Retro**, **schedule** `0 6 */2 * *` (06:00 every second day, flexible timing), instruction
+     [`prompts/retro-routine.md`](prompts/retro-routine.md): the self-improvement cycle. Silent (0 tokens) when there is
+     nothing to do; see [Retro loop notices](#retro-loop-notices).
 4. Ask for work: "Add rate limiting to the API in ~/src/myproject". The bot plans, launches runs under Vigia,
    tells you when to expect news, and picks up when the routine wakes it.
 
 **Automatic setup in Grok Bot:** give your bot the skill in [`skills/orquestra-setup/SKILL.md`](skills/orquestra-setup/SKILL.md)
-and ask "install Orquestra". It installs everything, creates the Vigia routine, asks you only for logins and the
-webhook URL/key (through a masked field), and tests the wake-up.
+and ask "install Orquestra". It installs everything, creates **both** routines (Vigia and Retro) on the bot, asks you
+only for logins and the webhook URL/key (through a masked field), and tests the wake-up. Re-running it updates the
+routines in place (no duplicates).
+
+**Retro without bot routines** (any other platform): one crontab line on the machine with the Orquestra home:
+
+```
+0 6 */2 * * PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" "$HOME/.orquestra/fleet/bin/fleet-retro-cycle" >> "$HOME/.orquestra/retro-cycle.log" 2>&1
+```
+
+### Retro loop notices
+
+The retro cycle talks to you only through one short notice, built by code:
+- **Applied**: 1-3 lines when it applied or auto-reverted a rule (with the undo id). Orquestra profile-change proposals
+  are never applied: they wait in `~/.orquestra/fleet/skill/proposals/profile-queue.md` and are only counted inside this
+  same notice. There is no separate profile notice.
+- **Scheduler late**: `retro: scheduler late: Nh`, on by default, sent even when the cycle is otherwise empty, but only
+  when the last completed cycle is older than `cycle.late_hours` (default 72 h = the 2-day interval + 24 h grace). It is
+  a clock check, 0 model tokens. Turn it off with `"late_notice": false` under `cycle` in
+  `~/.orquestra/fleet/skill/retro-policy.json`.
+- Anything else is silent: a not-due or empty cycle costs 0 tokens; a cycle that ran the model but found nothing worth
+  applying spends its (capped) budget and says nothing.
 
 **In any other agent** (Claude Code itself, a custom agent, another assistant): use the prompt as the system
 prompt. Replace the "routine named Vigia" part with whatever your platform offers for webhook-triggered runs,
-or drop it and have the agent run `vigia-status` at the time it promised.
+or drop it and have the agent run `vigia-status` at the time it promised. Schedule the retro cycle with the cron line
+above.
 
 The prompt assumes: a shared machine where the CLIs are logged in with your accounts; `~/.orquestra` paths
 (edit them if you installed elsewhere); the model aliases `opus`, `sonnet`, `haiku`; and the autonomy policy above.
@@ -226,10 +250,10 @@ The prompt assumes: a shared machine where the CLIs are logged in with your acco
 ```
 bin/            vigia-run, vigia-status, vigia-stop, vigia-notify, hooks, vigia_lib.py, vigia_comms.py,
                 claude-hooks.json.template
-fleet/          bin/ (fleet-run, fleet-wt, fleet-codex, codex-dev, codex-reviewer, fleet-wait),
+fleet/          bin/ (fleet-run, fleet-wt, fleet-codex, codex-dev, codex-reviewer, fleet-wait, retro loop tools),
                 .claude/agents/ (team-lead, dev, reviewer-claude, security), skill/fleet-sdd/ (flow, briefs, templates)
 docs/           vigia.md (Vigia reference), fleet.md (fleet reference)
-prompts/        orquestra.md (the bot instructions), vigia-routine.md (webhook routine instruction)
+prompts/        orquestra.md (the bot instructions), vigia-routine.md (webhook routine), retro-routine.md (retro cycle)
 skills/         orquestra-setup/SKILL.md (self-install skill for Grok Bot)
 tests/          unittest scripts (no LLM, temp dirs only)
 install.sh      installer (into $ORQUESTRA_HOME, default ~/.orquestra)
@@ -249,6 +273,10 @@ for t in tests/test_*.py; do python3 "$t"; done
 - `test_vigia_notify.py`: per-run webhook, muting, `started` not POSTed, dedupe
 - `test_vigia_watchdog.py`: wall-clock cap across suspension, stall with CPU, `incomplete`, watchdog, PID reuse
 - `test_fleet.py`: fleet-wt waves/integration/conflicts and `fleet-run --dry-run`
+- `test_retro_loop.py`: fleet-retro, fleet-skill-apply (apply/revert/ledger) and fleet-skill-lint, no LLM
+- `test_retro_policy.py`, `test_rules_index.py`, `test_judge.py`, `test_probes.py`, `test_prune_merge.py`, `test_probation.py`,
+  `test_retro_cycle.py`: retro loop v0.2.0 (policy, rules index, judge memory, probes, merge-guard, probation, cycle runner), stubbed model
+- `test_oss_port.py`: no hardcoded paths/names, `install.sh` fresh and re-install (local edits kept as `.upstream`, reserved files untouched)
 
 ## Security notes
 

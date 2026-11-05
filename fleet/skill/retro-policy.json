@@ -1,0 +1,77 @@
+{
+  "owner_name": "the owner",
+  "lessons_file": "learnings.md",
+  "ignore_dirs": [
+    "fleet",
+    "bin",
+    "vigia",
+    "skill",
+    "tmp"
+  ],
+  "quota": {
+    "project_additions_per_project": 3,
+    "generic_additions": 3,
+    "shrink_ops_per_scope": 3,
+    "read_cap_multiplier": 3
+  },
+  "budgets": {
+    "lessons_chars": 4000,
+    "learnings_chars": 4000,
+    "skill_md_chars": 12000,
+    "references_total_chars": 40000
+  },
+  "budget": {
+    "tokens_per_cycle": 25000,
+    "output_allowance_tokens": 4000,
+    "outstanding_max_age_hours": 168
+  },
+  "cycle": {
+    "due_hours": 48,
+    "due_slack_hours": 6,
+    "late_hours": 72,
+    "late_notice": true,
+    "max_batch_dirs": 10,
+    "first_batch_hours": 48
+  },
+  "judge_memory": {
+    "block_days": 14,
+    "cooldown_days": [
+      30,
+      60,
+      90
+    ],
+    "cooldown_window_days": 60,
+    "cooldown_reset_days": 90,
+    "log_days": 90,
+    "log_lines": 500,
+    "max_precedents": 3,
+    "max_rejections_in_retro_prompt": 5,
+    "near_suppress": false,
+    "near_jaccard": 0.5,
+    "near_ratio": 0.88
+  },
+  "eval": {
+    "project": "lite",
+    "max_success_probes": 2,
+    "success_window_days": 7,
+    "probe_max_chars": 1500
+  },
+  "index": {
+    "related_max": 8,
+    "new_overlap_refuse": 0.6
+  },
+  "merge_guard": {
+    "min_ratio": 0.8
+  },
+  "probation": {
+    "min_runs": 3,
+    "windows_to_active": 2,
+    "max_per_always_loaded_file": 1,
+    "regression_threshold": 0.25
+  },
+  "pending_expire_batches": 3,
+  "always_loaded": [
+    "skill/fleet-sdd/SKILL.md",
+    ".claude/agents/team-lead.md"
+  ]
+}

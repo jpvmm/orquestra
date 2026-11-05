@@ -96,6 +96,40 @@ inside the lead do NOT count (practical limit ~20). Hence `max_parallel=4`: lead
 - The lead does NOT use the Vigia's `--protect-tests` (devs write tests first on purpose).
 - Vigia secret redaction may turn text like `pwd: ...` into `***` in conversation.md (false positive).
 
+## Retro loop (v0.2.0)
+Both loops (per project, generic) run **once every two days in one batch**, no end-of-run hook. Schedule
+`0 6 */2 * * fleet-retro-cycle`: the setup skill creates it as the **Retro** routine (next to Vigia); elsewhere, cron. Full operator guide: [retro-cycle.md](retro-cycle.md).
+- **Cycle runner** `fleet-retro-cycle` (prompt `retro-routine.md`): decides whether a cycle is due (`cycle.due_hours`;
+  `late_hours` 72 and `late_notice` on: `scheduler late: Nh`); an empty cycle makes 0 model calls and is silent unless
+  the scheduler is late. Otherwise it runs `fleet-retro --batch` (task folders
+  `$ORQUESTRA_HOME/<project>/<task>/` finished since the last batch, at most `cycle.max_batch_dirs`, none with an active
+  run in `$VIGIA_BASE/active`), judges, applies, then lints. `--dry-run` changes nothing; exit 5 = lock held, 4 = pending.
+- The model only answers JSON; the script validates it and writes diffs to `skill/proposals/`.
+- **Loop 1, per project** → `$ORQUESTRA_HOME/<p>/LESSONS.md` (~4000 chars), ledger `<p>/lessons-ledger.jsonl`; fleet-run
+  copies it to `T/.fleet/project-lessons.md`. **Loop 2, generic** → `skill/fleet-sdd/SKILL.md`, `references/<topic>.md`,
+  `.claude/agents/*.md`, `$ORQUESTRA_HOME/learnings.md`; ledger `skill/ledger.jsonl`.
+- **Gates** before a generic rule is applied: per-scope quotas, overlap/contradiction check against `skill/rules-index.json`
+  (`index.new_overlap_refuse`), merge-guard (`merge_guard.min_ratio`: a merge must not lose content), and a cheap paired
+  behavioural check by `fleet-skill-judge` (read-only, no tools, through vigia-run) on probes from `fleet-skill-eval`.
+- **Judge memory** (`skill/judge-log.jsonl`): rejected rules are blocked for `block_days`, then re-admitted with growing
+  cooldowns; recent precedents and rejections are shown to the judge and retro prompts. `near_suppress` stays off.
+- **Probation and auto-revert**: an applied generic rule is `probation` for `probation.min_runs` runs over
+  `windows_to_active` windows (at most one per always-loaded file); a regression above `regression_threshold` reverts it
+  automatically with the exact bytes (`fleet-skill-apply --revert ID` does it by hand). Archive moves, never deletes.
+- **Budget**: `budget.tokens_per_cycle` (default 25000) is a hard cap, reserved before each call (chars/4 estimate plus
+  `output_allowance_tokens`) and never exceeded; usage is read from the stream-json `result`.
+- **Shadow**: `fleet-retro-shadow` replays the gates without applying anything, to measure a policy before enabling it.
+- **Policy** `skill/retro-policy.json` (override with `FLEET_RETRO_POLICY`): `owner_name`, `lessons_file`, `ignore_dirs`,
+  `quota`, `budgets`, `budget`, `cycle`, `judge_memory`, `eval`, `index`, `merge_guard`, `probation`,
+  `pending_expire_batches`, `always_loaded`. Never a patch target.
+- Paths: one resolver (`fleet_skill_lib`): `ORQUESTRA_HOME` (default `~/.orquestra`) → `ORQ_ROOT`, `FLEET_ROOT`,
+  `VIGIA_BIN`, `VIGIA_BASE` (`$VIGIA_BASE/active`), all overridable.
+- **Install / upgrade**: `install.sh` copies every loop tool, `retro-policy.json` and `prompts/retro-routine.md`
+  (`$ORQUESTRA_HOME/retro-routine.md`). Hashes of installed skill/config/agent files are kept in
+  `skill/.install-baseline.json`; a re-install updates untouched files, but a file whose hash differs (edited by you or
+  learned by the loop) is kept and the new version written to `<file>.upstream`. Ledgers, archive, evals, judge log,
+  rules index, retro state/batches, proposals, `LESSONS.md` and `learnings.md` are never overwritten.
+
 ## Tests
-`python3 tests/test_fleet.py` (plus the Vigia tests in `tests/`). Tested with Claude Code 2.1.x · codex-cli 0.166 ·
+`python3 tests/test_fleet.py`, `python3 tests/test_retro_loop.py`, `python3 tests/test_oss_port.py` (plus the Vigia tests in `tests/`). Tested with Claude Code 2.1.x · codex-cli 0.166 ·
 Python 3 stdlib.

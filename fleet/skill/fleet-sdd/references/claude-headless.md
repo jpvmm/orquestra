@@ -1,6 +1,6 @@
 # Claude Code headless (`claude -p`) — launch flags and permissions
 
-Read when launching or debugging a `claude -p` run (lead, gate, ad-hoc). Binary: `~/.local/bin/claude` (put `~/.local/bin` on PATH).
+Read when launching or debugging a `claude -p` run (lead, gate, retro, ad-hoc). Binary: `~/.local/bin/claude` (put `~/.local/bin` on PATH).
 
 ## Flags
 - Put the prompt right after `-p`: `--allowedTools`, `--disallowedTools` and `--add-dir` are variadic and swallow a later positional prompt ("Input must be provided").

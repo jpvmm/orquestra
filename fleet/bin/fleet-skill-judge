@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""fleet-skill-judge: one paired batch judge call + judge memory. Thin JSON wrapper over fleet_judge_lib.
+
+  fleet-skill-judge judge --candidates FILE.json [--dry-run] [--batch-stamp S] [--batch-run R ...]
+                          [--budget-left N] [--model M] [--wait-sec N]
+      FILE.json: a list of candidate dicts or {"candidates": [...], "batch_stamp"?, "batch_runs"?}
+      (fleet-retro collect `candidates` + rule/old/new text). --budget-left defaults to budget.tokens_per_cycle.
+  fleet-skill-judge log [--scope S] [--target T] [--limit N]
+  fleet-skill-judge rotate
+  fleet-skill-judge rejections --scope S --target T      (text block for the retro prompt; empty when none)
+Global: --root FLEET_ROOT (default fleet_root()), --now ISO (testing). JSON on stdout; errors {"error": ...} exit 2.
+The model is only ever reached through vigia-run (muted, no tools)."""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fleet_judge_lib as J  # noqa: E402
+import fleet_skill_lib as L  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-skill-judge")
+    ap.add_argument("--root")
+    ap.add_argument("--now")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    j = sub.add_parser("judge")
+    j.add_argument("--candidates", required=True)
+    j.add_argument("--dry-run", action="store_true")
+    j.add_argument("--batch-stamp")
+    j.add_argument("--batch-run", action="append", default=None)
+    j.add_argument("--budget-left", type=int)
+    j.add_argument("--model")
+    j.add_argument("--wait-sec", type=int, default=540)
+    lg = sub.add_parser("log")
+    lg.add_argument("--scope")
+    lg.add_argument("--target")
+    lg.add_argument("--limit", type=int, default=50)
+    sub.add_parser("rotate")
+    rj = sub.add_parser("rejections")
+    rj.add_argument("--scope", required=True)
+    rj.add_argument("--target", required=True)
+    a = ap.parse_args(argv)
+    root = os.path.abspath(a.root) if a.root else L.fleet_root()
+    pol = L.load_policy(root)
+    try:
+        if a.cmd == "judge":
+            with open(a.candidates, encoding="utf-8") as f:
+                data = json.load(f)
+            meta = data if isinstance(data, dict) else {}
+            stamp = a.batch_stamp or meta.get("batch_stamp") or (time.strftime("%Y%m%d-%H%M%S") + "-judge")
+            runs = a.batch_run if a.batch_run is not None else list(meta.get("batch_runs") or [])
+            budget = a.budget_left if a.budget_left is not None else int(pol["budget"]["tokens_per_cycle"])
+            out = J.judge(data, batch_stamp=stamp, batch_runs=runs, budget_left=budget, now=a.now, root=root,
+                          policy=pol, dry_run=a.dry_run, model=a.model, wait_sec=a.wait_sec)
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+        elif a.cmd == "log":
+            print(json.dumps(J.read_log(root, a.scope, a.target)[-max(0, a.limit):], indent=2, ensure_ascii=False))
+        elif a.cmd == "rotate":
+            print(json.dumps(J.rotate(root, a.now, pol), indent=2))
+        else:
+            txt = J.rejections_block(a.scope, a.target, now=a.now, root=root, policy=pol)
+            if txt:
+                print(txt)
+    except (OSError, ValueError) as e:
+        print(json.dumps({"error": str(e)}))
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

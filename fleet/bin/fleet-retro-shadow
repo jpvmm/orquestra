@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""fleet-retro-shadow — rehearse the retro cycle on a COPY of real task folders, without touching them.
+
+  fleet-retro-shadow --source ROOT --dest TMPDIR [--with-model] [--json]
+
+ROOT is an Orquestra home: `<ROOT>/<project>/<task>/` task folders, `<ROOT>/fleet/skill/` and the lessons files.
+TMPDIR must be new or empty. The script copies ONLY:
+  * per task folder: plan.md, progress.md, criteria.json, FINAL-SUMMARY.md, runs/*.status.json, runs/*.events.jsonl,
+    runs/*.stderr.log;
+  * `<ROOT>/fleet/skill/**` (the archive/ and backups/ folders are left out when they are large: > 5 MB);
+  * the lessons files: `<ROOT>/<lessons file>` (policy `lessons_file`, default learnings.md; FLEET_LESSONS_NAME) and
+    `<ROOT>/<project>/LESSONS.md` / `learnings.md`.
+It NEVER copies — and never opens — a `vigia/` folder, a file named webhook.env or any `*.env` file, a symlink or a
+lock file: they are skipped by NAME while walking, before any open. Then it runs
+`fleet-retro-cycle --dry-run --force --json` with FLEET_ROOT=<TMPDIR>/fleet and ORQ_ROOT=<TMPDIR> (VIGIA_ATIVOS, if set in
+the environment, is kept so the real active runs are skipped; it is only read). Nothing is applied to ROOT (it is only
+read). With --with-model the dry run makes its ONE generation call (muted, read-only, kept in <TMPDIR>/shadow-out).
+Prints the dry-run numbers: folders selected, estimated tokens, real tokens (with a model), and the sums of tokens and
+would_suppress found in the copied skill/retro-batches/*/usage.json history. Exit 0 ok, 2 bad arguments, 1 cycle failed."""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, BIN)
+import fleet_skill_lib as L  # noqa: E402
+
+CYCLE = os.path.join(BIN, "fleet-retro-cycle")
+TASK_FILES = ("plan.md", "progress.md", "criteria.json", "FINAL-SUMMARY.md")
+RUN_SUFFIXES = (".status.json", ".events.jsonl", ".stderr.log")
+PROJECT_LESSONS = ("LESSONS.md", "learnings.md")
+SKIP_DIRS = {"vigia"}                      # never entered, anywhere
+LARGE_BYTES = 5 * 1024 * 1024              # archive/ and backups/ above this size are left out
+BIG_DIRS = ("archive", "backups", "ledger-backups")
+NEVER_PROJECT = {"fleet", "bin", "vigia", "skill", "tmp", "node_modules", ".git"}
+
+
+def forbidden(name):
+    """A name that is never copied nor opened: webhook.env, any *.env, lock files, the vigia folder."""
+    n = name.lower()
+    return n == "webhook.env" or n.endswith(".env") or n.endswith(".lock") or n in SKIP_DIRS
+
+
+SOURCE_ROOT = None                         # set by build_shadow: the real path of the tree being read
+
+
+def safe_dir(path):
+    """True only for a real (non-symlink) directory whose real path stays inside SOURCE_ROOT and outside its vigia/.
+    lstat/realpath only — nothing is opened."""
+    try:
+        if os.path.islink(path) or not os.path.isdir(path):
+            return False
+    except OSError:
+        return False
+    if SOURCE_ROOT is None:
+        return True
+    real = os.path.realpath(path)
+    root = SOURCE_ROOT
+    if real != root and not real.startswith(root + os.sep):
+        return False
+    vig = os.path.join(root, "vigia")
+    return not (real == vig or real.startswith(vig + os.sep))
+
+
+def entries(path):
+    """Regular entries of a directory as (name, is_dir, is_file) — symlinks and forbidden names are dropped here,
+    by name/lstat only (nothing is opened). A directory that is itself a symlink / escapes the source lists nothing."""
+    if not safe_dir(path):
+        return []
+    try:
+        with os.scandir(path) as it:
+            found = sorted(((e.name, e.is_dir(follow_symlinks=False), e.is_file(follow_symlinks=False))
+                            for e in it if not e.is_symlink()), key=lambda x: x[0])
+    except OSError:
+        return []
+    return [x for x in found if not forbidden(x[0])]
+
+
+def dir_size(path):
+    total = 0
+    for base, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if not forbidden(d)]
+        for f in files:
+            if forbidden(f):
+                continue
+            try:
+                total += os.lstat(os.path.join(base, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def copy_file(src, dst):
+    if os.path.islink(src) or not os.path.isfile(src):
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(src, "rb") as a, open(dst, "wb") as b:
+        for chunk in iter(lambda: a.read(65536), b""):
+            b.write(chunk)
+    st = os.stat(src)
+    os.utime(dst, (st.st_atime, st.st_mtime))   # ended_at / mtimes drive the cycle's windows: keep them
+
+
+def copy_tree(src, dst, stats, skip_big=True):
+    for name, is_dir, is_file in entries(src):
+        s, d = os.path.join(src, name), os.path.join(dst, name)
+        if is_dir:
+            if skip_big and name in BIG_DIRS and dir_size(s) > LARGE_BYTES:
+                stats["skipped_large"].append(s)
+                continue
+            copy_tree(s, d, stats, skip_big)
+        elif is_file:
+            copy_file(s, d)
+            stats["files"] += 1
+
+
+def copy_task(src, dst, stats):
+    n = 0
+    for name, _is_dir, is_file in entries(src):
+        if is_file and name in TASK_FILES:
+            copy_file(os.path.join(src, name), os.path.join(dst, name))
+            n += 1
+    runs = os.path.join(src, "runs")
+    for name, _is_dir, is_file in entries(runs):
+        if is_file and name.endswith(RUN_SUFFIXES):
+            copy_file(os.path.join(runs, name), os.path.join(dst, "runs", name))
+            n += 1
+    stats["files"] += n
+    return n
+
+
+def source_lessons_name(source):
+    """Lessons file name the SOURCE home uses: FLEET_LESSONS_NAME env, else <source>/fleet/skill/retro-policy.json, else default."""
+    if os.environ.get("FLEET_LESSONS_NAME"):
+        return os.environ["FLEET_LESSONS_NAME"]
+    global SOURCE_ROOT
+    SOURCE_ROOT = os.path.realpath(source)   # same containment rule as the copier (build_shadow resets it)
+    fleet_d = os.path.join(source, "fleet")
+    pol = os.path.join(fleet_d, "skill", "retro-policy.json")
+    if not (safe_dir(fleet_d) and safe_dir(os.path.dirname(pol))):   # no symlinked ancestor, nothing outside SOURCE
+        return L.lessons_name()
+    try:
+        if os.path.isfile(pol) and not os.path.islink(pol) and os.path.getsize(pol) < 1_000_000:
+            with open(pol, encoding="utf-8") as f:
+                name = json.load(f).get("lessons_file")
+            if isinstance(name, str) and name and os.sep not in name and name not in (".", ".."):
+                return name
+    except (OSError, ValueError, AttributeError):
+        pass
+    return L.lessons_name()
+
+
+def build_shadow(source, dest, lessons_name=None):
+    """Copy the allowed parts of `source` (an Orquestra home) into `dest`. → stats dict."""
+    global SOURCE_ROOT
+    source, dest = os.path.abspath(source), os.path.abspath(dest)
+    SOURCE_ROOT = os.path.realpath(source)
+    stats = {"tasks": 0, "projects": 0, "files": 0, "skipped_large": []}
+    lessons = lessons_name or source_lessons_name(source)
+    top = entries(source)
+    for name, is_dir, is_file in top:
+        s = os.path.join(source, name)
+        if is_file and name == lessons:
+            copy_file(s, os.path.join(dest, name))
+            stats["files"] += 1
+        elif is_dir and name == "fleet":
+            skill = os.path.join(s, "skill")
+            if safe_dir(skill):
+                copy_tree(skill, os.path.join(dest, "fleet", "skill"), stats)
+        elif is_dir and name not in NEVER_PROJECT and not name.startswith("."):
+            took = False
+            for tname, tdir, _f in entries(s):
+                if tdir and tname not in NEVER_PROJECT and not tname.startswith("."):
+                    if copy_task(os.path.join(s, tname), os.path.join(dest, name, tname), stats):
+                        stats["tasks"] += 1
+                        took = True
+                elif _f and tname in PROJECT_LESSONS:
+                    copy_file(os.path.join(s, tname), os.path.join(dest, name, tname))
+                    stats["files"] += 1
+                    took = True
+            stats["projects"] += 1 if took else 0
+    os.makedirs(os.path.join(dest, "fleet", "skill"), exist_ok=True)
+    return stats
+
+
+def history(dest):
+    """Sums over the copied skill/retro-batches/*/usage.json (past cycles of the source)."""
+    h = {"batches": 0, "tokens": 0, "would_suppress": 0, "blocked": 0, "calls": 0, "last": None}
+    base = os.path.join(dest, "fleet", "skill", "retro-batches")
+    for stamp in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        try:
+            with open(os.path.join(base, stamp, "usage.json"), encoding="utf-8") as f:
+                u = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(u, dict):
+            continue
+        t = sum(int(v) for v in (u.get("tokens") or {}).values() if isinstance(v, (int, float)))
+        h["batches"] += 1
+        h["tokens"] += t
+        h["would_suppress"] += int(u.get("would_suppress") or 0)
+        h["blocked"] += int(u.get("blocked") or 0)
+        h["calls"] += int((u.get("calls") or {}).get("total") or 0)
+        h["last"] = {"stamp": stamp, "tokens": t, "would_suppress": int(u.get("would_suppress") or 0)}
+    return h
+
+
+def shadow_env(dest, lessons_name=None):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("ORQUESTRA_HOME", "FLEET_LESSONS", "VIGIA_BASE", "VIGIA_WEBHOOK_ENV", "FLEET_ROOT", "ORQ_ROOT")}
+    env.update(FLEET_ROOT=os.path.join(dest, "fleet"), ORQ_ROOT=dest, VIGIA_WEBHOOK_ENV="", PYTHONDONTWRITEBYTECODE="1")
+    env["FLEET_LESSONS"] = os.path.join(dest, lessons_name or L.lessons_name())
+    # resolve the real Vigia bin BEFORE FLEET_ROOT is redirected (DEST has no bin/vigia-run)
+    env.setdefault("VIGIA_BIN", os.path.expanduser(os.environ.get("VIGIA_BIN") or os.path.join(os.path.dirname(L.fleet_root()), "bin")))
+    if "VIGIA_ATIVOS" not in os.environ:   # no registry given: an empty one inside DEST (the source's is not guessed)
+        env["VIGIA_ATIVOS"] = os.path.join(dest, "vigia-active-empty")
+    return env
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleet-retro-shadow", description="dry-run the retro cycle on a copy")
+    ap.add_argument("--source", required=True, help="Orquestra home to read (never written)")
+    ap.add_argument("--dest", required=True, help="new or empty folder that receives the copy")
+    ap.add_argument("--with-model", action="store_true", help="make the ONE generation call of the dry run")
+    ap.add_argument("--json", action="store_true", help="print the numbers as JSON")
+    ap.add_argument("--model", default="sonnet")
+    ap.add_argument("--wait-sec", type=int, default=540)
+    a = ap.parse_args(argv)
+    source, dest = os.path.abspath(a.source), os.path.abspath(a.dest)
+    if not os.path.isdir(source):
+        sys.exit(f"fleet-retro-shadow: --source {source} is not a folder")
+    if os.path.islink(dest):
+        sys.exit(f"fleet-retro-shadow: --dest {dest} must not be a symlink")
+    rsrc, rdst = os.path.realpath(source), os.path.realpath(dest)   # resolve aliases: no symlinked dest/ancestor into SOURCE
+    for x, y in ((source, dest), (rsrc, rdst)):
+        if y == x or y.startswith(x + os.sep) or x.startswith(y + os.sep):
+            sys.exit("fleet-retro-shadow: --dest and --source must be separate folders (not nested)")
+    if os.path.exists(dest) and (not os.path.isdir(dest) or os.listdir(dest)):
+        sys.exit(f"fleet-retro-shadow: --dest {dest} must not exist or must be empty")
+    os.makedirs(dest, exist_ok=True)
+    lessons = source_lessons_name(source)
+    stats = build_shadow(source, dest, lessons)
+    out = os.path.join(dest, "shadow-out")
+    cmd = [CYCLE, "--dry-run", "--force", "--json", "--out", out, "--model", a.model, "--wait-sec", str(a.wait_sec)]
+    if a.with_model:
+        cmd.append("--with-model")
+    r = subprocess.run(cmd, capture_output=True, text=True, env=shadow_env(dest, lessons))
+    try:
+        rep = json.loads(r.stdout)
+    except ValueError:
+        rep = None
+    if r.returncode != 0 or not isinstance(rep, dict):
+        sys.stderr.write(r.stderr[-2000:] + "\n")
+        sys.exit(f"fleet-retro-shadow: the dry-run cycle failed (exit {r.returncode})")
+    use = rep.get("usage") or {}
+    res = {"dest": dest, "copied": stats, "selected": rep.get("selected", []), "skipped_active": rep.get("skipped_active", []),
+           "estimated_tokens": rep.get("estimated_tokens", 0), "budget_left": rep.get("budget_left"),
+           "fits_budget": rep.get("fits_budget"), "model_calls": rep.get("model_calls", 0),
+           "real_tokens": sum(int(v) for v in (use.get("tokens") or use).values() if isinstance(v, (int, float)))
+           if use else 0, "would_judge": rep.get("would_judge", 0), "would_revert": rep.get("would_revert", []),
+           "history": history(dest)}
+    if a.json:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    h = res["history"]
+    print(f"shadow: copied {stats['tasks']} task folder(s) of {stats['projects']} project(s), {stats['files']} file(s) -> {dest}")
+    print(f"dry-run: {len(res['selected'])} folder(s) selected, estimated {res['estimated_tokens']} tokens "
+          f"(budget left {res['budget_left']}), model calls {res['model_calls']}, real tokens {res['real_tokens']}, "
+          f"would judge {res['would_judge']}")
+    print(f"history ({h['batches']} past batch(es) in usage.json): tokens {h['tokens']}, calls {h['calls']}, "
+          f"would_suppress {h['would_suppress']}, blocked {h['blocked']}")
+    if stats["skipped_large"]:
+        print("left out (large): " + ", ".join(stats["skipped_large"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

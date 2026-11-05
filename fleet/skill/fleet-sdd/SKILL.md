@@ -40,7 +40,9 @@ Tools (in the fleet `bin/` folder given in your prompt, use absolute paths): `fl
 For each task of the wave:
 1. `fleet-wt --task-dir T new ID` → WT path (starts from the CURRENT integration state).
 2. Write `T/briefs/task-ID-brief.md` from `brief-implementer.md` (full task text, its criteria,
-   allowed files, WT, report path). The dev does not read the whole plan.
+   allowed files, WT, report path). The dev does not read the whole plan. If `T/.fleet/project-lessons.md` exists
+   (the project's LESSONS.md), paste the rules that apply to the task into the brief's `Project lessons` field, and
+   into every reviewer brief's context.
 3. Dispatch ALL devs of the wave IN THE SAME MESSAGE, always in the FOREGROUND (`run_in_background: false` on every
    Agent and Bash call): several foreground calls in one message already run in parallel and return together.
    - Claude dev: Agent tool, `subagent_type: dev`, `model:` = `roles.dev.model` (sonnet for mechanical work,
@@ -101,4 +103,12 @@ For each approved task, in topological order (dependencies first):
 - Cap: the Vigia accepts 5 active runs IN TOTAL (all bots); your run is already 1. Codex runs count; Claude subagents
   do not (practical limit ~20 concurrent). `max_parallel` (default 4) limits concurrent Codex devs+reviewers.
   `codex-*` exits `not_launched` code 3 if the cap stays full for 15 min → run fewer in parallel.
-- Codex dev has no network (sandbox): a test that opens a socket → run it yourself in the integration.
+- Codex (dev or reviewer) has no sockets, no Docker and cannot commit (sandbox): a test that opens a socket or needs
+  Docker → run it yourself in the integration.
+- Bash: prefer simple commands with absolute paths. A command denied for approval is never retried in the same form:
+  simplify it (split it, drop `$(...)`/`VAR=x cmd`/pipes) — headless, nobody approves and the run loops. Validate JSON
+  with `python3 -m json.tool FILE`, not an improvised pipeline.
+- New test files: the dev runs the repo's import-order linter and formatter on them before reporting DONE (Python:
+  `ruff check --select I --fix` + `ruff format`); put that in the implementer brief. Unsorted imports fail the gate.
+- Depth, read only when needed: `references/claude-headless.md` (claude -p flags, allowlists), `references/codex-sandbox.md`,
+  `references/docker-without-systemd.md`.

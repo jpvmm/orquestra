@@ -109,7 +109,8 @@ class TestPolicy(Base):
             pol["quota"]["project_additions_per_project"], 3
         )  # untouched sibling kept
         self.assertEqual(pol["cycle"]["due_hours"], 12)
-        self.assertEqual(pol["cycle"]["late_hours"], 60)
+        self.assertEqual(pol["cycle"]["late_hours"], 72)
+        self.assertIs(pol["cycle"]["late_notice"], True)
         self.assertEqual(pol["custom"], {"x": 1})  # unknown keys kept
         self.assertEqual(pol["_warnings"], [])
 

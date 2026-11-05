@@ -27,7 +27,9 @@
   },
   "cycle": {
     "due_hours": 48,
-    "late_hours": 60,
+    "due_slack_hours": 6,
+    "late_hours": 72,
+    "late_notice": true,
     "max_batch_dirs": 10,
     "first_batch_hours": 48
   },

@@ -4,7 +4,8 @@
 judge (one paired call) → apply → probation pass → quiet notice. An empty cycle costs 0 model calls. This page covers
 how it is scheduled, how to PROVE the scheduler exists, and how to rehearse a cycle on a copy of your real data.
 
-Nothing in this repository creates a routine or a cron entry. You (or your agent) do that once, by hand.
+The `orquestra-setup` skill ("install Orquestra" in Grok Bot) creates the **Retro** routine for you, on the same bot as
+the Vigia routine, and updates it in place on a re-run. On other platforms, add the cron line below once.
 
 ## Scheduling the 2-day batch
 
@@ -16,20 +17,28 @@ The batch runs every two days, early in the morning, in the owner's time zone:
 
 (`0 6 */2 * *` = 06:00 on every second day of the month.) Pick ONE of these ways to fire it:
 
-* **A routine of your agent** (for example a Grok Bot / agent routine) with that schedule, in your time zone, whose
-  action is to run `fleet-retro-cycle` and forward its stdout (the notice) to you. A quiet cycle prints nothing.
+* **A routine of your agent** (default: the **Retro** routine the setup skill creates; schedule `0 6 */2 * *`, your
+  time zone, flexible timing, instruction `prompts/retro-routine.md`): it runs `fleet-retro-cycle` and forwards its
+  stdout (the notice) to you. A quiet cycle prints nothing.
 * **System cron** on the machine that holds the Orquestra home:
   `0 6 */2 * * /path/to/fleet/bin/fleet-retro-cycle >> "$HOME/.orquestra-retro-cycle.log" 2>&1`
   (set `ORQUESTRA_HOME`/`FLEET_ROOT` in the crontab if they are not the defaults; cron has a minimal `PATH`, so use
   absolute paths and make sure `vigia-run` is reachable through `VIGIA_BIN`).
 
 Why `*/2` is fine even though it is uneven: it fires on day 31 and on day 1 back to back at the turn of a 31-day month.
-The cycle's due check (`cycle.due_hours`, default 48 h since `last_cycle` in `skill/retro-state.json`) absorbs it: the
-second invocation prints `not due: last cycle 6.0h ago (< 48h)` and does nothing. A second invocation while one is still
+The cycle's due check (`cycle.due_hours` 48 minus `cycle.due_slack_hours` 6 = 42 h since `last_cycle` in
+`skill/retro-state.json`; the slack keeps a fire a few minutes or hours early from skipping a whole cycle) absorbs it:
+the second invocation prints `not due: last cycle 24.0h ago (< 42h)` and does nothing. A second invocation while one is still
 running exits 5 (the batch lock). `--force` skips the due check (manual runs).
 
-If the scheduler dies, the next real cycle prints `retro: scheduler late: Nh` once the last cycle is older than
-`cycle.late_hours` (default 60 h), so a dead scheduler becomes visible.
+If the scheduler dies, the next real cycle prints `retro: scheduler late: Nh` once the last completed cycle is older
+than `cycle.late_hours` (default 72 h = the 48 h interval + 24 h grace), so a dead scheduler becomes visible. It is on by
+default and sent even when the cycle is otherwise empty; a normal (on-time) empty cycle stays silent. It is a pure clock
+check (0 model tokens). One knob turns it off: `"late_notice": false` under `cycle` in `skill/retro-policy.json`. If you
+change the schedule, set `late_hours` to the new interval plus a grace.
+
+The only other notice is the "applied" one (1-3 lines: rules applied or auto-reverted, undo ids). Profile-change
+proposals are never applied; their pending count rides in that same notice, never in a notice of their own.
 
 ## PROOF that the scheduler exists
 

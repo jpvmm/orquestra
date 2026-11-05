@@ -31,6 +31,16 @@ All notable changes to this project are documented here. The format is based on
   (no Vigia folder, no `.env` files), 10 tasks selected, 1 skipped as active, estimated 18,428 tokens (fits the 25k cap).
 
 ### Changed
+- Setup creates the retro trigger: the `orquestra-setup` skill ("install Orquestra") now creates TWO routines on the
+  Orquestra bot, **Vigia** (webhook) and **Retro** (schedule `0 6 */2 * *`, flexible timing, `prompts/retro-routine.md`),
+  and updates them in place on a re-run (no duplicates). README quick-start lists both, with a one-line cron for other
+  platforms; `install.sh` prints both routines at the end.
+- Scheduler-late notice: `cycle.late_hours` default 60 -> 72 (the 48 h interval + 24 h grace) and new knob
+  `cycle.late_notice` (default `true`; `false` disables it). Sent even on an otherwise empty cycle, but only past that
+  threshold; a normal empty cycle stays silent. Pure clock check, 0 model tokens.
+- Due check slack: new `cycle.due_slack_hours` (default 6): a cycle is due after 48 - 6 = 42 h, so a routine firing a
+  little early (flexible timing) no longer skips a whole 2-day cycle.
+- Documented: Orquestra profile-change proposals are only counted inside the single "applied" notice (no separate notice).
 - Re-install never overwrites a skill/config/agent file that differs from its recorded baseline (written as
   `<file>.upstream` and reported) nor any bookkeeping file (ledgers, archive, evals, judge log, rules index, retro state,
   `LESSONS.md`, `learnings.md`).

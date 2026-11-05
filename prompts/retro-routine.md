@@ -1,19 +1,25 @@
 # Retro routine: the self-improvement cycle
 
-> Instruction for a scheduled routine (cron or bot routine) that runs the retro cycle. Paste everything below the line
-> into the routine's instruction field. Paths assume the default install (`~/.orquestra`).
-> Suggested schedule: `0 6 */2 * *` (every second day, 06:00). The cycle itself checks that it is due (>= 48 h since the
-> last one), so an extra or early trigger is harmless.
+> Instruction for the scheduled bot routine named "Retro" that runs the retro cycle. The orquestra-setup skill creates
+> it next to the Vigia routine, on the same bot (or update it in place if it exists). Schedule: `0 6 */2 * *` (every
+> second day, 06:00, the owner's time zone; flexible timing is fine). The cycle itself checks that it is due (>= 42 h
+> since the last one: 48 h minus 6 h of slack), so an extra or early trigger is harmless. Paste everything below the
+> line into the routine's instruction field. Paths assume the default install (`~/.orquestra`).
+> Without bot routines, use cron: `0 6 */2 * * $HOME/.orquestra/fleet/bin/fleet-retro-cycle` (stdout = the notice).
 
 ---
 
 Run `~/.orquestra/fleet/bin/fleet-retro-cycle` once and read its output.
 
-- Nothing printed (exit 0): the cycle was empty, not due, or found nothing worth applying. Say nothing.
-- Printed 1-3 lines: they are the notice (what was applied or auto-reverted, with the undo id; a pending profile queue
-  and `scheduler late: Nh` can appear in it). Forward them to the user as they are, without adding or reformatting.
-- Printed exactly one line `retro: scheduler late: Nh`: the cycle was otherwise empty, but the last cycle ran more than
-  60 h ago, i.e. the scheduler (this routine) was dead or skipped runs. Forward it too: a dead scheduler must be visible.
+- Nothing printed, or one line starting with `not due:` (exit 0): the cycle was empty, not due, or found nothing
+  worth applying. Say nothing.
+- Printed 1-3 lines: they are the single "applied" notice (what was applied or auto-reverted, with the undo id; the
+  count of pending profile proposals and `scheduler late: Nh` ride in it, there is no separate notice for them).
+  Forward them to the user as they are, without adding or reformatting.
+- Printed exactly one line `retro: scheduler late: Nh`: the cycle was otherwise empty, but the last completed cycle is
+  older than `cycle.late_hours` (default 72 h = the 48 h interval + 24 h grace), i.e. the scheduler (this routine) was
+  dead or skipped runs. Forward it too: a dead scheduler must be visible. (Pure clock check, 0 model tokens; the owner
+  can turn it off with `"late_notice": false` under `cycle` in `skill/retro-policy.json`.)
 - Exit 5: another cycle holds the lock. Do nothing; do not retry in a loop.
 - Any other failure: tell the user in one line with the command's last error line.
 

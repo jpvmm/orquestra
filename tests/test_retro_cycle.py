@@ -287,24 +287,63 @@ class TestEmptyAndDue(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.calls("gen"), 1)
 
-    def test_late_scheduler_flagged_alone_and_in_notice(self):
-        self.set_last_cycle(70)
+    def test_due_slack_absorbs_an_early_fire(self):
+        self.mk()
+        self.set_last_cycle(30)
+        self.assertIn("not due", self.run_cycle().stdout)
+        self.assertEqual(self.calls(), 0)
+        self.set_last_cycle(47.9)   # a 2-day routine firing a little early still runs (due after 48 - 6 = 42 h)
         r = self.run_cycle()
-        self.assertEqual(r.stdout.strip(), "retro: scheduler late: 70h")
-        self.set_last_cycle(70)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("not due", r.stdout)
+        self.assertEqual(self.calls("gen"), 1)
+
+    def test_late_scheduler_flagged_alone_and_in_notice(self):
+        self.set_last_cycle(80)
+        r = self.run_cycle()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "retro: scheduler late: 80h")
+        self.assertEqual(self.calls(), 0, "the late notice is a clock check: no model call")
+        self.assertEqual(self.batch_dirs(), [])
+        self.set_last_cycle(80)
         self.mk()
         self.answer("gen", {"verdict": "proposals", "proposals": [PROJECT]})
         r = self.run_cycle()
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = r.stdout.strip().splitlines()
         self.assertLessEqual(len(lines), 3)
-        self.assertIn("scheduler late: 70h", r.stdout)
+        self.assertIn("scheduler late: 80h", r.stdout)
         self.assertIn("applied 1 change", lines[0])
 
-    def test_not_late_below_threshold(self):
-        self.set_last_cycle(50)
-        r = self.run_cycle()
+    def test_late_notice_shown_once_then_silent(self):
+        self.set_last_cycle(80)
+        self.assertIn("scheduler late", self.run_cycle().stdout)
+        r = self.run_cycle("--force")   # that cycle moved last_cycle to now: the next empty cycle is silent again
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "")
+
+    def test_not_late_below_threshold(self):
+        for h in (50, 70):   # late only past the 48 h interval + 24 h grace (default late_hours 72)
+            self.set_last_cycle(h)
+            r = self.run_cycle()
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout, "", h)
+            self.assertEqual(self.calls(), 0)
+            self.assertEqual(self.batch_dirs(), [])
+
+    def test_late_notice_knob_disables_it(self):
+        env = self.policy(cycle={"late_notice": False})
+        self.set_last_cycle(200)
+        r = self.run_cycle(**env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(self.calls(), 0)
+        self.set_last_cycle(200)
+        r = self.run_cycle("--dry-run", **env)
+        self.assertNotIn("scheduler late", r.stdout)
+        self.set_last_cycle(200)
+        r = self.run_cycle("--dry-run")
+        self.assertIn("scheduler late: 200h", r.stdout, "default is on")
 
     def test_duplicate_invocation_hits_the_lock(self):
         self.mk()

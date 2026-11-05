@@ -123,10 +123,14 @@ Installed Orquestra/Vigia:
   Vigia state:    $VIGIA_BASE
   Vigia docs:     $VIGIA_BASE/README.md
   bot prompt:     $ORQUESTRA_HOME/orquestra.md
-  Vigia routine:  $ORQUESTRA_HOME/vigia-routine.md
-  retro routine:  $ORQUESTRA_HOME/retro-routine.md
+  routines:       $ORQUESTRA_HOME/vigia-routine.md, $ORQUESTRA_HOME/retro-routine.md
   retro policy:   $FLEET/skill/retro-policy.json
   fleet:          $FLEET (docs: $FLEET/README.md)
+
+Routines to create on the bot (the orquestra-setup skill does both; a re-run updates them, no duplicates):
+  Vigia  trigger: webhook             instruction: $ORQUESTRA_HOME/vigia-routine.md
+  Retro  schedule: 0 6 */2 * *        instruction: $ORQUESTRA_HOME/retro-routine.md
+  no bot routines? cron: 0 6 */2 * * "$FLEET/bin/fleet-retro-cycle"
 
 Optional:
   export PATH="$BIN:$FLEET/bin:\$PATH"

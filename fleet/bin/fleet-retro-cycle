@@ -8,8 +8,11 @@ Order: due check → pending batch → lint → generation (fleet-retro batch, O
 probation pass (auto-reverts, txn recovery, T6) → quiet notice.
 
 * Holds the batch lock for the whole run: a second invocation exits 5.
-* Due check: runs only when >= policy cycle.due_hours passed since the last cycle (retro-state.json `last_cycle`), unless
-  --force (otherwise: "not due", exit 0, nothing done). Last cycle older than cycle.late_hours → `scheduler late: Nh`.
+* Due check: runs only when >= policy cycle.due_hours minus cycle.due_slack_hours (default 48 - 6 = 42 h, so scheduler
+  jitter on a 2-day schedule never skips a cycle) passed since the last cycle (retro-state.json `last_cycle`), unless
+  --force (otherwise: "not due", exit 0, nothing done). Last completed cycle older than cycle.late_hours (default 72 =
+  the 48 h interval + 24 h grace) → `scheduler late: Nh`, a pure clock check (no model call); cycle.late_notice=false
+  turns it off.
 * Empty cycle (no finished task folder, nothing deferred from before) = 0 model calls and silent.
 * Budget: policy budget.tokens_per_cycle is RESERVED before each model call (ceil(chars/4 x 1.25) + the fixed
   budget.output_allowance_tokens); a call whose reservation does not fit is not made — its folders/candidates stay pending.
@@ -348,10 +351,11 @@ def cycle(a):
     cyc = pol["cycle"]
     age_h = None if last is None else (now - last) / 3600.0
     report = {"ok": True, "dry_run": bool(a.dry_run), "due": True, "notice": [], "late_hours": None}
-    if age_h is not None and not a.force and age_h < float(cyc["due_hours"]):
-        report.update(due=False, reason=f"not due: last cycle {age_h:.1f}h ago (< {cyc['due_hours']}h)")
+    due_h = max(0.0, float(cyc["due_hours"]) - float(cyc.get("due_slack_hours", 0)))
+    if age_h is not None and not a.force and age_h < due_h:
+        report.update(due=False, reason=f"not due: last cycle {age_h:.1f}h ago (< {due_h:g}h)")
         return report, 0
-    if age_h is not None and age_h > float(cyc["late_hours"]):
+    if cyc.get("late_notice", True) and age_h is not None and age_h > float(cyc["late_hours"]):
         report["late_hours"] = int(age_h)
     if a.dry_run:
         return dry_run(a, RT, root, pol, st, report, now), 0

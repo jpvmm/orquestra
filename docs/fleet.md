@@ -97,10 +97,11 @@ inside the lead do NOT count (practical limit ~20). Hence `max_parallel=4`: lead
 - Vigia secret redaction may turn text like `pwd: ...` into `***` in conversation.md (false positive).
 
 ## Retro loop (v0.2.0)
-Both loops (per project, generic) run **once every two days in one batch**, no end-of-run hook. Suggested cron
-(not created by the install): `0 6 */2 * * fleet-retro-cycle`. Full operator guide: [retro-cycle.md](retro-cycle.md).
-- **Cycle runner** `fleet-retro-cycle` (prompt `retro-routine.md`): decides whether a cycle is due (`cycle.due_hours`,
-  `late_hours`); an empty cycle makes 0 model calls. Otherwise it runs `fleet-retro --batch` (task folders
+Both loops (per project, generic) run **once every two days in one batch**, no end-of-run hook. Schedule
+`0 6 */2 * * fleet-retro-cycle`: the setup skill creates it as the **Retro** routine (next to Vigia); elsewhere, cron. Full operator guide: [retro-cycle.md](retro-cycle.md).
+- **Cycle runner** `fleet-retro-cycle` (prompt `retro-routine.md`): decides whether a cycle is due (`cycle.due_hours`;
+  `late_hours` 72 and `late_notice` on: `scheduler late: Nh`); an empty cycle makes 0 model calls and is silent unless
+  the scheduler is late. Otherwise it runs `fleet-retro --batch` (task folders
   `$ORQUESTRA_HOME/<project>/<task>/` finished since the last batch, at most `cycle.max_batch_dirs`, none with an active
   run in `$VIGIA_BASE/active`), judges, applies, then lints. `--dry-run` changes nothing; exit 5 = lock held, 4 = pending.
 - The model only answers JSON; the script validates it and writes diffs to `skill/proposals/`.

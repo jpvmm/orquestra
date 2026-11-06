@@ -202,6 +202,14 @@ class TrustedBase(unittest.TestCase):
         self.assertEqual(V.ProtectedTests.modified(self.base, [self.repo]),
                          [f"{self.repo}: tests/test_old.py (parent directory is a symlink)"])
 
+    def test_crlf_checkout_of_untouched_test_is_fine(self):
+        f = os.path.join(self.repo, "tests", "test_old.py")
+        data = open(f, "rb").read()
+        open(f, "wb").write(data.replace(b"\n", b"\r\n"))          # core.autocrlf / eol=crlf checkout
+        self.assertEqual(V.ProtectedTests.modified(self.base, [self.repo]), [])
+        open(f, "wb").write(data.replace(b"\n", b"\r\n") + b"# weakened\r\n")
+        self.assertEqual(V.ProtectedTests.modified(self.base, [self.repo]), [f"{self.repo}: tests/test_old.py"])
+
     def test_clean_filter_cannot_hide_a_change(self):
         import shutil, subprocess
         keep = os.path.join(self.tmp.name, "orig.py")

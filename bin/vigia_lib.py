@@ -564,6 +564,16 @@ class ProtectedTests:
             return ProtectedTests.blob_id_bytes(f.read(), hexlen)
 
     @staticmethod
+    def same_blob(path, oid):
+        """File bytes match the base blob, as checked out (raw) or with CRLF line endings back to LF (autocrlf /
+        eol=crlf checkouts). Only line endings are forgiven; no git filter or config is run."""
+        with open(path, "rb") as f:
+            data = f.read()
+        if ProtectedTests.blob_id_bytes(data, len(oid)) == oid:
+            return True
+        return b"\r\n" in data and ProtectedTests.blob_id_bytes(data.replace(b"\r\n", b"\n"), len(oid)) == oid
+
+    @staticmethod
     def blob_id_bytes(data, hexlen=40):
         import hashlib
         algo = hashlib.sha256 if hexlen == 64 else hashlib.sha1
@@ -610,7 +620,7 @@ class ProtectedTests:
                             out.append(f"{d}: {p}")
                     elif os.path.islink(f) or not os.path.isfile(f):
                         out.append(f"{d}: {p} (deleted)" if not os.path.lexists(f) else f"{d}: {p}")
-                    elif ProtectedTests.blob_id(f, len(oid)) != oid:
+                    elif not ProtectedTests.same_blob(f, oid):
                         out.append(f"{d}: {p}")
             except (OSError, subprocess.SubprocessError) as e:
                 out.append(f"{d}: cannot verify protected tests ({type(e).__name__})")

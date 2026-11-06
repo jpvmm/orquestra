@@ -82,7 +82,12 @@ def main():
     vr = [os.path.join(VIGIA_BIN, "vigia-run"), "--tool", "codex", "--task-dir", td, "--name", a.name,
           "--cwd", cwd, "--max-min", str(a.max_min), "--task", a.task or f"fleet {a.role} {a.name}"]
     if writes:
-        vr += ["--max-files", "30"]
+        vr += ["--max-files", "30", "--protect-tests"]
+        sys.path.insert(0, VIGIA_BIN)
+        from vigia_lib import ProtectedTests
+        base = ProtectedTests.recorded_base(td)   # recorded by fleet-run in the Vigia folder (outside the sandbox)
+        if base:
+            vr += ["--protect-base", base]        # → vigia-run's end-of-run content check
     vr += ["--"] + cmd
     limit = time.time() + a.slot_wait
     while True:

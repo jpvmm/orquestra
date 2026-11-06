@@ -144,13 +144,16 @@ class FleetRunDry(Base):
             cmd = json.loads(self.run_dry(*extra).stdout)["command"]
             i = cmd.index("--disallowedTools")
             for rule in ("Bash(git commit:*)", "Bash(git push:*)", "Bash(git merge:*)", "Bash(git rebase:*)",
-                         "Bash(gh:*)", "Bash(rm -rf *)"):
+                         "Bash(gh:*)", "Bash(rm -rf *)", "Bash(curl:*)", "Read(**/.env)", "Read(**/webhook.env)"):
                 self.assertIn(rule, cmd[i + 1:], extra)
+            self.assertIn("--strict-mcp-config", cmd, extra)
 
-    def test_codex_lead_adds_vigia_base(self):
+    def test_codex_lead_refused_for_m(self):
+        """No network in its sandbox → it could not launch agents: fail closed (P with --lead codex still works)."""
         self.prepare()
-        cmd = json.loads(self.run_dry("--complexity", "M", "--lead", "codex").stdout)["command"]
-        self.assertIn(SCRATCH, cmd)
+        r = self.run_dry("--complexity", "M", "--lead", "codex", check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("team-lead must be claude", r.stdout)
 
     def test_criterion_without_command_refused(self):
         self.prepare()

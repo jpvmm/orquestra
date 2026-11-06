@@ -31,6 +31,13 @@ so nothing is rendered at install time.
 then the fleet writes `fleet.json`, `fleet-state.json`, `progress.md`, `briefs/`, `reports/`, `review/`, `patches/`,
 `wt/integration`, `wt/task-ID`, `FINAL-SUMMARY.md`.
 
+Criteria gate (fleet-run refuses the start otherwise): each `command` is short (≤240 chars, else a script in
+`T/checks/<id>.sh` called by absolute path) and executable — not manual text, not a no-op (`true`, `echo`, `test 1`),
+on PATH or an executable file (relative paths = the repo, since criteria run from the integration worktree).
+Commands join only with `&&`: no `||`, `;`, `|`, `&`, subshells or `$(...)`, so nothing masks a failure. A UI
+criterion (`"when": "ui"` or id `C-UI*`) names its proof file in `artifact` and its command checks it
+(`test -s ARTIFACT` or passes it to a check script). Criteria never change during a run; only a replan changes them.
+
 ## Usage
 ```
 export PATH="$HOME/.orquestra/fleet/bin:$HOME/.local/bin:$PATH"     # or $ORQUESTRA_HOME/fleet/bin

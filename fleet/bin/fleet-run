@@ -21,7 +21,7 @@ Paths: VIGIA_BIN (default: the bin/ next to this fleet/ folder, i.e. $ORQUESTRA_
 VIGIA_BASE (default $ORQUESTRA_HOME/vigia; ORQUESTRA_HOME defaults to this install, else ~/.orquestra).
 Output: JSON with name, status_path, conversation_path. Exit codes: 2 invalid input, 3 Vigia cap full,
 4 name in use, 5 command not found."""
-import argparse, json, os, re, subprocess, sys, time
+import argparse, json, os, re, shlex, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))          # .../fleet
 BIN = os.path.join(HERE, "bin")
@@ -105,6 +105,159 @@ def vigia_run(args_vr, cmd, env, dry):
     return json.loads(r.stdout)
 
 
+class Criteria:
+    """criteria.json gate: every criterion is proved by one short, executable command.
+
+    Shape accepted: simple commands joined only by `&&` (each one checked), no `||`, `;`, `|`, `&`, subshells,
+    `$(...)` or backticks — so nothing can mask a failure. `bash -c '...'` is checked as its inner command.
+    Criteria run from the integration worktree: relative scripts resolve against the repo; T/checks scripts are
+    given by absolute path."""
+
+    MAX_LEN = 240     # longer → a script in T/checks/ (keeps briefs and the lead's context small)
+    MANUAL = re.compile(r"\b(manual(ly)?|by hand|visual(ly)? (check|inspect)|eyeball|n/a|tbd|todo)\b|^\s*(\.\.\.|-|none|see\b|"
+                        r"check\b|verify\b|inspect\b|look\b|open\b)", re.I)
+    FORBIDDEN_OPS = {"||", ";", "|", "&", "|&", ";;", "(", ")", ";&", "&&&"}
+    SUBST = re.compile(r"\$\(|`|<\(|>\(")
+    VACUOUS = {"true", ":", "echo", "printf", "exit", "false", "yes", "sleep", "read"}
+    SETUP = {"cd", "export", "set"}   # allowed before the proving command, never alone
+    WRAPPERS = {"env", "timeout", "nice", "command", "nohup", "time", "xargs", "exec"}
+    FILE_TESTS = {"-s", "-f", "-e", "-r", "-x", "-d"}
+    SCRIPT_RUNNERS = {"bash", "sh"}
+
+    @staticmethod
+    def segments(command):
+        """[argv, ...] of the `&&`-joined simple commands, or a str with the reason it is not acceptable."""
+        if Criteria.SUBST.search(command):
+            return "command substitution / process substitution is not allowed"
+        command = re.sub(r"\d*>&\d+", " ", command)   # 2>&1 is a redirection, not a background job
+        try:
+            lx = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+            lx.whitespace_split = True
+            toks = list(lx)
+        except ValueError:
+            return "command does not parse"
+        segs, cur = [], []
+        for t in toks:
+            if t == "&&":
+                segs.append(cur); cur = []
+            elif t in Criteria.FORBIDDEN_OPS or set(t) <= set(";&|()"):
+                return f"operator {t!r} can mask a failure: join commands with && only"
+            elif t.startswith("#"):
+                return "a comment hides part of the command"
+            else:
+                cur.append(t)
+        segs.append(cur)
+        if any(not sg for sg in segs):
+            return "empty command around &&"
+        return segs
+
+    @staticmethod
+    def words(w):
+        """argv after VAR=value prefixes and wrappers (env/timeout N/...)."""
+        w = list(w)
+        while w:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w[0]):
+                w = w[1:]
+            elif os.path.basename(w[0]) in Criteria.WRAPPERS:
+                w = w[1:]
+                while w and (w[0].startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", w[0])):
+                    w = w[1:]   # wrapper options / timeout duration
+            else:
+                break
+        return w
+
+    @staticmethod
+    def resolve(p, repo):
+        return p if os.path.isabs(p) or not repo else os.path.join(repo, p)
+
+    @staticmethod
+    def segment_problem(w, path, repo, depth=0):
+        """Reason this simple command proves nothing / cannot run, or None. w = argv after wrappers."""
+        if not w:
+            return "command proves nothing"
+        first = os.path.basename(w[0])
+        if first in Criteria.SCRIPT_RUNNERS and len(w) >= 3 and w[1] == "-c":
+            if depth:
+                return "nested shells are not allowed"
+            inner = Criteria.segments(w[2])
+            if isinstance(inner, str):
+                return inner
+            for sg in inner:
+                why = Criteria.segment_problem(Criteria.words(sg), path, repo, depth + 1)
+                if why:
+                    return why
+            return None
+        if first in Criteria.SETUP:
+            return None
+        if first in Criteria.VACUOUS:
+            return "command proves nothing"
+        if first in ("test", "["):
+            args = w[1:-1] if first == "[" and w[-1:] == ["]"] else w[1:]
+            if first == "[" and w[-1:] != ["]"]:
+                return "`[` without `]`"
+            if len(args) != 2 or args[0] not in Criteria.FILE_TESTS:
+                return "test/[ must be a single file check (-s/-f/-e/-r/-x/-d FILE)"
+            return None
+        if "/" in w[0]:
+            f = Criteria.resolve(w[0], repo)
+            if repo and not (os.path.isfile(f) and os.access(f, os.X_OK)):
+                return f"{w[0]!r} is not an executable file (relative = repo; T/checks scripts by absolute path)"
+        elif not shutil.which(first, path=path):
+            return f"{first!r} is not an executable on PATH"
+        if first in Criteria.SCRIPT_RUNNERS:
+            if len(w) < 2 or w[1].startswith("-"):
+                return f"{first} needs a script file"
+            f = Criteria.resolve(w[1], repo)
+            if repo and not os.path.isfile(f):
+                return (f"script {w[1]!r} does not exist (relative = repo; T/checks scripts by absolute path; "
+                        f"they exist before the run)")
+        return None
+
+    @staticmethod
+    def ui_checked(art, segs):
+        """The artifact is file-tested (test/[ -s|-f ART) or passed to a program in some segment."""
+        for sg in segs:
+            w = Criteria.words(sg)
+            first = os.path.basename(w[0]) if w else ""
+            if first in ("test", "["):
+                if art in w and w[w.index(art) - 1] in ("-s", "-f"):
+                    return True
+            elif first in Criteria.SCRIPT_RUNNERS and len(w) >= 3 and w[1] == "-c":
+                inner = Criteria.segments(w[2])
+                if not isinstance(inner, str) and Criteria.ui_checked(art, inner):
+                    return True
+            elif art in w[1:]:
+                return True
+        return False
+
+    @staticmethod
+    def problems(crit, path, repo=None):
+        """List of human-readable problems; empty = valid. repo: where relative paths resolve (the run's cwd mirrors it)."""
+        out = []
+        for c in crit:
+            cid, cmd = c.get("id", "?"), str(c.get("command", "")).strip()
+            if not cmd:
+                out.append(f"{cid}: criterion without a proving command"); continue
+            if "\n" in cmd or len(cmd) > Criteria.MAX_LEN:
+                out.append(f"{cid}: command too long/multi-line: put it in T/checks/{cid}.sh and call it by absolute path"); continue
+            if Criteria.MANUAL.search(cmd):
+                out.append(f"{cid}: manual/non-executable command {cmd[:60]!r}"); continue
+            segs = Criteria.segments(cmd)
+            if isinstance(segs, str):
+                out.append(f"{cid}: {segs} ({cmd[:60]!r})"); continue
+            why = next((y for y in (Criteria.segment_problem(Criteria.words(sg), path, repo) for sg in segs) if y), None)
+            if not why and all(os.path.basename(Criteria.words(sg)[0]) in Criteria.SETUP for sg in segs):
+                why = "command proves nothing"
+            if why:
+                out.append(f"{cid}: {why} ({cmd[:60]!r})"); continue
+            if c.get("when") == "ui" or str(cid).upper().startswith("C-UI"):
+                art = str(c.get("artifact") or "").strip()
+                if not art or not Criteria.ui_checked(art, segs):
+                    out.append(f"{cid}: UI criterion must name its proof file in 'artifact' and the command must check "
+                               f"it (`test -s ARTIFACT`, or pass it to a check script)")
+        return out
+
+
 def main():
     ap = argparse.ArgumentParser(prog="fleet-run")
     ap.add_argument("--task-dir", required=True)
@@ -126,8 +279,7 @@ def main():
         if not os.path.isfile(os.path.join(T, f)): fail(f"missing {T}/{f}")
     crit = read_json(os.path.join(T, "criteria.json"), {})
     items = crit.get("criteria") or fail("criteria.json has no 'criteria'")
-    no_cmd = [c.get("id", "?") for c in items if not str(c.get("command", "")).strip()]
-    if no_cmd: fail(f"criterion without a proving command: {no_cmd}")
+    path = os.pathsep.join([BIN, os.path.expanduser("~/.local/bin"), os.environ.get("PATH", "")])
     tasks = read_json(os.path.join(T, "tasks.json"))
     if cx in ("M", "G"):
         if not tasks: fail("M/G requires tasks.json (DAG: id, files, depends_on)")
@@ -141,6 +293,8 @@ def main():
     fj = read_json(os.path.join(T, "fleet.json"), {}) or {}
     repo = a.repo or fj.get("repo") or fail("pass --repo (target repository)")
     repo = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo, capture_output=True, text=True).stdout.strip() or fail(f"{repo} is not a git repo")
+    bad = Criteria.problems(items, path, repo=repo)
+    if bad: fail("invalid criteria: " + "; ".join(bad))
     roles = default_roles(cx, a.lead)
     for k, v in (fj.get("roles") or {}).items():   # whatever was already written wins
         if k in roles: roles[k].update(v)

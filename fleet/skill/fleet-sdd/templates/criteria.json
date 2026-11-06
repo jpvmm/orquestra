@@ -9,15 +9,16 @@
     },
     {
       "id": "C2",
-      "description": "...",
-      "command": "...",
+      "description": "long check: a script in T/checks, called by absolute path (criteria run from the integration worktree)",
+      "command": "bash /ABSOLUTE/PATH/TO/T/checks/C2.sh",
       "expect": "exit 0",
       "passes": false
     },
     {
       "id": "C-UI",
-      "description": "UI visual proof: screenshot or Playwright headless journey artifact exists and is non-empty (required when task touches UI; delete this criterion when N/A)",
-      "command": "test -s proofs/ui-proof.png || test -s proofs/ui-journey.log",
+      "description": "UI visual proof: the screenshot (or Playwright headless journey log) named in artifact exists and is non-empty (required when task touches UI; delete this criterion when N/A)",
+      "command": "test -s proofs/ui-proof.png",
+      "artifact": "proofs/ui-proof.png",
       "expect": "exit 0",
       "passes": false,
       "when": "ui"

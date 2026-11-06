@@ -141,6 +141,8 @@ class GrepSecrets(unittest.TestCase):
         self.assertIsNone(self.deny(path=self.repo, glob="*.py"))
         self.assertIsNone(self.deny(path=self.repo, glob="**/*.{py,md}"))
         self.assertIsNone(self.deny(path=self.repo, type="py"))
+        self.assertTrue(self.deny(path=self.repo, type="sh"))              # rg's sh type includes *.env / .env
+        self.assertTrue(self.deny(path=self.repo, type="config"))
         self.assertIsNone(self.deny(path=os.path.join(self.repo, "src")))
 
     def test_hook_blocks_and_logs_it_as_secret(self):

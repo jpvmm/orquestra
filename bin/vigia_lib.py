@@ -723,6 +723,10 @@ class HookPolicy:
     SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
              ".next", "target"}
     MAX_ENTRIES = 50000
+    # ripgrep types checked to have no glob that matches .env / *.env / webhook.env (`sh`, `config`... do or may)
+    SAFE_TYPES = {"py", "python", "js", "ts", "typescript", "go", "rust", "java", "c", "cpp", "md", "markdown",
+                  "json", "yaml", "toml", "html", "css", "ruby", "php", "kotlin", "swift", "csharp", "sql", "rst",
+                  "txt", "vue", "svelte", "scala", "lua", "elixir", "haskell", "dart"}
 
     @staticmethod
     def _globs(g):
@@ -737,8 +741,10 @@ class HookPolicy:
         """Grep whose files could include a secret file: no type/glob that excludes them, and one exists under its
         path (bounded walk; too many files to check counts as yes)."""
         import fnmatch
-        if inp.get("type"):
-            return False                      # rg --type: source files of that language only
+        t = str(inp.get("type") or "")
+        if t in HookPolicy.SAFE_TYPES:
+            return False                      # rg --type of a language whose globs never match a .env file
+        # any other type (e.g. `sh` includes *.env / .env) is treated like no filter
         g = str(inp.get("glob") or "")
         if g and not g.startswith("!"):
             pats = [x.rsplit("/", 1)[-1] for x in HookPolicy._globs(g)]

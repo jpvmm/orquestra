@@ -523,10 +523,19 @@ class ProtectedTests:
         return listed or None
 
     @staticmethod
+    def blob_id(path, hexlen=40):
+        """Git blob id of the raw file bytes, computed here: no git filters/attributes/config from the worktree run."""
+        import hashlib
+        with open(path, "rb") as f:
+            data = f.read()
+        algo = hashlib.sha256 if hexlen == 64 else hashlib.sha1
+        return algo(b"blob %d\0" % len(data) + data).hexdigest()
+
+    @staticmethod
     def modified(base, dirs):
         """Problems with the base tests in the git worktrees dirs, as 'dir: path' (changed or deleted) or
-        'dir: cannot verify ...'. Compares file CONTENT with the base blobs (git hash-object), so renames, index
-        flags (assume-unchanged/skip-worktree) or any shell trick cannot hide a change. Fails closed: anything
+        'dir: cannot verify ...'. Compares the raw file bytes with the base blobs (hashed here, no git filters),
+        so renames, index flags, clean filters or any shell trick cannot hide a change. Fails closed: anything
         that cannot be checked is reported. vigia-run runs it when a protected run ends."""
         import subprocess
         out = []
@@ -543,16 +552,12 @@ class ProtectedTests:
                         meta, path = ent.split("\t", 1)
                         if meta.split()[1] == "blob" and TEST_RE.search(path):
                             blobs[path] = meta.split()[2]
-                present = [p for p in sorted(blobs) if os.path.isfile(os.path.join(d, p))]
-                out += [f"{d}: {p} (deleted)" for p in sorted(blobs) if p not in present]
-                if present:
-                    hs = subprocess.run(["git", "-C", d, "hash-object", "--stdin-paths"], input="\n".join(present) + "\n",
-                                        capture_output=True, text=True, timeout=120)
-                    got = hs.stdout.split()
-                    if hs.returncode != 0 or len(got) != len(present):
-                        out.append(f"{d}: cannot verify protected tests (git hash-object failed)")
-                        continue
-                    out += [f"{d}: {p}" for p, g in zip(present, got) if g != blobs[p]]
+                for p in sorted(blobs):
+                    f = os.path.join(d, p)
+                    if not os.path.isfile(f) or os.path.islink(f):
+                        out.append(f"{d}: {p} (deleted)")
+                    elif ProtectedTests.blob_id(f, len(blobs[p])) != blobs[p]:
+                        out.append(f"{d}: {p}")
             except (OSError, subprocess.SubprocessError) as e:
                 out.append(f"{d}: cannot verify protected tests ({type(e).__name__})")
         return out

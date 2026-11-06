@@ -162,6 +162,17 @@ class TrustedBase(unittest.TestCase):
         os.environ["VIGIA_PROTECT_BASE"], os.environ["VIGIA_CWD"] = self.base, self.repo
         self.assertEqual(V.ProtectedTests.load(self.T), frozenset({"tests/test_old.py"}))   # git, not the file
 
+    def test_clean_filter_cannot_hide_a_change(self):
+        import shutil
+        keep = os.path.join(self.tmp.name, "orig.py")
+        shutil.copy(os.path.join(self.repo, "tests", "test_old.py"), keep)
+        subprocess.run(["git", "config", "filter.hide.clean", f"cat {keep}"], cwd=self.repo, check=True, env=self.e)
+        with open(os.path.join(self.repo, ".gitattributes"), "w") as f:
+            f.write("tests/*.py filter=hide\n")
+        with open(os.path.join(self.repo, "tests", "test_old.py"), "a") as f:
+            f.write("# weakened\n")
+        self.assertIn(f"{self.repo}: tests/test_old.py", V.ProtectedTests.modified(self.base, [self.repo]))
+
     def test_modified_by_content(self):
         import subprocess
         g = lambda *c: subprocess.run(["git", *c], cwd=self.repo, check=True, env=self.e, capture_output=True)

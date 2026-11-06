@@ -22,6 +22,8 @@ ALIAS = {
 ROLE_FLAGS = {
     "plan": {
         "claude_tools": "Read,Grep,Glob",   # a plan critique only reads: no Bash, no file writes
+        "claude_only_tools": "Read,Grep,Glob",
+        "claude_deny": ("Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"),
         "protect_tests": False,
         "codex_sandbox": "read-only",
         "max_min": 30,
@@ -161,8 +163,10 @@ def build_cmd(a, prompt, flags):
                 "--output-format", "stream-json", "--verbose",
                 "--settings", a.settings or os.path.join(VIGIA_BIN, "claude-hooks.json"),
                 "--allowedTools", a.tools or flags["claude_tools"],
-                "--disallowedTools", *CLAUDE_DENY,
+                "--disallowedTools", *CLAUDE_DENY, *flags.get("claude_deny", ()),
                 "--strict-mcp-config"]
+        if flags.get("claude_only_tools"):   # --allowedTools only pre-approves; --tools limits what exists at all
+            cmd += ["--tools", flags["claude_only_tools"]]
         seen = set()
         for d in [cwd, td] + add_dirs:
             if d not in seen:

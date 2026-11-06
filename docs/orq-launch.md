@@ -19,7 +19,7 @@ Safety flags it always adds:
 
 - Claude: `--disallowedTools` for `git commit/push/merge/rebase`, `gh`, `curl`, `wget`, `rm -rf`, and
   Read/Edit/Write of `.env*` / `webhook.env`; plus `--strict-mcp-config` (no MCP servers). The `plan` role
-  gets only `Read,Grep,Glob`.
+  gets only `Read,Grep,Glob` (`--tools`, so nothing else exists; Bash/Edit/Write also denied).
 - Codex `workspace-write` roles: `-c sandbox_workspace_write.network_access=false`, so a user config cannot
   turn network on. `--output-schema FILE` is passed only to read-only roles (plan/review).
 - The `lead` role runs with `--protect-tests` (its subagents edit inside the same process).

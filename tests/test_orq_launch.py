@@ -71,6 +71,11 @@ class OrqLaunch(unittest.TestCase):
     def test_plan_has_no_bash_and_lead_protects_tests(self):
         plan = json.loads(self.run_l("--force-lock", role="plan").stdout)["cmd"]
         self.assertNotIn("Bash", plan[plan.index("--allowedTools") + 1])
+        self.assertEqual(plan[plan.index("--tools") + 1], "Read,Grep,Glob")   # availability, not just approval
+        for t in ("Bash", "Edit", "Write"):
+            self.assertIn(t, plan[plan.index("--disallowedTools") + 1:])
+        impl = json.loads(self.run_l("--force-lock", role="implement").stdout)["cmd"]
+        self.assertNotIn("--tools", impl)
         lead = json.loads(self.run_l("--force-lock", role="lead").stdout)
         self.assertIn("--protect-tests", lead["vigia_args"])
 

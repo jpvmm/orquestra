@@ -18,9 +18,12 @@ PREVIEW = 500
 # ---------------------------------------------------------------- redaction
 
 _ENV_NAME = r"(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|private[_-]?key|key|token|secret|password|passwd|pwd|pass|passphrase|credentials?|auth)"
-# value: \"escaped\" (inside serialized JSON) | "quoted" / 'quoted' (whole value, spaces included) | bare
-_ASSIGN_RE = re.compile(r"\b(" + _ENV_NAME + r")(\b\\?[\"']?\s*(?:=|:)\s*)"
-                        r"(?:(\\\")((?:[^\"\\\n]|\\[^\"\n])*)\\\"|([\"'])([^\n]*?)\5|([\"']?)([^\s\"',;\\]+))", re.I)
+# value: \"escaped\" (inside serialized JSON) | "quoted" / 'quoted' (whole value: spaces, escaped quotes and
+# newlines included; an unterminated quote masks to the end) | bare
+_ASSIGN_RE = re.compile(r"\b(" + _ENV_NAME + r")(\b\\?[\"']?\s*(?:=|:)\s*)(?:"
+                        r"(\\\")((?:\\\\\\\"|\\\\\\\\|\\[^\"]|[^\"\\])*)(\\\"|(?=\")|\Z)"
+                        r"|([\"'])((?:(?!\6)[^\\]|\\[\s\S])*)(\6|\Z)"
+                        r"|([\"']?)([^\s\"',;\\]+))", re.I)
 _SECRET_RES = [
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S),
      "-----BEGIN PRIVATE KEY-----***-----END PRIVATE KEY-----"),
@@ -46,13 +49,14 @@ def _looks_secret(v):
 def _assign(m):
     name, sep = m.group(1), m.group(2)
     if m.group(3):
-        q, val, close = m.group(3), m.group(4), m.group(3)
-    elif m.group(5):
-        q, val, close = m.group(5), m.group(6), m.group(5)
+        q, val, close = m.group(3), m.group(4), m.group(5)
+    elif m.group(6):
+        q, val, close = m.group(6), m.group(7), m.group(8)
     else:
-        q, val, close = m.group(7), m.group(8), ""
+        q, val, close = m.group(9), m.group(10), ""
+    quoted = m.group(3) or m.group(6)
     env_style = name.isupper() and "=" in sep  # FOO_KEY=..., TOKEN=...: always masked
-    quoted_secret = bool(close) and len(val.strip()) >= 6 and not val.startswith(("$", "<"))
+    quoted_secret = bool(quoted) and len(val.strip()) >= 6 and not val.startswith(("$", "<"))
     if val.startswith("***") or not (env_style or quoted_secret or _looks_secret(val)):
         return m.group(0)
     return f"{name}{sep}{q}***{close}"

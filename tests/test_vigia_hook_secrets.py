@@ -75,6 +75,44 @@ class Redaction(unittest.TestCase):
             self.assertNotIn("two words", open(hb).read())
 
 
+ESCAPED = 'TOKEN="alpha\\" beta gamma"'
+MULTI = 'DB_PASSWORD="first line\nsecond gamma"'
+
+
+class QuotedEdgeCases(unittest.TestCase):
+    def test_escaped_quote_and_multiline(self):
+        self.assertEqual(C.redact(ESCAPED), 'TOKEN="***"')
+        self.assertEqual(C.redact(MULTI + " tail"), 'DB_PASSWORD="***" tail')
+        for raw in (ESCAPED + " tail", MULTI):
+            out = C.redact(json.dumps({"stdout": raw}))
+            self.assertNotIn("gamma", out)
+            self.assertNotIn("beta", out)
+        self.assertEqual(C.redact('pass="ab" and token="cd"'), 'pass="ab" and token="cd"')
+        self.assertEqual(C.redact('TOKEN="abcdef1" next="x"'), 'TOKEN="***" next="x"')
+
+    def check(self, name, tool):
+        with tempfile.TemporaryDirectory() as td:
+            hb = os.path.join(td, "hb.jsonl")
+            env = dict(VIGIA_HEARTBEAT=hb, VIGIA_CWD=td)
+            for raw in (ESCAPED, MULTI):
+                run_hook(name, {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {"command": "x " + raw}}, **env)
+                run_hook(name, {"hook_event_name": "PostToolUse", "tool_name": tool, "tool_input": {"command": "env"},
+                                "tool_response": {"stdout": raw, "stderr": ""}}, **env)
+                run_hook(name, {"hook_event_name": "PostToolUse", "tool_name": tool, "tool_input": {"command": "env"},
+                                "tool_response": raw}, **env)
+                run_hook(name, {"hook_event_name": "Stop", "last_assistant_message": "done " + raw}, **env)
+            txt = open(hb).read()
+            self.assertGreaterEqual(len(txt.splitlines()), 8)
+            for leak in ("beta", "gamma", "second"):
+                self.assertNotIn(leak, txt)
+
+    def test_claude_hook(self):
+        self.check("vigia-claude-hook", "Bash")
+
+    def test_codex_hook(self):
+        self.check("vigia-codex-hook", "Bash")
+
+
 class AnalyzerAlerts(unittest.TestCase):
     def test_denied_secret_is_an_alert_not_a_test_edit(self):
         import importlib.machinery, importlib.util

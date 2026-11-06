@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Security
-- Hooks deny any tool call that names a secret file (`.env`, `.env.*` except example/sample/template, `webhook.env`, or a glob matching them), with or without `--protect-tests`; the run gets an alert. `hooks.jsonl` is now redacted: every field before truncation, structured tool responses before serialization, and quoted secret values (`TOKEN="a b c"`) masked whole.
+- Hooks deny any tool call that names a secret file (`.env`, `.env.*` except example/sample/template, `webhook.env`, or a glob matching them), with or without `--protect-tests`; the run gets an alert. `hooks.jsonl` is now redacted: every field before truncation, structured tool responses before serialization, and quoted secret values (`TOKEN="a b c"`, escaped quotes and multiline values included) masked whole.
 
 ### Fixed
 - `--protect-tests` only counts test paths inside the run cwd/worktree (scratch under `/tmp` no longer trips the loop detector).

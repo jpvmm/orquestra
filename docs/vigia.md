@@ -56,6 +56,8 @@ $B/vigia-run --tool codex --task-dir /path/to/task --name t1-codex --task "revie
 | `--protect-base SHA` | none | with `--protect-tests`: the protected list comes from git at SHA, and when the run ends any base test changed/deleted (by content) in cwd or `TASK_DIR/wt/*` turns `done` into `loop` (fails closed if it cannot verify). The expected contents come from fleet-run's manifest (taken before launch) when it matches SHA |
 | `--loop-repeat N` | 3 | how many repetitions count as a loop |
 | `--task TEXT` | none | short task description shown in status, notifications and `vigia-status` |
+| `--role ROLE` | none | the run's real role (`plan`, `review`, `implement`, `lead`); decides the Claude usage-limit follow-up |
+| `--output PATH` | none | expected result file; a Codex fallback of a Claude review writes its reply there. An existing file is moved to `PATH.prev` before the run starts; a `plan`/`review` run that ends without writing it is `failed` (`output_sha256` in the status otherwise) |
 | `--prompt-file PATH` | none | file holding the prompt, when the command reads it from stdin (`-`); otherwise only noted |
 | `--foreground` | off | do not detach (debugging) |
 
@@ -120,6 +122,9 @@ It kills whatever is left of the group, marks the run `killed` and sends the not
 | `loop` | same error N times, identical edit/test cycle N times, protected test file touched, or growing scope (`loop_reason`) | do not relaunch as-is; change the approach |
 | `killed` | stopped by `vigia-stop`, by an external signal, or because the supervisor died | check who stopped it |
 | `incomplete` | exited 0 but did not deliver: a fleet lead (`fleet-*-lead-*`) without a fresh, non-empty `T/FINAL-SUMMARY.md` (`incomplete_reason`) | treat as a failure, not `done`: read the alert and decide whether to resume |
+| `limit_paused` | a Claude run (`--tool claude`) hit the subscription usage limit and its role is lead/implement/plan/unknown | wait for the reset in `limit`; relaunch `resume_command` from `T/.fleet/limit-resume.json` (the exact launcher argv, from `ORQ_RELAUNCH_ARGV`) |
+| `limit_fallback` | a Claude **review** hit the limit and was relaunched on Codex (`fleet-codex reviewer`); `limit_fallback.relaunch` has the new run's `name`/`status_path`/`output` (also `fallback_status_path`) | wait on the new run; if the relaunch failed (or raised), the state is `failed` (no review was produced) and `summary` says `fallback FAILED` |
+| `limit_handoff` | not final: a Claude review hit the limit and the Codex relaunch is being decided (seconds); if the supervisor dies here, `vigia-status`/`fleet-wait` finish it | keep waiting |
 
 Killing: SIGTERM to the whole group (and to descendants that changed group), wait 10 s (`VIGIA_KILL_GRACE`), then SIGKILL.
 Then verify with `pgrep -g <pgid>`.

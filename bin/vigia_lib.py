@@ -30,7 +30,7 @@ ACTIVE_DIR = os.path.join(BASE, "active")
 EVENTS_FILE = os.path.join(BASE, "events.jsonl")
 MAX_ACTIVE = int(os.environ.get("VIGIA_MAX_ACTIVE", "5"))
 TZ = ZoneInfo(os.environ["VIGIA_TZ"]) if os.environ.get("VIGIA_TZ") else None
-FINAL_STATES = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete")
+FINAL_STATES = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete", "limit_paused", "limit_fallback")
 # watchdog (watch_active): heartbeat = mtime of status.json (the supervisor touches it every poll)
 HB_STALE = float(os.environ.get("VIGIA_HB_STALE_SEC", "180"))
 WD_GRACE = float(os.environ.get("VIGIA_WD_GRACE_SEC", "120"))
@@ -172,6 +172,63 @@ def active_entries():
     return out
 
 
+def handoff_marker(sp):
+    """Registry entry (Vigia folder, outside the slot registry) for a run in limit_handoff: survives the supervisor."""
+    return os.path.join(BASE, "handoffs", h(os.path.abspath(sp)) + ".json")
+
+
+def _rm(p):
+    try:
+        os.unlink(p)
+    except (FileNotFoundError, TypeError):
+        pass
+
+
+def reconcile_handoff(sp):
+    """Finish a limit_handoff whose supervisor died: limit_fallback if the Codex replacement run exists (its status
+    file), else failed. Live supervisor → untouched. Returns the run's state."""
+    st = read_json(sp) or {}
+    if st.get("state") != "limit_handoff":
+        _rm(handoff_marker(sp))
+        return st.get("state")
+    ho = st.get("handoff") or {}
+    if alive(ho.get("supervisor_pid"), ho.get("supervisor_start")):
+        return "limit_handoff"
+    with run_lock(sp, wait=5) as ok:
+        if not ok:
+            return "limit_handoff"
+        st = read_json(sp) or {}
+        if st.get("state") == "limit_handoff":
+            sub = ho.get("replacement_status")
+            if sub and os.path.isfile(sub):
+                st.update(state="limit_fallback", fallback_status_path=sub)
+                msg = "Claude limit: supervisor died after the Codex fallback was registered"
+            else:
+                st["state"] = "failed"
+                msg = "Claude limit: supervisor died during the Codex fallback handoff (no replacement run)"
+            st["ended_at"] = st.get("ended_at") or now_iso()
+            st["summary"] = (msg + " | " + (st.get("summary") or ""))[:500]
+            write_json_atomic(sp, st)
+    _rm(handoff_marker(sp))
+    return st.get("state")
+
+
+def reconcile_handoffs():
+    """Every recorded handoff (vigia-run start, vigia-status, waiters): interrupted ones get a final state."""
+    import glob as _g
+    done = []
+    for f in _g.glob(os.path.join(BASE, "handoffs", "*.json")):
+        sp = (read_json(f) or {}).get("status_path")
+        if not sp:
+            _rm(f)
+            continue
+        try:
+            done.append((sp, reconcile_handoff(sp)))
+        except Exception:
+            pass
+    return done
+
+
 def cleanup_dead():
     """Remove registry entries whose supervisor died. If the supervised command is still
     alive (supervisor was killed hard), kill its group and mark the status as killed.
@@ -211,6 +268,10 @@ def cleanup_dead():
         except FileNotFoundError:
             pass
         cleaned.append(e.get("key"))
+    try:
+        reconcile_handoffs()
+    except Exception:
+        pass
     return cleaned
 
 
@@ -413,9 +474,154 @@ SHELL_WRITE_RE = re.compile(
 )
 ALERT_RE = re.compile(
     r"rate.?limit|usage limit|too many requests|\b429\b|quota|authentication_failed|invalid api key|not logged in|"
-    r"please run /login|unauthorized|\b401\b|oauth token|login required|credit balance",
+    r"please run /login|unauthorized|\b401\b|oauth token|login required|credit balance|"
+    r"hit your .+ limit|5-hour limit|resets \d{1,2}:\d{2}\s*(am|pm)?",
     re.I,
 )
+
+# Claude CLI subscription cap, e.g.:
+# "You've hit your 5-hour limit · resets 11:50pm (America/Sao_Paulo)"
+CLAUDE_LIMIT_RE = re.compile(
+    r"you'?ve hit your .+ limit|hit your 5-hour limit|5-hour limit\s*[·•].*resets",
+    re.I,
+)
+
+
+def detect_claude_limit(text):
+    """If text is the Claude CLI usage-limit error, return dict with resets; else None."""
+    if not text:
+        return None
+    m = CLAUDE_LIMIT_RE.search(str(text))
+    if not m:
+        return None
+    resets = None
+    rm = re.search(r"resets\s+([^\n(]+)", str(text), re.I)
+    if rm:
+        resets = rm.group(1).strip(" ·•")
+    return {"kind": "claude_usage_limit", "match": m.group(0), "resets": resets}
+
+
+def limit_fallback_plan(role):
+    """What to do when Claude hits the usage limit, by run role.
+    review → relaunch the review on Codex (LimitFallback.launch_codex_review); lead/plan/implement → pause with
+    state limit_paused and T/.fleet/limit-resume.json (no loop). Unknown role → pause (safe side)."""
+    role = LimitFallback.ROLE.get((role or "").lower())
+    if role == "review":
+        return {"action": "fallback_tool", "tool": "codex", "state": "limit_fallback",
+                "summary": "Claude usage limit: review relaunched on Codex (codex-reviewer)"}
+    return {"action": "pause", "tool": None, "state": "limit_paused",
+            "summary": "Claude usage limit: run paused — resume after the reset with T/.fleet/limit-resume.json"}
+
+
+class LimitFallback:
+    """Claude usage limit → real follow-up: relaunch a review on Codex, or write the resume file for a pause."""
+
+    ROLE = {"review": "review", "reviewer": "review", "final_reviewer": "review", "security": "review",
+            "plan": "plan", "lead": "lead", "team-lead": "lead", "implement": "implement", "dev": "implement"}
+
+    @staticmethod
+    def role_of(role, task_dir, name):
+        """The ACTUAL run's role: --role from the launcher, else this run's entry in fleet.json, else its name."""
+        if role:
+            return LimitFallback.ROLE.get(role.lower(), role.lower())
+        fj = read_json(os.path.join(task_dir, "fleet.json")) if task_dir else None
+        for r in (fj or {}).get("runs") or []:
+            if (r or {}).get("name") == name and r.get("role"):
+                return LimitFallback.ROLE.get(r["role"].lower(), r["role"].lower())
+        n = name or ""
+        if "-lead-" in n:
+            return "lead"
+        if "-rev-" in n or "review" in n:
+            return "review"
+        if "-dev-" in n:
+            return "implement"
+        return None
+
+    @staticmethod
+    def prompt_of(cmd):
+        """The prompt of a `claude -p PROMPT ...` command line (None if absent)."""
+        cmd = list(cmd or [])
+        for flag in ("-p", "--print"):
+            if flag in cmd and cmd.index(flag) + 1 < len(cmd):
+                return cmd[cmd.index(flag) + 1]
+        return None
+
+    @staticmethod
+    def resume_file(task_dir, *, name, role, resets, relaunch_argv=None):
+        """Lead/implement/plan paused by the limit: record what to relaunch and when. relaunch_argv is the exact
+        launcher command line of THIS run (recorded at launch via ORQ_RELAUNCH_ARGV), so options are kept."""
+        dest = os.path.join(task_dir, ".fleet", "limit-resume.json")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        write_json_atomic(dest, {"paused_run": name, "role": role, "resets": resets, "written_at": now_iso(),
+                                 "resume_command": list(relaunch_argv) if relaunch_argv else None,
+                                 "note": "after the reset, relaunch resume_command; "
+                                         "the lead resumes from progress.md + fleet-state.json"})
+        return dest
+
+    @staticmethod
+    def launch_codex_review(st, *, fleet_bin, env=None, timeout=240):
+        """`fleet-codex reviewer --no-wait` with the same prompt/cwd/output. Call AFTER this run left active/.
+        launched=True only when the Vigia registered the new run."""
+        import subprocess
+        td, name = st.get("task_dir"), st.get("name") or "run"
+        prompt = LimitFallback.prompt_of(st.get("cmd"))
+        if not td or not prompt:
+            return {"launched": False, "error": "no task_dir or prompt to relaunch"}
+        fb = os.path.join(td, ".fleet")
+        os.makedirs(fb, exist_ok=True)
+        pf = os.path.join(fb, f"{name}.limit-fallback.prompt.md")
+        with open(pf, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        out = st.get("output") or os.path.join(td, "review", f"{name}.codex-fallback.md")
+        new = name[:76] + "-cx"
+        cmd = [os.path.join(fleet_bin, "fleet-codex"), "reviewer", "--task-dir", td, "--name", new,
+               "--prompt-file", pf, "--output", out, "--cwd", st.get("cwd") or td, "--no-wait",
+               "--slot-wait", str(max(30, timeout - 60)), "--task", f"limit fallback of {name}"]
+        e = dict(env if env is not None else os.environ)
+        if st.get("webhook_env") != "":   # the replaced run notified the bot: so does its replacement
+            e["FLEET_NOTIFY_SUBRUNS"] = "1"
+        try:
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=e, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            return {"launched": False, "error": f"{type(ex).__name__}: {ex}", "command": cmd}
+        try:
+            info = json.loads((r.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            info = {}
+        ok = r.returncode == 0 and info.get("state") == "running" and bool(info.get("status_path"))
+        res = {"launched": ok, "name": new, "output": out, "command": cmd, "status_path": info.get("status_path")}
+        if not ok:
+            res["error"] = (info.get("error") or r.stderr or r.stdout or f"exit {r.returncode}")[-600:]
+        return res
+
+
+def append_usage_progress(task_dir, *, name, tool, model, usage=None, limit_info=None):
+    """Append a short usage line to task_dir/progress.md when the file exists."""
+    if not task_dir:
+        return False
+    path = os.path.join(task_dir, "progress.md")
+    if not os.path.isfile(path):
+        return False
+    usage = usage or {}
+    parts = [f"- usage {now_iso()}: run={name} tool={tool} model={model or '?'}"]
+    bits = []
+    for k in ("input_tokens", "output_tokens", "total_tokens", "total_cost_usd", "num_turns", "duration_ms"):
+        if usage.get(k) is not None:
+            bits.append(f"{k}={usage[k]}")
+    if bits:
+        parts.append(" ".join(bits))
+    if limit_info:
+        parts.append(f"LIMIT {limit_info.get('kind')} resets={limit_info.get('resets')}")
+        fb = limit_fallback_plan(usage.get("role"))
+        parts.append(f"role={usage.get('role') or '?'} fallback={fb['action']}:{fb.get('tool') or fb['state']}")
+    line = " ".join(parts) + "\n"
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+        return True
+    except OSError:
+        return False
+
 
 # agent stderr: this pattern always applies; ALERT_RE only on Claude's stderr (Codex echoes the whole conversation: noise)
 STDERR_ALERT_RE = re.compile(r"Background tasks still running", re.I)

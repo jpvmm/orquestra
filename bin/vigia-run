@@ -22,7 +22,7 @@ a JSON object with the status path. Exit 0 = started; 2 = bad usage; 3 = active-
 Paths: state lives in $VIGIA_BASE (default $ORQUESTRA_HOME/vigia, default ~/.orquestra/vigia);
 per-run files live in <task-dir>/runs/.
 """
-import argparse, ctypes, glob, json, os, re, shlex, signal, shutil, subprocess, sys, time
+import argparse, ctypes, glob, hashlib, json, os, re, shlex, signal, shutil, subprocess, sys, time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -65,6 +65,8 @@ def parse():
     p.add_argument("--cwd", default=None)
     p.add_argument("--foreground", action="store_true", help="do not detach (debug)")
     p.add_argument("--task", default=None, help="short task description (goes into the status, notifications and prompt.md)")
+    p.add_argument("--role", default=None, help="the run's real role (plan|review|implement|lead): decides the Claude-limit follow-up")
+    p.add_argument("--output", default=None, help="expected result file; a Codex fallback of a Claude review writes there")
     p.add_argument("--prompt-file", default=None,
                    help="file holding the prompt (when the prompt comes from stdin/'-', or to record the full prompt)")
     a = p.parse_args(ours)
@@ -542,7 +544,9 @@ def supervise(a, paths, key, notifier=None):
         "checked_at": None, "summary": "", "loop_reason": None, "alerts": [],
         "limits": {"stall_min": a.stall_min, "max_min": a.max_min, "max_turns_hint": a.max_turns_hint,
                    "max_files": a.max_files, "protect_tests": a.protect_tests, "loop_repeat": a.loop_repeat,
-                   "protect_base": a.protect_base},
+                   "protect_base": a.protect_base, "role": a.role},
+        "role": a.role, "output": os.path.abspath(a.output) if a.output else None,
+        "relaunch_argv": relaunch_argv_from_environ(),
         "stats": {}, "kill": None, "paths": paths,
         # per-bot webhook: VIGIA_WEBHOOK_ENV at launch is stored here so notifications go to the same bot even
         # when another process sends them (e.g. vigia-status cleaning up a dead supervisor). None = default.
@@ -591,6 +595,14 @@ def supervise(a, paths, key, notifier=None):
     signal.signal(signal.SIGTERM, on_sig)
     signal.signal(signal.SIGINT, on_sig)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    # an older round's result must never pass for this run's: move it aside before the agent starts
+    if a.output and os.path.lexists(a.output):
+        try:
+            os.replace(a.output, a.output + ".prev")
+            st["output_previous"] = a.output + ".prev"
+        except OSError as e:
+            st["output_move_error"] = str(e)
 
     env = dict(os.environ)
     env["PATH"] = env.get("PATH", "") + ":" + os.path.expanduser("~/.local/bin")  # fallback: default claude install dir
@@ -780,6 +792,75 @@ def supervise(a, paths, key, notifier=None):
     if an.result:
         r = an.result
         st["result"] = {k: r.get(k) for k in ("subtype", "is_error", "num_turns", "total_cost_usd", "duration_ms") if k in r}
+        usage = st.setdefault("usage", {})
+        if isinstance(r.get("usage"), dict):
+            usage.update(r["usage"])
+        for k in ("input_tokens", "output_tokens", "total_tokens"):
+            if k in r:
+                usage[k] = r[k]
+    # Claude subscription limit → explicit state (no silent loop)
+    blob = " ".join([
+        st.get("summary") or "",
+        " ".join(st.get("alerts") or []),
+        str(an.last_error or ""),
+        str((an.result or {}).get("result") or "")[-2000:],   # the limit can be the final result (stdout, exit 0)
+        str(an.last_msg or "")[-2000:],
+    ])
+    try:
+        with open(paths["stderr"], errors="replace") as _ef:
+            blob += " " + _ef.read()[-2000:]
+    except OSError:
+        pass
+    lim = V.detect_claude_limit(blob) if a.tool == "claude" else None   # a Codex run echoes text: no false hits
+    # a plan/review run with --output succeeds only if THIS run wrote the file (old ones were moved aside)
+    if a.output and a.role in ("plan", "review") and not lim and st.get("state") == "done":
+        try:
+            with open(a.output, "rb") as f:
+                st["output_sha256"] = hashlib.sha256(f.read()).hexdigest()
+        except OSError as e:
+            st["state"] = "failed"
+            st["summary"] = (f"--output was not written ({type(e).__name__}) | " + (st.get("summary") or ""))[:500]
+    if lim:
+        st["limit"] = lim
+        role = V.LimitFallback.role_of(a.role, a.task_dir, a.name)
+        fb = dict(V.limit_fallback_plan(role))
+        fb["role"] = role
+        if fb["action"] == "fallback_tool":
+            fb["pending"] = True          # launched by run_supervisor once this run has left active/
+            fb["prior_state"] = st.get("state")
+            st["state"] = "limit_handoff"  # not terminal: waiters keep waiting until the relaunch is decided
+            new = (a.name[:76] + "-cx")   # LimitFallback.launch_codex_review's name
+            st["handoff"] = {"supervisor_pid": os.getpid(), "supervisor_start": (V.proc_stat(os.getpid()) or {}).get("start"),
+                             "since": V.now_iso(),
+                             "replacement_status": os.path.join(a.task_dir, "runs", new + ".status.json")}
+            try:   # survives this supervisor: an interrupted handoff is finished by reconcile_handoff
+                os.makedirs(os.path.dirname(V.handoff_marker(paths["status"])), exist_ok=True)
+                C.write_atomic(V.handoff_marker(paths["status"]), json.dumps({"status_path": paths["status"]}) + "\n")
+            except OSError as e:
+                st["alerts"].append(f"could not write the handoff marker: {e}")
+        else:
+            try:
+                fb["resume_file"] = V.LimitFallback.resume_file(a.task_dir, name=a.name, role=role,
+                                                                resets=lim.get("resets"),
+                                                                relaunch_argv=st.get("relaunch_argv"))
+            except OSError as e:
+                fb["resume_error"] = str(e)
+        st["limit_fallback"] = fb
+        if fb["action"] == "pause" and st.get("state") in ("done", "failed", "running"):
+            st["state"] = "limit_paused"
+        st["summary"] = (fb["summary"] + (f" (resets {lim.get('resets')})" if lim.get("resets") else "")
+                         + " | " + (st.get("summary") or ""))[:500]
+        usage = dict(st.get("usage") or {})
+        usage.update({k: st.get("result", {}).get(k) for k in ("total_cost_usd", "num_turns", "duration_ms") if st.get("result")})
+        usage["role"] = role
+        V.append_usage_progress(a.task_dir, name=a.name, tool=a.tool, model=st.get("model"),
+                                usage=usage, limit_info=lim)
+    elif st.get("state") in ("done", "failed", "incomplete", "timeout", "loop", "killed") and a.task_dir:
+        usage = dict(st.get("usage") or {})
+        if st.get("result"):
+            usage.update({k: st["result"].get(k) for k in ("total_cost_usd", "num_turns", "duration_ms") if k in st["result"]})
+        V.append_usage_progress(a.task_dir, name=a.name, tool=a.tool, model=st.get("model"), usage=usage)
+
     if not st["summary"]:
         base = an.last_msg or an.last_error or ""
         if not base:
@@ -791,6 +872,8 @@ def supervise(a, paths, key, notifier=None):
         st["summary"] = re.sub(r"\s+", " ", str(base)).strip()[:300]
     if st["alerts"]:
         st["summary"] = (st["summary"] + " | ALERT: " + "; ".join(st["alerts"][:3]))[:500]
+    if incomplete and st.get("state") == "limit_paused":
+        incomplete = None   # the limit explains the missing summary: keep the resumable state, not 'incomplete'
     if incomplete:
         st["state"] = "incomplete"
         st["incomplete_reason"] = incomplete
@@ -1015,6 +1098,15 @@ def webhook_env_from_environ():
     return os.path.abspath(os.path.expanduser(v)) if v else ""
 
 
+def relaunch_argv_from_environ():
+    """ORQ_RELAUNCH_ARGV (JSON list) = the launcher command line that started this run (e.g. fleet-run)."""
+    try:
+        v = json.loads(os.environ.get("ORQ_RELAUNCH_ARGV") or "null")
+    except ValueError:
+        return None
+    return [str(x) for x in v] if isinstance(v, list) and v else None
+
+
 def run_supervisor(a, paths, key, entry):
     st = None
     notifier = None
@@ -1048,6 +1140,47 @@ def run_supervisor(a, paths, key, entry):
                     pass
         except Exception:
             pass
+        # Claude limit on a review: relaunch it on Codex now that this run left active/
+        try:
+            fb = (st or {}).get("limit_fallback") or {}
+            if fb.get("pending"):
+                fleet_bin = os.environ.get("FLEET_BIN") or os.path.join(os.path.dirname(V.BIN), "fleet", "bin")
+                fb.pop("pending")
+                try:
+                    fb["relaunch"] = V.LimitFallback.launch_codex_review(st, fleet_bin=fleet_bin)
+                except Exception as e:   # never leave the non-final limit_handoff behind
+                    fb["relaunch"] = {"launched": False, "error": f"{type(e).__name__}: {e}"}
+                with V.run_lock(paths["status"]):
+                    cur = V.read_json(paths["status"]) or st
+                    cur["limit_fallback"] = fb
+                    if fb["relaunch"].get("launched"):
+                        cur["state"] = "limit_fallback"
+                        cur["fallback_status_path"] = fb["relaunch"].get("status_path")
+                        cur["summary"] = (f"Claude limit: review relaunched on Codex as {fb['relaunch']['name']} | "
+                                          + (cur.get("summary") or ""))[:500]
+                    else:
+                        # no review was produced: a clean exit (done) is a failure here; keep a worse prior state
+                        prior = fb.get("prior_state")
+                        cur["state"] = prior if prior in ("failed", "stalled", "timeout", "loop", "killed") else "failed"
+                        cur["summary"] = (f"Claude limit: Codex fallback FAILED to launch "
+                                          f"({fb['relaunch'].get('error', '?')[:160]}) | " + (cur.get("summary") or ""))[:500]
+                    V.write_json_atomic(paths["status"], C.redact_obj(cur))
+                    st = cur
+                V._rm(V.handoff_marker(paths["status"]))
+        except Exception as e:
+            print(f"limit fallback failed: {e}", file=sys.stderr)
+            try:   # persist a final state: waiters must not stay on limit_handoff
+                with V.run_lock(paths["status"]):
+                    cur = V.read_json(paths["status"]) or st or {}
+                    if cur.get("state") == "limit_handoff":
+                        cur["state"] = "failed"
+                        cur["summary"] = (f"Claude limit: Codex fallback FAILED ({type(e).__name__}: {str(e)[:160]}) | "
+                                          + (cur.get("summary") or ""))[:500]
+                        V.write_json_atomic(paths["status"], C.redact_obj(cur))
+                        st = cur
+                V._rm(V.handoff_marker(paths["status"]))
+            except Exception as e2:
+                print(f"could not write the fallback's final state: {e2}", file=sys.stderr)
         # end notification: exactly one (vigia-notify also dedupes per run), after pending notifications
         try:
             if notifier is not None:

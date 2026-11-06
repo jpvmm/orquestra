@@ -18,7 +18,12 @@ import argparse, json, os, subprocess, sys, time
 
 FLEET = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 VIGIA_BIN = os.path.expanduser(os.environ.get("VIGIA_BIN") or os.path.join(os.path.dirname(FLEET), "bin"))
-TERMINAL = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete")
+sys.path.insert(0, VIGIA_BIN)
+try:
+    from vigia_lib import reconcile_handoff   # noqa: E402  (a limit_handoff whose supervisor died)
+except Exception:
+    reconcile_handoff = None
+TERMINAL = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete", "limit_paused", "limit_fallback")
 
 
 def default_model(td, role):
@@ -42,6 +47,11 @@ def wait(status_path, maximum):
                 st = json.load(f)
         except (OSError, ValueError):
             pass
+        if st.get("state") == "limit_handoff" and reconcile_handoff:   # its supervisor may have died mid-handoff
+            try:
+                reconcile_handoff(status_path)
+            except Exception:
+                pass
         if st.get("state") in TERMINAL or time.time() >= end:
             return st
         time.sleep(5)

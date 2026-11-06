@@ -574,7 +574,7 @@ class ProtectedTests:
         """Problems with the base tests in the git worktrees dirs, as 'dir: path' (changed or deleted) or
         'dir: cannot verify ...'. Compares the raw file bytes with the base blobs (hashed here, no git filters, no
         replace refs), so renames, index flags, clean filters or any shell trick cannot hide a change; symlinks are
-        compared by target. Fails closed: anything that cannot be checked is reported. expected = paths that must be in the base (fleet-run's snapshot); one
+        compared by target, a symlinked parent directory or a changed exec bit is reported. Fails closed: anything that cannot be checked is reported. expected = paths that must be in the base (fleet-run's snapshot); one
         missing from the base tree is reported too. vigia-run runs it when a protected run ends."""
         import subprocess
         out = []
@@ -595,6 +595,14 @@ class ProtectedTests:
                 for p in sorted(blobs):
                     mode, oid = blobs[p]
                     f = os.path.join(d, p)
+                    parts = p.split("/")[:-1]
+                    if any(os.path.islink(os.path.join(d, *parts[:i])) for i in range(1, len(parts) + 1)):
+                        out.append(f"{d}: {p} (parent directory is a symlink)")
+                        continue
+                    if mode in ("100644", "100755") and os.path.isfile(f) and not os.path.islink(f) \
+                            and (mode == "100755") != bool(os.stat(f).st_mode & 0o111):
+                        out.append(f"{d}: {p} (mode changed)")
+                        continue
                     if mode == "120000":     # symlink: the blob is the link target
                         if not os.path.islink(f):
                             out.append(f"{d}: {p} (deleted)" if not os.path.lexists(f) else f"{d}: {p}")

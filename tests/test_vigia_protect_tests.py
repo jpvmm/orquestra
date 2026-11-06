@@ -189,6 +189,19 @@ class TrustedBase(unittest.TestCase):
         os.symlink("/dev/null", os.path.join(self.repo, "tests", "test_link.py"))
         self.assertEqual(V.ProtectedTests.modified(base, [self.repo]), [f"{self.repo}: tests/test_link.py"])
 
+    def test_symlinked_parent_dir_and_mode_change_are_caught(self):
+        import shutil
+        tests = os.path.join(self.repo, "tests")
+        os.chmod(os.path.join(tests, "test_old.py"), 0o755)
+        self.assertEqual(V.ProtectedTests.modified(self.base, [self.repo]), [f"{self.repo}: tests/test_old.py (mode changed)"])
+        os.chmod(os.path.join(tests, "test_old.py"), 0o644)
+        copy = os.path.join(self.tmp.name, "copy")
+        shutil.copytree(tests, copy)
+        shutil.rmtree(tests)
+        os.symlink(copy, tests)                                   # same bytes, but the delivery has a symlink
+        self.assertEqual(V.ProtectedTests.modified(self.base, [self.repo]),
+                         [f"{self.repo}: tests/test_old.py (parent directory is a symlink)"])
+
     def test_clean_filter_cannot_hide_a_change(self):
         import shutil, subprocess
         keep = os.path.join(self.tmp.name, "orig.py")

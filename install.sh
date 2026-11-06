@@ -36,7 +36,18 @@ cp -R "$REPO/fleet/skill/fleet-sdd/." "$FLEET/skill/fleet-sdd/"
 cp "$REPO/docs/fleet.md" "$FLEET/README.md"
 
 cp "$REPO/docs/vigia.md" "$VIGIA_BASE/README.md"
-cp "$REPO/prompts/orquestra.md" "$ORQUESTRA_HOME/orquestra.md"
+# Preserve a customized orquestra.md: only replace if missing or still identical to the
+# previously shipped copy. Otherwise write orquestra.md.new and leave the live file alone.
+SHIPPED="$REPO/prompts/orquestra.md"
+DEST="$ORQUESTRA_HOME/orquestra.md"
+if [ ! -e "$DEST" ]; then
+  cp "$SHIPPED" "$DEST"
+elif cmp -s "$SHIPPED" "$DEST"; then
+  cp "$SHIPPED" "$DEST"   # identical: refresh timestamps/content harmlessly
+else
+  cp "$SHIPPED" "$DEST.new"
+  echo "install.sh: kept customized $DEST; shipped copy written to $DEST.new" >&2
+fi
 cp "$REPO/prompts/vigia-routine.md" "$ORQUESTRA_HOME/vigia-routine.md"
 [ -e "$VIGIA_BASE/webhook.env.example" ] || cp "$REPO/webhook.env.example" "$VIGIA_BASE/webhook.env.example"
 [ -e "$ORQUESTRA_HOME/learnings.md" ] || printf '# Learnings\n\nWhat worked (and did not) with each tool and model.\n' > "$ORQUESTRA_HOME/learnings.md"

@@ -1,9 +1,35 @@
 {
   "criteria": [
-    {"id": "C1", "description": "add(2, 3) returns 5 and add accepts negatives", "command": "python3 -m pytest -q test_calc.py -k add", "expect": "exit 0", "passes": false},
-    {"id": "C2", "description": "...", "command": "...", "expect": "exit 0", "passes": false}
+    {
+      "id": "C1",
+      "description": "add(2, 3) returns 5 and add accepts negatives",
+      "command": "python3 -m pytest -q test_calc.py -k add",
+      "expect": "exit 0",
+      "passes": false
+    },
+    {
+      "id": "C2",
+      "description": "long check: a script in T/checks, called by absolute path (criteria run from the integration worktree)",
+      "command": "bash /ABSOLUTE/PATH/TO/T/checks/C2.sh",
+      "expect": "exit 0",
+      "passes": false
+    },
+    {
+      "id": "C-UI",
+      "description": "UI visual proof: the screenshot (or Playwright headless journey log) named in artifact exists and is non-empty (required when task touches UI; delete this criterion when N/A)",
+      "command": "test -s proofs/ui-proof.png",
+      "artifact": "proofs/ui-proof.png",
+      "expect": "exit 0",
+      "passes": false,
+      "when": "ui"
+    }
   ],
   "critical_tests": [
-    {"id": "T1", "description": "add with negatives and zero", "file": "test_calc.py"}
-  ]
+    {
+      "id": "T1",
+      "description": "add with negatives and zero",
+      "file": "test_calc.py"
+    }
+  ],
+  "_ui_note": "If the task touches UI (frontend, HTML/CSS/JS pages, screenshots of a product surface): keep C-UI (or an equivalent criterion whose command opens a real screenshot file or runs a Playwright headless journey and fails if the evidence file is missing/empty). Delete C-UI when the task has no UI. Recipe: venv /tmp/pwvenv + playwright with executable_path=/usr/bin/google-chrome (no browser download)."
 }

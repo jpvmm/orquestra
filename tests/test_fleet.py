@@ -118,7 +118,7 @@ class Integration(Base):
 class FleetRunDry(Base):
     def prepare(self, plan="Add two numbers."):
         write(os.path.join(self.T, "plan.md"), plan)
-        write(os.path.join(self.T, "criteria.json"), json.dumps({"criteria": [{"id": "C1", "command": "true", "passes": False}]}))
+        write(os.path.join(self.T, "criteria.json"), json.dumps({"criteria": [{"id": "C1", "command": "python3 -m pytest -q", "passes": False}]}))
         self.tasks([{"id": "1", "files": ["calc.py"]}, {"id": "2", "files": ["sub.py"]}])
 
     def run_dry(self, *extra, check=True, env=None):

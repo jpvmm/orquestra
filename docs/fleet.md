@@ -31,6 +31,19 @@ so nothing is rendered at install time.
 then the fleet writes `fleet.json`, `fleet-state.json`, `progress.md`, `briefs/`, `reports/`, `review/`, `patches/`,
 `wt/integration`, `wt/task-ID`, `FINAL-SUMMARY.md`.
 
+Criteria gate (fleet-run refuses the start otherwise): each `command` is a WHITELISTED proof, ≤240 chars, joined only
+with `&&` (no `||`, `;`, `|`, `&`, subshells or `$(...)`, so nothing masks a failure). Allowed simple commands:
+`cd DIR` (literal; later relative paths resolve from it) and `VAR=value` prefixes (not `PATH`, `HOME`, `PYTHONHOME`,
+`PYTHONOPTIMIZE`, `BASH_ENV`, nor `PYTEST_*`/`LD_*`/`GO*`/`CARGO*`/`NODE_*`/`npm_*` variables); arguments must be literal
+(no `$`, backslashes, or unquoted `*?[]{}~`) no redirection except `2>&1`, and no quoted operator characters (`'&&'` would be a mere argument); a test runner — `pytest`, `python3 -m pytest|unittest`, `npm|pnpm|yarn test`,
+`go test`, `cargo test` (bare, or by path only when it is a real Python binary or the same file `PATH` resolves the runner to; `python -m`
+refuses a `pytest.py`/`unittest`/`sitecustomize.py` that would shadow the runner in the cwd or `PYTHONPATH`), without
+a whitelist of arguments per runner (no help/listing/no-run modes, `-exec`, plugins, config files or name filters that can select nothing); an existing text script under `T/checks/` (absolute path, or `bash|sh` + that
+path). Everything else is refused: inline code (`python3 -c`, `node -e`, `bash -c`), other programs, wrappers (`env`,
+`exec`, `timeout`, `xargs`, `find`) and shell options. A UI criterion (`"when": "ui"` or id `C-UI*`) names its proof
+file in `artifact` and always checks it explicitly with `test -s ARTIFACT` (`test -s` is allowed only there; a
+`T/checks` script may check more). Criteria never change during a run; only a replan changes them.
+
 ## Usage
 ```
 export PATH="$HOME/.orquestra/fleet/bin:$HOME/.local/bin:$PATH"     # or $ORQUESTRA_HOME/fleet/bin

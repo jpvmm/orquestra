@@ -186,6 +186,30 @@ class VigiaRunEndToEnd(unittest.TestCase):
             self.assertEqual(st["state"], "failed")
             self.assertIn("FAILED", st["summary"])
 
+    def run_review(self, td, name, script):
+        import json, subprocess
+        env = dict(os.environ, VIGIA_BASE=os.path.join(td, "v"), VIGIA_WEBHOOK_ENV="", VIGIA_POLL_SEC="0.3")
+        out = os.path.join(td, "review", "r.md")
+        cmd = [os.path.join(ROOT, "bin", "vigia-run"), "--tool", "codex", "--task-dir", td, "--name", name,
+               "--role", "review", "--output", out, "--foreground", "--", "sh", "-c", script.replace("OUT", out)]
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return out, json.load(open(os.path.join(td, "runs", f"{name}.status.json")))
+
+    def test_review_output_is_this_runs_or_the_run_fails(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "review"))
+            open(os.path.join(td, "review", "r.md"), "w").write("OLD ROUND\n")
+            out, st = self.run_review(td, "rev-a", "exit 0")          # wrote nothing: the old file must not count
+            self.assertEqual(st["state"], "failed")
+            self.assertIn("--output", st["summary"])
+            self.assertFalse(os.path.exists(out))
+            self.assertEqual(open(out + ".prev").read(), "OLD ROUND\n")
+            out, st = self.run_review(td, "rev-b", "printf 'NEW\\n' > OUT")
+            self.assertEqual(st["state"], "done")
+            self.assertEqual(st["output_sha256"], hashlib.sha256(b"NEW\n").hexdigest())
+
     def test_codex_run_is_not_a_claude_limit(self):
         with tempfile.TemporaryDirectory() as td:
             st = self.run_v(td, "codex", "lead")

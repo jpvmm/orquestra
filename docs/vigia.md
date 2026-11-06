@@ -56,7 +56,7 @@ $B/vigia-run --tool codex --task-dir /path/to/task --name t1-codex --task "revie
 | `--loop-repeat N` | 3 | how many repetitions count as a loop |
 | `--task TEXT` | none | short task description shown in status, notifications and `vigia-status` |
 | `--role ROLE` | none | the run's real role (`plan`, `review`, `implement`, `lead`); decides the Claude usage-limit follow-up |
-| `--output PATH` | none | expected result file; a Codex fallback of a Claude review writes its reply there |
+| `--output PATH` | none | expected result file; a Codex fallback of a Claude review writes its reply there. An existing file is moved to `PATH.prev` before the run starts; a `plan`/`review` run that ends without writing it is `failed` (`output_sha256` in the status otherwise) |
 | `--prompt-file PATH` | none | file holding the prompt, when the command reads it from stdin (`-`); otherwise only noted |
 | `--foreground` | off | do not detach (debugging) |
 

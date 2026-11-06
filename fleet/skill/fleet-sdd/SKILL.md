@@ -26,6 +26,8 @@ T/patches/task-ID.patch              ← approved patch (fleet-wt package)
 T/wt/integration  T/wt/task-ID       ← worktrees (fleet-wt)
 T/FINAL-SUMMARY.md                   ← your final summary (fixed format)
 ```
+
+UI tasks: `criteria.json` MUST include a visual-proof criterion (screenshot file opened/checked, or Playwright headless journey log). Template: `templates/criteria.json` `C-UI`.
 Tools (in the fleet `bin/` folder given in your prompt, use absolute paths): `fleet-wt`, `codex-reviewer`,
 `codex-dev`, `fleet-wait`. Models/roles: read `T/fleet.json` (`roles`, `max_parallel`).
 

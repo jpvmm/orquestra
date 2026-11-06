@@ -113,6 +113,46 @@ class QuotedEdgeCases(unittest.TestCase):
         self.check("vigia-codex-hook", "Bash")
 
 
+class GrepSecrets(unittest.TestCase):
+    def setUp(self):
+        self.V = V
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = self.tmp.name
+        os.makedirs(os.path.join(self.repo, "src"))
+        open(os.path.join(self.repo, "src", "a.py"), "w").write("x = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def deny(self, **inp):
+        return self.V.HookPolicy.deny_reason("PreToolUse", "Grep", {"pattern": ".", **inp}, env={"VIGIA_CWD": self.repo})
+
+    def test_glob_naming_a_secret_is_denied(self):
+        self.assertTrue(self.deny(path=self.repo, glob=".env", output_mode="content"))
+        self.assertTrue(self.deny(path=self.repo, glob="webhook*"))
+
+    def test_unscoped_search_over_a_secret_is_denied_scoped_one_allowed(self):
+        self.assertIsNone(self.deny(path=self.repo))                       # no secret file here
+        open(os.path.join(self.repo, ".env"), "w").write("TOKEN=abc123456\n")
+        self.assertTrue(self.deny(path=self.repo))
+        self.assertTrue(self.deny())                                        # path defaults to the run cwd
+        self.assertTrue(self.deny(path=self.repo, glob="*"))
+        self.assertTrue(self.deny(path=self.repo, glob="!*.md"))
+        self.assertIsNone(self.deny(path=self.repo, glob="*.py"))
+        self.assertIsNone(self.deny(path=self.repo, glob="**/*.{py,md}"))
+        self.assertIsNone(self.deny(path=self.repo, type="py"))
+        self.assertIsNone(self.deny(path=os.path.join(self.repo, "src")))
+
+    def test_hook_blocks_and_logs_it_as_secret(self):
+        open(os.path.join(self.repo, ".env"), "w").write("TOKEN=abc123456\n")
+        hb = os.path.join(self.repo, "hb.jsonl")
+        r = run_hook("vigia-claude-hook", {"hook_event_name": "PreToolUse", "tool_name": "Grep",
+                                       "tool_input": {"pattern": ".", "path": self.repo, "output_mode": "content"}},
+                 VIGIA_HEARTBEAT=hb, VIGIA_CWD=self.repo)
+        self.assertIn('"deny"', r.stdout)
+        self.assertEqual(json.loads(open(hb).readline())["denied"], "secret")
+
+
 class AnalyzerAlerts(unittest.TestCase):
     def test_denied_secret_is_an_alert_not_a_test_edit(self):
         import importlib.machinery, importlib.util

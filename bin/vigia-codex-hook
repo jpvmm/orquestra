@@ -57,7 +57,7 @@ def main():
             rec["agent_type"] = ev.get("agent_type")
             rec["last_message"] = redact(str(ev.get("last_assistant_message") or ""))[:300]
         if deny:
-            secret = deny == HookPolicy.SECRET
+            secret = deny in (HookPolicy.SECRET, HookPolicy.SECRET_SEARCH)
             rec["denied"] = "secret" if secret else "test"
             hit = (lambda p: touches_secret(p)) if secret else \
                 (lambda p: is_test(p, roots=[env["VIGIA_CWD"]], task_dir=env.get("VIGIA_TASK_DIR") or None))

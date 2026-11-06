@@ -52,7 +52,7 @@ def main():
             rec["agent_type"] = ev.get("agent_type")
             rec["last_message"] = redact(str(ev.get("last_assistant_message") or ""))[:300]
         if deny:
-            rec["denied"] = "secret" if deny == HookPolicy.SECRET else "test"
+            rec["denied"] = "secret" if deny in (HookPolicy.SECRET, HookPolicy.SECRET_SEARCH) else "test"
             rec["path"] = file_path or redact(str(inp.get("command") or ""))[:200]
         try:
             with open(target, "a") as f:

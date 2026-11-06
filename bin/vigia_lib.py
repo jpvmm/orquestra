@@ -680,6 +680,47 @@ class HookPolicy:
     SHELL = ("Bash", "shell", "local_shell", "exec_command")
     TEST = "Test file protected by Vigia (it exists on the base): do not edit it; add a new test file if needed."
     SECRET = "Secret file (.env / webhook.env) blocked by Vigia: do not read or write it."
+    SECRET_SEARCH = ("Search blocked by Vigia: it would read secret files (.env / webhook.env) in this folder. "
+                     "Narrow it with a glob/type that excludes them (e.g. glob='*.py' or type='py').")
+    SECRET_NAMES = (".env", ".env.local", ".env.production", ".env.dev", "webhook.env")
+    SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
+             ".next", "target"}
+    MAX_ENTRIES = 50000
+
+    @staticmethod
+    def _globs(g):
+        """Expand one level of {a,b} braces (ripgrep glob syntax)."""
+        m = re.search(r"\{([^{}]*)\}", g)
+        if not m:
+            return [g]
+        return [g[:m.start()] + alt + g[m.end():] for alt in m.group(1).split(",")]
+
+    @staticmethod
+    def search_reaches_secret(inp, cwd):
+        """Grep whose files could include a secret file: no type/glob that excludes them, and one exists under its
+        path (bounded walk; too many files to check counts as yes)."""
+        import fnmatch
+        if inp.get("type"):
+            return False                      # rg --type: source files of that language only
+        g = str(inp.get("glob") or "")
+        if g and not g.startswith("!"):
+            pats = [x.rsplit("/", 1)[-1] for x in HookPolicy._globs(g)]
+            if not any(fnmatch.fnmatch(n, pt) for n in HookPolicy.SECRET_NAMES for pt in pats):
+                return False
+        root = str(inp.get("path") or cwd or "")
+        if not root:
+            return True
+        root = root if os.path.isabs(root) else os.path.join(cwd or "", root)
+        if os.path.isfile(root):
+            return touches_secret(root)
+        n = 0
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in HookPolicy.SKIP_DIRS]
+            n += len(files) + len(dirs)
+            if any(touches_secret(f) for f in files) or n > HookPolicy.MAX_ENTRIES:
+                return True
+        return False
+
 
     @staticmethod
     def deny_reason(event, tool, inp, files=(), env=None):
@@ -692,6 +733,10 @@ class HookPolicy:
         paths = [p for p in (inp.get("file_path"), inp.get("notebook_path"), inp.get("path")) if p] + list(files)
         if any(touches_secret(p) for p in paths) or (cmd and touches_secret(cmd)):   # always on, any tool
             return HookPolicy.SECRET
+        if tool in ("Grep", "Glob") and touches_secret(inp.get("glob") or ""):
+            return HookPolicy.SECRET
+        if tool == "Grep" and HookPolicy.search_reaches_secret(inp, env.get("VIGIA_CWD") or os.getcwd()):
+            return HookPolicy.SECRET_SEARCH
         if env.get("VIGIA_PROTECT_TESTS") != "1":
             return None
         task_dir = env.get("VIGIA_TASK_DIR") or None

@@ -8,7 +8,7 @@ All notable changes to this project are documented here. The format is based on
 ### Added
 - Fleet criteria template ships a `C-UI` visual-proof criterion (screenshot or Playwright journey log) for UI tasks.
 - fleet-run criteria gate: refuses manual, vacuous (`true`, `echo`, `test 1`), unknown or failure-masking commands
-  (`||`, `;`, `|`, `&`, subshells, `$(...)`), commands that may run nothing (`xargs`, `find -exec`), long commands (→ `T/checks/<id>.sh`), missing/non-executable scripts,
+  (`||`, `;`, `|`, `&`, subshells, `$(...)`), commands that may run nothing (`xargs`, `find -exec`, a bare interpreter, `--version`, no-op inline code like `python3 -c pass`), long commands (→ `T/checks/<id>.sh`), missing/non-executable scripts,
   and UI criteria whose command does not check their `artifact`. The skill states criteria never change in a run.
 
 

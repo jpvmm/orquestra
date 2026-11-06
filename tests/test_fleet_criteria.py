@@ -33,7 +33,9 @@ class CriteriaGate(unittest.TestCase):
                     "[ 1 ]", "bash -c true", "sh -c 'true && :'", "python3 -m pytest; printf ok",
                     "python3 -m pytest | tee log", "python3 -m pytest &", "(python3 -m pytest)", "echo $(python3 x)",
                     "python3 -m pytest && true", "cd sub", "bash -c cd", "python3 missing-proof-script.py",
-                    "node missing.js", "sh", "xargs -r test -s proofs/ui.png", "find . -name x -exec true"):
+                    "node missing.js", "sh", "xargs -r test -s proofs/ui.png", "find . -name x -exec true",
+                    "python3", "python3 -c pass", "python3 --version", "node -v", "python3 -c 'import sys; print(1)'",
+                    "node -e 'process.exit(0)'", "python3 -c"):
             self.assertTrue(self.bad(command=cmd), cmd)
 
     def test_scripts_must_exist_and_be_executable(self):

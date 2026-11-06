@@ -127,6 +127,15 @@ class Criteria:
     # interpreters whose first operand is a script file, unless code/module comes inline (-c/-m/-e...)
     INTERPRETERS = {"bash", "sh", "python", "python3", "node", "ruby", "perl"}
     INLINE = {"-c", "-m", "-e", "--eval", "-p", "--print", "-r"}
+    INFO_FLAGS = {"--version", "-V", "--help", "-h", "-v"}
+    RUNNER_FLAGS = {"--test"}
+    TRIVIAL_STMT = re.compile(r"(pass|None|True|False|\d+|true|:|exit(\s*0|\(\s*0?\s*\))?|(sys\.|process\.|os\._)?exit\(\s*0?\s*\)"
+                              r"|import [\w., ]+|print\(.*\)|console\.log\(.*\)|puts\b.*|\(\s*\))?")
+
+    @staticmethod
+    def trivial_code(code):
+        """Inline code that checks nothing: empty, pass, prints, imports, exit(0)."""
+        return all(Criteria.TRIVIAL_STMT.fullmatch(st.strip()) for st in re.split(r"[;\n]", code or ""))
 
     @staticmethod
     def segments(command):
@@ -205,15 +214,26 @@ class Criteria:
         elif not shutil.which(first, path=path):
             return f"{first!r} is not an executable on PATH"
         if first in Criteria.INTERPRETERS or re.fullmatch(r"python3?(\.\d+)?", first):
-            script = None
-            for x in w[1:]:
-                if x in Criteria.INLINE:
-                    break               # inline code or a module (python3 -m pytest): no script operand
+            script, inline = None, False
+            for i, x in enumerate(w[1:], 1):
+                if x in Criteria.INFO_FLAGS:
+                    return f"{first} {x} proves nothing"
+                if x in Criteria.INLINE:   # inline code or a module (python3 -m pytest): no script operand
+                    code = w[i + 1] if i + 1 < len(w) else ""
+                    if x != "-m" and Criteria.trivial_code(code):
+                        return f"inline code {code!r} proves nothing"
+                    if not code:
+                        return f"{first} {x} needs an argument"
+                    inline = True
+                    break
+                if x in Criteria.RUNNER_FLAGS:
+                    inline = True       # e.g. node --test: runs the test files it finds
+                    break
                 if not x.startswith("-"):
                     script = x
                     break
-            if script is None and first in Criteria.SCRIPT_RUNNERS and not set(w[1:]) & Criteria.INLINE:
-                return f"{first} needs a script file"
+            if script is None and not inline:   # a bare interpreter reads stdin and exits 0 on EOF
+                return f"{first} needs a script file, a module or a real inline check"
             if script is not None and repo and not os.path.isfile(Criteria.resolve(script, repo)):
                 return (f"script {script!r} does not exist (relative = repo; T/checks scripts by absolute path; "
                         f"they exist before the run)")

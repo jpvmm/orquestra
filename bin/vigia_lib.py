@@ -737,6 +737,8 @@ class HookPolicy:
         g = str(inp.get("glob") or "")
         if str(inp.get("type") or ""):
             return True
+        if "\\" in g:
+            return True                                  # ripgrep treats `\` as an escape (`webhoo\k.env`): fail closed
         neg = g.startswith("!")
         pats = HookPolicy._globs(g[1:] if neg else g) if g else []
 

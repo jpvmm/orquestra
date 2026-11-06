@@ -191,6 +191,17 @@ class GrepSecrets(unittest.TestCase):
         self.assertIsNone(self.deny(path=self.repo, glob="!webhoo[k].env"))
         self.assertTrue(self.deny(path=self.repo, glob="!/sub"))
 
+    def test_backslash_in_glob_fails_closed(self):
+        """ripgrep treats `\\` as an escape (`webhoo\\k.env` matches webhook.env); the hook's regex did not."""
+        os.makedirs(os.path.join(self.repo, "sub"))
+        open(os.path.join(self.repo, "webhook.env"), "w").write("T=1\n")
+        open(os.path.join(self.repo, "sub", "webhook.env"), "w").write("T=1\n")
+        for g in ("webhoo\\k.env", "!webhoo\\k.env", "!/webhoo\\k.env"):
+            self.assertTrue(self.deny(path=self.repo, glob=g), g)
+        os.remove(os.path.join(self.repo, "webhook.env"))
+        self.assertTrue(self.deny(path=self.repo, glob="!webhoo\\k.env"))       # nested secret still present
+
+    @unittest.skipUnless(shutil.which("rg"), "ripgrep not installed")
     @unittest.skipUnless(shutil.which("rg"), "ripgrep not installed")
     def test_allowed_searches_never_list_a_secret_in_ripgrep(self):
         """Differential: whenever the hook allows a Grep, `rg --files --hidden --no-ignore` with the same filters lists
@@ -202,7 +213,8 @@ class GrepSecrets(unittest.TestCase):
                   "sub/c.md", "sub/deep/d.json"):
             open(os.path.join(self.repo, f), "w").write("x\n")
         globs = ["*.py", "*.json", "!*.json", "!/.env", "!.env*", "!**/.env*", "!sub/*", "!sub/**", "**/*.py", "src/**",
-                 "*.{py,md}", "!*.{json,env}", "!{.env*,webhook.env}", "*.md", "sub/*.md", "!/sub", "!build", "*", "!webhook.env", "sub/*.json", "!src/x/*"]
+                 "*.{py,md}", "!*.{json,env}", "!{.env*,webhook.env}", "*.md", "sub/*.md", "!/sub", "!build", "*", "!webhook.env", "sub/*.json", "!src/x/*",
+                 "webhoo\\k.env"]
         allowed = 0
         for g in globs + [""]:
             inp = {"glob": g} if g else {}

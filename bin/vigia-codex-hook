@@ -30,8 +30,9 @@ def main():
     patch = tool == "apply_patch"
     files = patch_files(inp.get("command")) if patch else []
     # --protect-tests: only paths inside the run cwd (and task dir if set)
-    roots = [x for x in (os.environ.get("VIGIA_CWD"), os.environ.get("VIGIA_TASK_DIR"), os.getcwd()) if x]
-    tests = [p for p in files if is_test(p, roots=roots)]
+    task_dir = os.environ.get("VIGIA_TASK_DIR") or None
+    roots = [x for x in (os.environ.get("VIGIA_CWD"), task_dir, os.getcwd()) if x]
+    tests = [p for p in files if is_test(p, roots=roots, task_dir=task_dir)]
     deny = name == "PreToolUse" and patch and os.environ.get("VIGIA_PROTECT_TESTS") == "1" and tests
     if target:
         rec = {"ts": now_iso(), "hook_event_name": name, "session_id": ev.get("session_id"), "origin": "codex"}

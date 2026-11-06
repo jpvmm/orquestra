@@ -2,12 +2,15 @@
 """Claude Code hook (enabled per run via `--settings $ORQUESTRA_HOME/bin/claude-hooks.json`).
 Reads the hook event JSON on stdin and appends a short line to $VIGIA_HEARTBEAT (set by vigia-run).
 Outside Vigia (no VIGIA_HEARTBEAT) it does nothing. Never prints to stdout and always exits 0,
-except: with VIGIA_PROTECT_TESTS=1 it denies (PreToolUse) edits to test files."""
-import hashlib, json, os, re, sys
+except: with VIGIA_PROTECT_TESTS=1 it denies (PreToolUse) edits to protected test files (the ones that exist on
+the base, via T/.fleet/protected-tests.txt; without that file, any test) inside the run cwd/task dir."""
+import hashlib, json, os, sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*$|(^|/)[^/]*_test\.[^/]+$|\.spec\.[^/]+$|\.test\.[^/]+$|(^|/)conftest\.py$")
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from vigia_lib import is_test
 EDIT = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 DENY_MSG = "Test file protected by Vigia: do not edit tests in this task."
 
@@ -28,21 +31,14 @@ def main():
     tool = ev.get("tool_name")
     inp = ev.get("tool_input") or {}
     file_path = inp.get("file_path") or inp.get("notebook_path")
-    def under_roots(path):
-        roots = [x for x in (os.environ.get("VIGIA_CWD"), os.environ.get("VIGIA_TASK_DIR")) if x]
-        if not roots or not path or not os.path.isabs(path):
-            return True
-        abs_p = os.path.abspath(path)
-        for r in roots:
-            root = os.path.abspath(r)
-            if root == os.sep or abs_p == root or abs_p.startswith(root + os.sep):
-                return True
-        return False
-
+    task_dir = os.environ.get("VIGIA_TASK_DIR") or None
+    roots = [x for x in (os.environ.get("VIGIA_CWD"), task_dir) if x]
     deny = (name == "PreToolUse" and tool in EDIT and os.environ.get("VIGIA_PROTECT_TESTS") == "1"
-             and file_path and TEST_RE.search(file_path) and under_roots(file_path))
+            and file_path and is_test(file_path, roots=roots or None, task_dir=task_dir))
     if target:
         rec = {"ts": now_iso(), "hook_event_name": name, "session_id": ev.get("session_id")}
+        if ev.get("agent_id"):   # tool call made by a subagent (not the run's own)
+            rec["agent_id"] = ev.get("agent_id")
         if tool:
             rec["tool_name"] = tool
             rec["tool_input"] = {k: (str(v)[:500]) for k, v in inp.items()

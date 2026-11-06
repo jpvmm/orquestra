@@ -93,7 +93,9 @@ inside the lead do NOT count (practical limit ~20). Hence `max_parallel=4`: lead
 - `tasks.json` `files` must list EVERY file a task may edit (including "only if needed" ones): waves only keep
   same-file tasks apart through that list.
 - Codex dev has no network: HTTP/socket tests fail there; the lead runs those in the integration.
-- The lead does NOT use the Vigia's `--protect-tests` (devs write tests first on purpose).
+- The lead runs with `--protect-tests`, scoped by `T/.fleet/protected-tests.txt` (the base commit's test files,
+  snapshot at `fleet-wt init`): devs may ADD test files (TDD) but not edit existing ones; a subagent's attempt is denied
+  and recorded as an alert, while the lead's own attempt stops the run as `loop`.
 - Vigia secret redaction may turn text like `pwd: ...` into `***` in conversation.md (false positive).
 
 ## Tests

@@ -444,18 +444,81 @@ def _under_roots(path, roots):
     return False
 
 
-def is_test(path, roots=None):
-    """Is this a test file? If roots is given, only paths inside the cwd/worktree count."""
-    if not path:
-        return False
-    p = str(path)
-    if not _under_roots(p, roots):
-        return False
-    return bool(TEST_RE.search(p))
+class ProtectedTests:
+    """--protect-tests protects the test files that already exist on the base commit.
+
+    fleet-run snapshots them into T/.fleet/protected-tests.txt (one repo-relative path per line). With the
+    snapshot only those paths are protected, so TDD can add NEW test files. Without it (older task folders,
+    raw vigia-run) every test-named path is protected, as before."""
+
+    REL = os.path.join(".fleet", "protected-tests.txt")
+
+    @staticmethod
+    def path(task_dir):
+        return os.path.join(task_dir, ProtectedTests.REL) if task_dir else None
+
+    @staticmethod
+    def snapshot(repo, rev, task_dir):
+        """Write the base commit's test files to T/.fleet/protected-tests.txt; return (path, count)."""
+        import subprocess
+        out = subprocess.run(["git", "ls-tree", "-r", "-z", "--name-only", rev], cwd=repo,
+                             capture_output=True, text=True, check=True).stdout
+        tests = sorted(p for p in out.split("\0") if p and TEST_RE.search(p))
+        dest = ProtectedTests.path(task_dir)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp = dest + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("".join(t + "\n" for t in tests))
+        os.replace(tmp, dest)
+        return dest, len(tests)
+
+    @staticmethod
+    def load(task_dir):
+        """frozenset of protected repo-relative paths, or None when there is no snapshot."""
+        p = ProtectedTests.path(task_dir)
+        if not p or not os.path.isfile(p):
+            return None
+        with open(p, encoding="utf-8") as f:
+            return frozenset(ln.rstrip("\n") for ln in f if ln.strip())
+
+    @staticmethod
+    def candidates(path, roots, task_dir):
+        """Repo-relative forms of path: after T/wt/<worktree>/, or relative to a root, or as given."""
+        p = str(path)
+        if not os.path.isabs(p):
+            return {os.path.normpath(p)}
+        p = os.path.abspath(p)
+        out = set()
+        if task_dir:
+            wt = os.path.join(os.path.abspath(task_dir), "wt") + os.sep
+            if p.startswith(wt):
+                rest = p[len(wt):].split(os.sep, 1)
+                if len(rest) == 2:
+                    out.add(rest[1])
+        for r in roots or []:
+            r = os.path.abspath(r)
+            if p.startswith(r + os.sep):
+                out.add(os.path.relpath(p, r))
+        return out
+
+    @staticmethod
+    def is_protected(path, roots=None, task_dir=None):
+        if not path or not _under_roots(str(path), roots):
+            return False
+        listed = ProtectedTests.load(task_dir)
+        if listed is None:
+            return bool(TEST_RE.search(str(path)))
+        return bool(ProtectedTests.candidates(path, roots, task_dir) & listed)
 
 
-def shell_test_writes(cmd, roots=None):
-    """Heuristic: test-file paths that a shell command appears to write or delete."""
+def is_test(path, roots=None, task_dir=None):
+    """Protected test file? Only inside the cwd/worktree when roots is given; with T/.fleet/protected-tests.txt
+    only the base's existing tests count (new test files are allowed)."""
+    return ProtectedTests.is_protected(path, roots, task_dir)
+
+
+def shell_test_writes(cmd, roots=None, task_dir=None):
+    """Heuristic: protected test paths that a shell command appears to write or delete."""
     found = []
     for m in SHELL_WRITE_RE.finditer(cmd or ""):
         target = m.group(1) or m.group(2) or ""
@@ -463,7 +526,7 @@ def shell_test_writes(cmd, roots=None):
             tok = tok.strip("'\"")
             if tok.startswith("-") or tok == "/dev/null":
                 continue
-            if is_test(tok, roots=roots):
+            if is_test(tok, roots=roots, task_dir=task_dir):
                 found.append(tok)
     return found
 

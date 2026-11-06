@@ -134,19 +134,30 @@ class Analyzer:
                 rs.append(c)
         return rs
 
-    def _edit(self, path, file_content=""):
+    def _edit(self, path, file_content="", own=True):
+        """own=False: an edit by a subagent of this run (the lead's devs). The hook already denies protected tests
+        for them; here it is only an alert and it does not count toward this run's scope/loop signals."""
         if not path:
+            return
+        protected = self.a.protect_tests and V.is_test(path, roots=self._protect_roots(), task_dir=self.a.task_dir)
+        if not own:
+            if protected:
+                self._plain_alert(f"subagent tried to edit a protected test: {path}")
             return
         self.files.add(path)
         self.edits_since_test.append(V.h(path, file_content))
-        if self.a.protect_tests and V.is_test(path, roots=self._protect_roots()) and not self.loop:
+        if protected and not self.loop:
             self.loop = f"touched a protected test file: {path}"
         if self.a.max_files and len(self.files) > self.a.max_files and not self.loop:
             self.loop = f"growing scope: {len(self.files)} files edited (> --max-files {self.a.max_files})"
 
-    def _shell(self, cmd):
-        for p in V.shell_test_writes(cmd, roots=self._protect_roots()):
-            self._edit(p, "shell:" + cmd)
+    def _plain_alert(self, txt):
+        if txt not in self.alerts and len(self.alerts) < 10:
+            self.alerts.append(txt)
+
+    def _shell(self, cmd, own=True):
+        for p in V.shell_test_writes(cmd, roots=self._protect_roots(), task_dir=self.a.task_dir):
+            self._edit(p, "shell:" + cmd, own)
 
     def _test(self, cmd, output, failed):
         sig = V.h(sorted(self.edits_since_test), V.normalize(cmd, 200), V.normalize(output, 600), failed)
@@ -188,12 +199,14 @@ class Analyzer:
                         self.conv.subagent_call(c.get("id"), inp.get("subagent_type"), inp.get("description"), inp.get("prompt"))
                     else:
                         self._conv("tool", C.tool_line(name, inp), who)
-                    self._tool_call()
+                    own = not who   # loop/scope signals count only this run's own calls, not its subagents'
+                    if own:
+                        self._tool_call()
                     if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
                         self._edit(inp.get("file_path") or inp.get("notebook_path"),
-                                   json.dumps(inp, sort_keys=True)[:5000])
+                                   json.dumps(inp, sort_keys=True)[:5000], own)
                     elif name == "Bash":
-                        self._shell(inp.get("command", ""))
+                        self._shell(inp.get("command", ""), own)
                 elif c.get("type") == "text" and c.get("text"):
                     if not who:
                         self.last_msg = c["text"]
@@ -210,9 +223,12 @@ class Analyzer:
                 if name in ("Task", "Agent"):
                     self._conv("sub_result", content, (inp or {}).get("subagent_type") or "subagent")
                 if c.get("is_error"):
-                    self._error(f"tool:{name}", content)
+                    if ev.get("parent_tool_use_id"):   # a subagent's failed call: not this run's loop signal
+                        self._alert(str(content))
+                    else:
+                        self._error(f"tool:{name}", content)
                     self._conv("error", f"{name}: {str(content)[:300]}")
-                if name == "Bash" and V.TEST_CMD_RE.search(inp.get("command", "")):
+                if name == "Bash" and V.TEST_CMD_RE.search(inp.get("command", "")) and not ev.get("parent_tool_use_id"):
                     self._test(inp.get("command", ""), content, bool(c.get("is_error")))
         elif t == "rate_limit_event":
             info = ev.get("rate_limit_info") or {}
@@ -320,19 +336,24 @@ class Analyzer:
             return self.codex_hook(ev)
         if self.stream_claude:
             return
+        own = not ev.get("agent_id")   # hook events from a subagent carry agent_id
         if event_name == "PostToolUse" or event_name == "PostToolUseFailure":
             name, inp = ev.get("tool_name"), ev.get("tool_input") or {}
-            self._tool_call()
+            if own:
+                self._tool_call()
             if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
-                self._edit(inp.get("file_path") or inp.get("notebook_path"), ev.get("edit_sig", ""))
+                self._edit(inp.get("file_path") or inp.get("notebook_path"), ev.get("edit_sig", ""), own)
             if name == "Bash":
-                self._shell(inp.get("command", ""))
-                if V.TEST_CMD_RE.search(inp.get("command", "")):
+                self._shell(inp.get("command", ""), own)
+                if own and V.TEST_CMD_RE.search(inp.get("command", "")):
                     self._test(inp.get("command", ""), ev.get("output", ""), event_name == "PostToolUseFailure")
             if event_name == "PostToolUseFailure":
-                self._error(f"tool:{name}", ev.get("error", ""))
+                if own:
+                    self._error(f"tool:{name}", ev.get("error", ""))
+                else:
+                    self._alert(ev.get("error", ""))
         elif event_name == "PreToolUse" and ev.get("denied"):
-            self._edit(ev.get("path"), "denied")
+            self._edit(ev.get("path"), "denied", own)
         elif event_name == "StopFailure":
             self._alert(str(ev.get("error", "")) + " " + str(ev.get("matcher", "")))
         elif event_name == "SubagentStop":

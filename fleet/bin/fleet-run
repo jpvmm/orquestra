@@ -167,6 +167,11 @@ def main():
         if r.returncode != 0: fail(f"fleet-wt init: {r.stderr.strip()}")
         st = json.loads(r.stdout)
         fj["base"], fj["integration"] = st["base"], st["integration"]
+        # --protect-tests protects the tests that exist on the base; new test files stay allowed (TDD)
+        sys.path.insert(0, VIGIA_BIN)
+        from vigia_lib import ProtectedTests
+        # rewritten on every start from the base commit, so a tampered list does not survive a relaunch
+        fj["protected_tests"] = {"file": ProtectedTests.snapshot(repo, st["base"], T)[0]}
     integ = fj.get("integration") or os.path.join(T, "wt", "integration")
     agents = build_agents(roles, os.path.join(T, ".fleet", "agents.json"))
 
@@ -198,7 +203,10 @@ def main():
                   f"Finish with T/FINAL-SUMMARY.md in the fixed format; that is your only final reply.")
         mx = a.max_min or (120 if cx == "M" else 240)
         vr = ["--tool", lead["tool"], "--task-dir", T, "--name", name, "--cwd", integ, "--task", a.task,
-              "--max-min", str(mx), "--stall-min", "20", "--max-files", "80"]
+              "--max-min", str(mx), "--stall-min", "20", "--max-files", "80",
+              "--protect-tests"]   # the lead's dev subagents run inside its process: the hook protects base tests for them
+        if fj.get("base"):
+            vr += ["--protect-base", fj["base"]]   # argv, out of the agents' reach: end-of-run content check
         if lead["tool"] == "claude":
             env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"   # headless: a background subagent dies when the turn ends
             cmd = claude_cmd(prompt, "team-lead", lead["model"], 200 if cx == "M" else 400, tools_rw, [T, HERE])
@@ -227,7 +235,8 @@ def main():
             if dev["tool"] == "claude":
                 cmd = claude_cmd(prompt, "dev", dev["model"], 80, "Read,Edit,Write,Grep,Glob,Bash", [T])
                 info = vigia_run(["--tool", "claude", "--task-dir", T, "--name", name, "--cwd", wt, "--task", a.task,
-                                  "--max-min", str(a.max_min or 40), "--max-files", "30"], cmd, env, a.dry_run)
+                                  "--max-min", str(a.max_min or 40), "--max-files", "30", "--protect-tests"]
+                                 + (["--protect-base", fj["base"]] if fj.get("base") else []), cmd, env, a.dry_run)
             else:
                 env["FLEET_NOTIFY_SUBRUNS"] = "1"
                 cmd = [os.path.join(BIN, "codex-dev"), "--task-dir", T, "--name", name, "--cwd", wt, "--prompt-file", brief,

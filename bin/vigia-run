@@ -740,6 +740,8 @@ def supervise(a, paths, key, notifier=None):
         st.get("summary") or "",
         " ".join(st.get("alerts") or []),
         str(an.last_error or ""),
+        str((an.result or {}).get("result") or "")[-2000:],   # the limit can be the final result (stdout, exit 0)
+        str(an.last_msg or "")[-2000:],
     ])
     try:
         with open(paths["stderr"], errors="replace") as _ef:
@@ -754,6 +756,8 @@ def supervise(a, paths, key, notifier=None):
         fb["role"] = role
         if fb["action"] == "fallback_tool":
             fb["pending"] = True          # launched by run_supervisor once this run has left active/
+            fb["prior_state"] = st.get("state")
+            st["state"] = "limit_handoff"  # not terminal: waiters keep waiting until the relaunch is decided
         else:
             try:
                 fb["resume_file"] = V.LimitFallback.resume_file(a.task_dir, name=a.name, role=role,
@@ -1068,9 +1072,11 @@ def run_supervisor(a, paths, key, entry):
                     cur["limit_fallback"] = fb
                     if fb["relaunch"].get("launched"):
                         cur["state"] = "limit_fallback"
+                        cur["fallback_status_path"] = fb["relaunch"].get("status_path")
                         cur["summary"] = (f"Claude limit: review relaunched on Codex as {fb['relaunch']['name']} | "
                                           + (cur.get("summary") or ""))[:500]
                     else:
+                        cur["state"] = fb.get("prior_state") or "failed"
                         cur["summary"] = (f"Claude limit: Codex fallback FAILED to launch "
                                           f"({fb['relaunch'].get('error', '?')[:160]}) | " + (cur.get("summary") or ""))[:500]
                     V.write_json_atomic(paths["status"], C.redact_obj(cur))

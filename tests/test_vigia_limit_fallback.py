@@ -143,6 +143,42 @@ class VigiaRunEndToEnd(unittest.TestCase):
             self.assertEqual(st["state"], "limit_paused")
             self.assertNotIn("incomplete_reason", st)
 
+    def review_with_stdout_limit(self, td, codex_script):
+        """A Claude review whose stream ends with the limit as its final result (stdout, exit 0)."""
+        import json, stat, subprocess
+        fb = os.path.join(td, "fbin"); os.makedirs(fb)
+        with open(os.path.join(fb, "fleet-codex"), "w") as f:
+            f.write(codex_script)
+        os.chmod(os.path.join(fb, "fleet-codex"), 0o755)
+        fake = os.path.join(td, "claude-fake")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\ncat <<'EOF'\n" + json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                                           "result": SAMPLE}) + "\nEOF\nexit 0\n")
+        os.chmod(fake, 0o755)
+        env = dict(os.environ, VIGIA_BASE=os.path.join(td, "v"), VIGIA_WEBHOOK_ENV="", VIGIA_POLL_SEC="0.3", FLEET_BIN=fb)
+        cmd = [os.path.join(ROOT, "bin", "vigia-run"), "--tool", "claude", "--task-dir", td, "--name", "fleet-x-rev-1",
+               "--role", "review", "--output", os.path.join(td, "review", "r.md"), "--foreground", "--", fake, "-p", "review it"]
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.load(open(os.path.join(td, "runs", "fleet-x-rev-1.status.json")))
+
+    def test_limit_in_final_result_falls_back_and_waiters_see_a_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp, seen = os.path.join(td, "runs", "fleet-x-rev-1.status.json"), os.path.join(td, "seen")
+            st = self.review_with_stdout_limit(td, (
+                f"#!/bin/sh\npython3 -c \"import json;print(json.load(open('{sp}'))['state'])\" > {seen}\n"
+                "echo '{\"state\": \"running\", \"status_path\": \"/s/new.json\"}'\n"))
+            self.assertEqual(open(seen).read().strip(), "limit_handoff")   # not terminal while the relaunch is decided
+            self.assertNotIn("limit_handoff", V.FINAL_STATES)
+            self.assertEqual(st["state"], "limit_fallback")
+            self.assertEqual(st["fallback_status_path"], "/s/new.json")
+
+    def test_failed_relaunch_restores_the_prior_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            st = self.review_with_stdout_limit(td, "#!/bin/sh\necho '{\"error\": \"cap\"}'\nexit 3\n")
+            self.assertNotIn(st["state"], ("limit_handoff", "limit_fallback"))
+            self.assertIn("FAILED", st["summary"])
+
     def test_codex_run_is_not_a_claude_limit(self):
         with tempfile.TemporaryDirectory() as td:
             st = self.run_v(td, "codex", "lead")

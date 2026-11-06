@@ -87,7 +87,8 @@ def base_tests_changed(a):
     if not (a.protect_tests and a.protect_base):
         return []
     dirs = [a.cwd] + sorted(glob.glob(os.path.join(a.task_dir, "wt", "*")))
-    return V.ProtectedTests.modified(a.protect_base, list(dict.fromkeys(dirs)))
+    expected = V.ProtectedTests.snapshot_for(a.task_dir, a.cwd, a.protect_base)
+    return V.ProtectedTests.modified(a.protect_base, list(dict.fromkeys(dirs)), expected)
 
 
 # ======================= event analysis =======================

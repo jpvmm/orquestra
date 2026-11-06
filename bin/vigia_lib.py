@@ -444,11 +444,22 @@ def _under_roots(path, roots):
     return False
 
 
+def git_plain(repo, *args, **kw):
+    """git for protection checks: replacement refs (`git replace`) ignored, so an agent cannot swap the base."""
+    import subprocess
+    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        env.pop(k, None)
+    return subprocess.run(["git", "--no-replace-objects", "-C", repo, *args], capture_output=True, text=True, env=env, **kw)
+
+
 def rev_sha(repo, rev):
     """Full commit sha of rev in repo (raises CalledProcessError if it is not a commit)."""
     import subprocess
-    return subprocess.run(["git", "-C", repo, "rev-parse", "--verify", rev + "^{commit}"], capture_output=True,
-                          text=True, check=True).stdout.strip()
+    r = git_plain(repo, "rev-parse", "--verify", rev + "^{commit}")
+    if r.returncode != 0:
+        raise subprocess.CalledProcessError(r.returncode, "git rev-parse", r.stdout, r.stderr)
+    return r.stdout.strip()
 
 
 class ProtectedTests:
@@ -469,8 +480,10 @@ class ProtectedTests:
     def snapshot(repo, rev, task_dir):
         """Write the base commit's test files to the protected list of task_dir; return (path, count)."""
         import subprocess
-        out = subprocess.run(["git", "ls-tree", "-r", "-z", "--name-only", rev], cwd=repo,
-                             capture_output=True, text=True, check=True).stdout
+        r = git_plain(repo, "ls-tree", "-r", "-z", "--name-only", rev)
+        if r.returncode != 0:
+            raise subprocess.CalledProcessError(r.returncode, "git ls-tree", r.stdout, r.stderr)
+        out = r.stdout
         tests = sorted(p for p in out.split("\0") if p and TEST_RE.search(p))
         dest = ProtectedTests.path(task_dir)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -498,8 +511,7 @@ class ProtectedTests:
         """Test files of commit rev, or None when git cannot read it."""
         import subprocess
         try:
-            out = subprocess.run(["git", "-C", repo, "ls-tree", "-r", "-z", "--name-only", rev],
-                                 capture_output=True, text=True, timeout=20)
+            out = git_plain(repo, "ls-tree", "-r", "-z", "--name-only", rev, timeout=20)
         except (OSError, subprocess.SubprocessError):
             return None
         if out.returncode != 0:
@@ -514,35 +526,61 @@ class ProtectedTests:
         base = os.environ.get("VIGIA_PROTECT_BASE") or ProtectedTests.recorded_base(task_dir)
         repo = os.environ.get("VIGIA_CWD")
         if base and repo:
-            return ProtectedTests.from_git(repo, base)   # None (git failed) → fail closed
-        p = ProtectedTests.path(task_dir)
-        if not p or not os.path.isfile(p):
-            return None
-        with open(p, encoding="utf-8") as f:
-            listed = frozenset(ln.rstrip("\n") for ln in f if ln.strip())
+            got = ProtectedTests.from_git(repo, base)   # None (git failed) → fail closed
+            if got is None:
+                return None
+            return got | ProtectedTests.snapshot_for(task_dir, repo, base)
+        listed = ProtectedTests.listed(task_dir)
         return listed or None
+
+    @staticmethod
+    def listed(task_dir):
+        """Paths in the snapshot file written by fleet-run before any agent ran (empty set if none)."""
+        p = ProtectedTests.path(task_dir)
+        try:
+            with open(p, encoding="utf-8") as f:
+                return frozenset(ln.rstrip("\n") for ln in f if ln.strip())
+        except (OSError, TypeError):
+            return frozenset()
+
+    @staticmethod
+    def snapshot_for(task_dir, repo, base):
+        """The snapshot list when it was taken at this same base commit (kept outside the repo, so rewriting git
+        objects or refs in the repo cannot shrink it); else an empty set."""
+        import subprocess
+        rec = ProtectedTests.recorded_base(task_dir)
+        if not rec:
+            return frozenset()
+        try:
+            same = rec == rev_sha(repo, base)
+        except (OSError, subprocess.SubprocessError):
+            same = rec.startswith(base) and len(base) >= 7
+        return ProtectedTests.listed(task_dir) if same else frozenset()
 
     @staticmethod
     def blob_id(path, hexlen=40):
         """Git blob id of the raw file bytes, computed here: no git filters/attributes/config from the worktree run."""
-        import hashlib
         with open(path, "rb") as f:
-            data = f.read()
+            return ProtectedTests.blob_id_bytes(f.read(), hexlen)
+
+    @staticmethod
+    def blob_id_bytes(data, hexlen=40):
+        import hashlib
         algo = hashlib.sha256 if hexlen == 64 else hashlib.sha1
         return algo(b"blob %d\0" % len(data) + data).hexdigest()
 
     @staticmethod
-    def modified(base, dirs):
+    def modified(base, dirs, expected=frozenset()):
         """Problems with the base tests in the git worktrees dirs, as 'dir: path' (changed or deleted) or
-        'dir: cannot verify ...'. Compares the raw file bytes with the base blobs (hashed here, no git filters),
-        so renames, index flags, clean filters or any shell trick cannot hide a change. Fails closed: anything
-        that cannot be checked is reported. vigia-run runs it when a protected run ends."""
+        'dir: cannot verify ...'. Compares the raw file bytes with the base blobs (hashed here, no git filters, no
+        replace refs), so renames, index flags, clean filters or any shell trick cannot hide a change; symlinks are
+        compared by target. Fails closed: anything that cannot be checked is reported. expected = paths that must be in the base (fleet-run's snapshot); one
+        missing from the base tree is reported too. vigia-run runs it when a protected run ends."""
         import subprocess
         out = []
         for d in dirs:
             try:
-                ls = subprocess.run(["git", "-C", d, "ls-tree", "-r", "-z", base], capture_output=True, text=True,
-                                    timeout=60)
+                ls = git_plain(d, "ls-tree", "-r", "-z", base, timeout=60)
                 if ls.returncode != 0:
                     out.append(f"{d}: cannot verify protected tests (git ls-tree {base[:12]} failed)")
                     continue
@@ -550,13 +588,21 @@ class ProtectedTests:
                 for ent in ls.stdout.split("\0"):
                     if "\t" in ent:
                         meta, path = ent.split("\t", 1)
-                        if meta.split()[1] == "blob" and TEST_RE.search(path):
-                            blobs[path] = meta.split()[2]
+                        mode, kind, oid = meta.split()
+                        if kind == "blob" and TEST_RE.search(path):
+                            blobs[path] = (mode, oid)
+                out += [f"{d}: {p} (not in the base tree: cannot verify)" for p in sorted(set(expected) - set(blobs))]
                 for p in sorted(blobs):
+                    mode, oid = blobs[p]
                     f = os.path.join(d, p)
-                    if not os.path.isfile(f) or os.path.islink(f):
-                        out.append(f"{d}: {p} (deleted)")
-                    elif ProtectedTests.blob_id(f, len(blobs[p])) != blobs[p]:
+                    if mode == "120000":     # symlink: the blob is the link target
+                        if not os.path.islink(f):
+                            out.append(f"{d}: {p} (deleted)" if not os.path.lexists(f) else f"{d}: {p}")
+                        elif ProtectedTests.blob_id_bytes(os.fsencode(os.readlink(f)), len(oid)) != oid:
+                            out.append(f"{d}: {p}")
+                    elif os.path.islink(f) or not os.path.isfile(f):
+                        out.append(f"{d}: {p} (deleted)" if not os.path.lexists(f) else f"{d}: {p}")
+                    elif ProtectedTests.blob_id(f, len(oid)) != oid:
                         out.append(f"{d}: {p}")
             except (OSError, subprocess.SubprocessError) as e:
                 out.append(f"{d}: cannot verify protected tests ({type(e).__name__})")

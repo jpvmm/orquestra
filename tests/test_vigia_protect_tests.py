@@ -162,6 +162,33 @@ class TrustedBase(unittest.TestCase):
         os.environ["VIGIA_PROTECT_BASE"], os.environ["VIGIA_CWD"] = self.base, self.repo
         self.assertEqual(V.ProtectedTests.load(self.T), frozenset({"tests/test_old.py"}))   # git, not the file
 
+    def test_git_replace_cannot_swap_the_base(self):
+        import subprocess
+        g = lambda *c: subprocess.run(["git", *c], cwd=self.repo, check=True, env=self.e, capture_output=True, text=True)
+        empty_tree = g("hash-object", "-t", "tree", "-w", "/dev/null").stdout.strip()
+        fake = g("commit-tree", empty_tree, "-m", "no tests").stdout.strip()
+        g("replace", self.base, fake)                                   # the agent swaps the base for an empty commit
+        V.ProtectedTests.snapshot(self.repo, self.base, self.T)
+        os.environ["VIGIA_PROTECT_BASE"], os.environ["VIGIA_CWD"] = self.base, self.repo
+        self.assertEqual(V.ProtectedTests.load(self.T), frozenset({"tests/test_old.py"}))
+        os.remove(os.path.join(self.repo, "tests", "test_old.py"))
+        self.assertIn(f"{self.repo}: tests/test_old.py (deleted)", V.ProtectedTests.modified(self.base, [self.repo]))
+
+    def test_snapshot_paths_missing_from_the_base_are_reported(self):
+        bad = V.ProtectedTests.modified(self.base, [self.repo], frozenset({"tests/test_old.py", "tests/test_gone.py"}))
+        self.assertEqual(bad, [f"{self.repo}: tests/test_gone.py (not in the base tree: cannot verify)"])
+
+    def test_unchanged_symlinked_test_is_fine_and_a_retarget_is_caught(self):
+        import subprocess
+        os.symlink("test_old.py", os.path.join(self.repo, "tests", "test_link.py"))
+        for c in (["git", "add", "."], ["git", "commit", "-qm", "link"]):
+            subprocess.run(c, cwd=self.repo, check=True, env=self.e)
+        base = V.rev_sha(self.repo, "HEAD")
+        self.assertEqual(V.ProtectedTests.modified(base, [self.repo]), [])
+        os.remove(os.path.join(self.repo, "tests", "test_link.py"))
+        os.symlink("/dev/null", os.path.join(self.repo, "tests", "test_link.py"))
+        self.assertEqual(V.ProtectedTests.modified(base, [self.repo]), [f"{self.repo}: tests/test_link.py"])
+
     def test_clean_filter_cannot_hide_a_change(self):
         import shutil, subprocess
         keep = os.path.join(self.tmp.name, "orig.py")

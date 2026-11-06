@@ -130,6 +130,19 @@ class VigiaRunEndToEnd(unittest.TestCase):
             res = json.load(open(os.path.join(td, ".fleet", "limit-resume.json")))
             self.assertEqual(res["resume_command"], ["/x/fleet-run", "--complexity", "M"])
 
+    def test_lead_exit_0_with_limit_stays_paused_not_incomplete(self):
+        import json, subprocess
+        with tempfile.TemporaryDirectory() as td:
+            env = dict(os.environ, VIGIA_BASE=os.path.join(td, "v"), VIGIA_WEBHOOK_ENV="", VIGIA_POLL_SEC="0.3")
+            cmd = [os.path.join(ROOT, "bin", "vigia-run"), "--tool", "claude", "--task-dir", td,
+                   "--name", "fleet-x-lead-1", "--role", "lead", "--foreground", "--",
+                   "sh", "-c", f"echo \"{SAMPLE}\" >&2; exit 0"]
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            st = json.load(open(os.path.join(td, "runs", "fleet-x-lead-1.status.json")))
+            self.assertEqual(st["state"], "limit_paused")
+            self.assertNotIn("incomplete_reason", st)
+
     def test_codex_run_is_not_a_claude_limit(self):
         with tempfile.TemporaryDirectory() as td:
             st = self.run_v(td, "codex", "lead")

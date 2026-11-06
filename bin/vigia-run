@@ -788,6 +788,8 @@ def supervise(a, paths, key, notifier=None):
         st["summary"] = re.sub(r"\s+", " ", str(base)).strip()[:300]
     if st["alerts"]:
         st["summary"] = (st["summary"] + " | ALERT: " + "; ".join(st["alerts"][:3]))[:500]
+    if incomplete and st.get("state") == "limit_paused":
+        incomplete = None   # the limit explains the missing summary: keep the resumable state, not 'incomplete'
     if incomplete:
         st["state"] = "incomplete"
         st["incomplete_reason"] = incomplete

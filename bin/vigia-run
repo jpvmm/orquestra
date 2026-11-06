@@ -774,6 +774,15 @@ def supervise(a, paths, key, notifier=None):
             fb["pending"] = True          # launched by run_supervisor once this run has left active/
             fb["prior_state"] = st.get("state")
             st["state"] = "limit_handoff"  # not terminal: waiters keep waiting until the relaunch is decided
+            new = (a.name[:76] + "-cx")   # LimitFallback.launch_codex_review's name
+            st["handoff"] = {"supervisor_pid": os.getpid(), "supervisor_start": (V.proc_stat(os.getpid()) or {}).get("start"),
+                             "since": V.now_iso(),
+                             "replacement_status": os.path.join(a.task_dir, "runs", new + ".status.json")}
+            try:   # survives this supervisor: an interrupted handoff is finished by reconcile_handoff
+                os.makedirs(os.path.dirname(V.handoff_marker(paths["status"])), exist_ok=True)
+                C.write_atomic(V.handoff_marker(paths["status"]), json.dumps({"status_path": paths["status"]}) + "\n")
+            except OSError as e:
+                st["alerts"].append(f"could not write the handoff marker: {e}")
         else:
             try:
                 fb["resume_file"] = V.LimitFallback.resume_file(a.task_dir, name=a.name, role=role,
@@ -1102,6 +1111,7 @@ def run_supervisor(a, paths, key, entry):
                                           f"({fb['relaunch'].get('error', '?')[:160]}) | " + (cur.get("summary") or ""))[:500]
                     V.write_json_atomic(paths["status"], C.redact_obj(cur))
                     st = cur
+                V._rm(V.handoff_marker(paths["status"]))
         except Exception as e:
             print(f"limit fallback failed: {e}", file=sys.stderr)
             try:   # persist a final state: waiters must not stay on limit_handoff
@@ -1113,6 +1123,7 @@ def run_supervisor(a, paths, key, entry):
                                           + (cur.get("summary") or ""))[:500]
                         V.write_json_atomic(paths["status"], C.redact_obj(cur))
                         st = cur
+                V._rm(V.handoff_marker(paths["status"]))
             except Exception as e2:
                 print(f"could not write the fallback's final state: {e2}", file=sys.stderr)
         # end notification: exactly one (vigia-notify also dedupes per run), after pending notifications

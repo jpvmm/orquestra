@@ -217,5 +217,67 @@ class VigiaRunEndToEnd(unittest.TestCase):
             self.assertNotEqual(st["state"], "limit_paused")
 
 
+class HandoffReconcile(unittest.TestCase):
+    """A supervisor that dies mid-handoff must not leave limit_handoff forever."""
+
+    def setUp(self):
+        import importlib, subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = os.environ.get("VIGIA_BASE")
+        os.environ["VIGIA_BASE"] = os.path.join(self.tmp.name, "vigia")
+        import vigia_lib
+        self.V = importlib.reload(vigia_lib)
+        p = subprocess.Popen(["true"]); p.wait()
+        self.dead = p.pid
+        self.T = os.path.join(self.tmp.name, "T"); os.makedirs(os.path.join(self.T, "runs"))
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop("VIGIA_BASE", None)
+        else:
+            os.environ["VIGIA_BASE"] = self.saved
+        self.tmp.cleanup()
+
+    def status(self, name, pid, start=None):
+        import json
+        sp = os.path.join(self.T, "runs", name + ".status.json")
+        rep = os.path.join(self.T, "runs", name + "-cx.status.json")
+        json.dump({"name": name, "state": "limit_handoff", "summary": "s",
+                   "handoff": {"supervisor_pid": pid, "supervisor_start": start, "replacement_status": rep}},
+                  open(sp, "w"))
+        m = self.V.handoff_marker(sp); os.makedirs(os.path.dirname(m), exist_ok=True)
+        json.dump({"status_path": sp}, open(m, "w"))
+        return sp, rep
+
+    def test_dead_supervisor_without_replacement_is_failed(self):
+        import json
+        sp, _ = self.status("r1", self.dead)
+        self.V.reconcile_handoffs()
+        st = json.load(open(sp))
+        self.assertEqual(st["state"], "failed")
+        self.assertIn("died", st["summary"])
+        self.assertFalse(os.path.exists(self.V.handoff_marker(sp)))
+
+    def test_dead_supervisor_with_replacement_is_limit_fallback(self):
+        import json
+        sp, rep = self.status("r2", self.dead)
+        open(rep, "w").write("{}")
+        self.assertEqual(self.V.reconcile_handoff(sp), "limit_fallback")
+        self.assertEqual(json.load(open(sp))["fallback_status_path"], rep)
+
+    def test_live_supervisor_is_left_alone(self):
+        sp, _ = self.status("r3", os.getpid(), (self.V.proc_stat(os.getpid()) or {}).get("start"))
+        self.assertEqual(self.V.reconcile_handoff(sp), "limit_handoff")
+        self.assertTrue(os.path.exists(self.V.handoff_marker(sp)))
+
+    def test_fleet_wait_finishes_an_orphaned_handoff(self):
+        import json, subprocess
+        sp, _ = self.status("r4", self.dead)
+        fw = os.path.join(ROOT, "fleet", "bin", "fleet-wait")
+        r = subprocess.run([fw, sp, "--max", "1"], capture_output=True, text=True, timeout=30, env=dict(os.environ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(r.stdout)["state"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -172,6 +172,63 @@ def active_entries():
     return out
 
 
+def handoff_marker(sp):
+    """Registry entry (Vigia folder, outside the slot registry) for a run in limit_handoff: survives the supervisor."""
+    return os.path.join(BASE, "handoffs", h(os.path.abspath(sp)) + ".json")
+
+
+def _rm(p):
+    try:
+        os.unlink(p)
+    except (FileNotFoundError, TypeError):
+        pass
+
+
+def reconcile_handoff(sp):
+    """Finish a limit_handoff whose supervisor died: limit_fallback if the Codex replacement run exists (its status
+    file), else failed. Live supervisor → untouched. Returns the run's state."""
+    st = read_json(sp) or {}
+    if st.get("state") != "limit_handoff":
+        _rm(handoff_marker(sp))
+        return st.get("state")
+    ho = st.get("handoff") or {}
+    if alive(ho.get("supervisor_pid"), ho.get("supervisor_start")):
+        return "limit_handoff"
+    with run_lock(sp, wait=5) as ok:
+        if not ok:
+            return "limit_handoff"
+        st = read_json(sp) or {}
+        if st.get("state") == "limit_handoff":
+            sub = ho.get("replacement_status")
+            if sub and os.path.isfile(sub):
+                st.update(state="limit_fallback", fallback_status_path=sub)
+                msg = "Claude limit: supervisor died after the Codex fallback was registered"
+            else:
+                st["state"] = "failed"
+                msg = "Claude limit: supervisor died during the Codex fallback handoff (no replacement run)"
+            st["ended_at"] = st.get("ended_at") or now_iso()
+            st["summary"] = (msg + " | " + (st.get("summary") or ""))[:500]
+            write_json_atomic(sp, st)
+    _rm(handoff_marker(sp))
+    return st.get("state")
+
+
+def reconcile_handoffs():
+    """Every recorded handoff (vigia-run start, vigia-status, waiters): interrupted ones get a final state."""
+    import glob as _g
+    done = []
+    for f in _g.glob(os.path.join(BASE, "handoffs", "*.json")):
+        sp = (read_json(f) or {}).get("status_path")
+        if not sp:
+            _rm(f)
+            continue
+        try:
+            done.append((sp, reconcile_handoff(sp)))
+        except Exception:
+            pass
+    return done
+
+
 def cleanup_dead():
     """Remove registry entries whose supervisor died. If the supervised command is still
     alive (supervisor was killed hard), kill its group and mark the status as killed.
@@ -211,6 +268,10 @@ def cleanup_dead():
         except FileNotFoundError:
             pass
         cleaned.append(e.get("key"))
+    try:
+        reconcile_handoffs()
+    except Exception:
+        pass
     return cleaned
 
 

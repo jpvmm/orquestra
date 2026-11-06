@@ -719,8 +719,6 @@ class HookPolicy:
     SECRET = "Secret file (.env / webhook.env) blocked by Vigia: do not read or write it."
     SECRET_SEARCH = ("Search blocked by Vigia: it would read secret files (.env / webhook.env) in this folder. "
                      "Narrow it with a glob/type that excludes them (e.g. glob='*.py' or type='py').")
-    SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
-             ".next", "target"}
     MAX_ENTRIES = 50000
     # ripgrep 14 default --type globs (rg --type-list); an unknown type is treated as no filter
     TYPE_GLOBS = {
@@ -768,26 +766,58 @@ class HookPolicy:
 
     @staticmethod
     def search_reaches_secret(inp, cwd):
-        """Grep that would read a secret file: walk its root (bounded) and test every file that the full secret rule
-        flags against the glob/type filters the way ripgrep applies them. Too many files to check counts as yes."""
-        import fnmatch
+        """Grep that would read a secret file: walk its root (bounded, no directory skipped) and test every file that the
+        full secret rule flags against the glob/type filters with ripgrep's precedence. Fails closed when unsure."""
         g = str(inp.get("glob") or "")
         t = str(inp.get("type") or "")
         neg = g.startswith("!")
         pats = HookPolicy._globs(g[1:] if neg else g) if g else []
         tglobs = HookPolicy.TYPE_GLOBS.get(t) if t else None
 
-        def match(pat, rel, base):
-            if "/" in pat.strip("/"):
-                return fnmatch.fnmatch(rel, pat.lstrip("/")) or (pat.startswith("**/") and fnmatch.fnmatch(base, pat[3:]))
-            return fnmatch.fnmatch(base, pat)
+        def rx(pat, strict):
+            """Glob -> regex. strict (exclusions): `*`/`?` stay inside one path segment, like ripgrep; loose
+            (inclusions): they may cross `/`. Each choice can only widen what counts as searched."""
+            out, k = "", 0
+            while k < len(pat):
+                if pat.startswith("**/", k):
+                    out += "(?:.*/)?"; k += 3; continue
+                if pat.startswith("**", k):
+                    out += ".*"; k += 2; continue
+                ch = pat[k]
+                if ch == "*":
+                    out += "[^/]*" if strict else ".*"
+                elif ch == "?":
+                    out += "[^/]" if strict else "."
+                elif ch == "[" and pat.find("]", k + 2) > 0:
+                    e = pat.find("]", k + 2)
+                    body = pat[k + 1:e]
+                    body = "^" + body[1:] if body[:1] == "!" else body
+                    out += "[" + body.replace("\\", "\\\\") + "]"
+                    k = e + 1; continue
+                else:
+                    out += re.escape(ch)
+                k += 1
+            return out
+
+        def match(pat, rel, strict):
+            p = pat[1:] if pat.startswith("/") else pat
+            if "/" not in p.rstrip("/"):                      # a bare name matches the file name at any depth
+                return re.fullmatch(rx(p, strict), rel.rsplit("/", 1)[-1]) is not None
+            if strict:                                         # anchored to the search root, like ripgrep
+                return re.fullmatch(rx(p, True), rel) is not None
+            return re.fullmatch("(?:.*/)?" + rx(p, False), rel) is not None   # inclusion: any suffix counts
+
+        if pats and not neg and any(c in x for x in pats for c in "{}"):
+            return True                                  # nested braces are not expanded: assume they reach one
 
         def included(rel):
-            base = rel.rsplit("/", 1)[-1]
-            if pats and (any(match(x, rel, base) for x in pats) == neg):
+            # ripgrep: a positive glob decides alone (it overrides --type); a negated one only excludes, then the type
+            if pats and not neg:
+                return any(match(x, rel, False) for x in pats)
+            if pats and neg and any(match(x, rel, True) for x in pats):
                 return False
-            if tglobs is not None and not any(fnmatch.fnmatch(base, x) for x in tglobs):
-                return False
+            if tglobs is not None:
+                return any(match(x, rel, False) for x in tglobs)
             return True
 
         root = str(inp.get("path") or cwd or "")
@@ -798,7 +828,6 @@ class HookPolicy:
             return touches_secret(os.path.basename(root))
         n = 0
         for dirpath, dirs, files in os.walk(root):
-            dirs[:] = [x for x in dirs if x not in HookPolicy.SKIP_DIRS]
             n += len(files) + len(dirs)
             if n > HookPolicy.MAX_ENTRIES:
                 return True

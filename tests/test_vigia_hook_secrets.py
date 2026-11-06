@@ -161,6 +161,25 @@ class GrepSecrets(unittest.TestCase):
         self.assertIsNone(self.deny(path=self.repo, type="py"))
         self.assertIsNone(self.deny(path=self.repo, glob="*.md"))
 
+    def test_ripgrep_semantics_and_no_skipped_dirs(self):
+        """negated globs do not cross `/`, a positive glob overrides type, build/ etc. are searched too."""
+        os.makedirs(os.path.join(self.repo, "src", "sub"))
+        open(os.path.join(self.repo, "src", "sub", ".env.json"), "w").write("{}\n")
+        self.assertTrue(self.deny(path=self.repo, glob="!src/*.json"))           # src/sub/.env.json is still searched
+        self.assertIsNone(self.deny(path=self.repo, glob="!**/*.json"))
+        self.assertTrue(self.deny(path=self.repo, glob="*.json", type="py"))     # the glob overrides the type
+        self.assertIsNone(self.deny(path=self.repo, glob="*.py", type="json"))
+        self.assertTrue(self.deny(path=self.repo, glob="!*.md", type="json"))    # negation then type
+        os.remove(os.path.join(self.repo, "src", "sub", ".env.json"))
+        for d in ("build", "dist", "node_modules", ".git"):
+            os.makedirs(os.path.join(self.repo, d), exist_ok=True)
+            f = os.path.join(self.repo, d, "webhook.env")
+            open(f, "w").write("T=1\n")
+            self.assertTrue(self.deny(path=self.repo, glob="*"), d)
+            os.remove(f)
+        self.assertIsNone(self.deny(path=self.repo, glob="*"))
+        self.assertTrue(self.deny(path=self.repo, glob="*.{a,{b,c}}"))           # unexpanded nesting fails closed
+
     def test_hook_blocks_and_logs_it_as_secret(self):
         open(os.path.join(self.repo, ".env"), "w").write("TOKEN=abc123456\n")
         hb = os.path.join(self.repo, "hb.jsonl")

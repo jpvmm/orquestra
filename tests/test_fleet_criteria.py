@@ -24,10 +24,13 @@ class CriteriaGate(unittest.TestCase):
     def test_executable_commands_pass(self):
         os.makedirs(os.path.join(self.tmp.name, "bin"), exist_ok=True)
         open(os.path.join(self.tmp.name, "bin", "test_x.py"), "w").write("assert True\n")
+        os.makedirs(os.path.join(self.tmp.name, "checks"), exist_ok=True)
+        open(os.path.join(self.tmp.name, "checks", "c1.sh"), "w").write("#!/bin/sh\ntest -s out\n")
+        os.chmod(os.path.join(self.tmp.name, "checks", "c1.sh"), 0o755)
         for cmd in ("python3 -m pytest -q", "test -s proofs/x.png", "[ -f out.txt ]", "FOO=1 python3 -c 'print(1); x'",
                     "cd sub && python3 -m pytest -q 2>&1", "bash -c 'python3 -m pytest -q'", "timeout 60 python3 -m pytest",
                     "cd bin && python3 test_x.py", "bash -c 'cd bin && python3 test_x.py'", "grep -q needle README.md",
-                    "diff out.txt expected.txt"):
+                    "diff out.txt expected.txt", f"{sys.executable} -m pytest -q", "./checks/c1.sh"):
             self.assertEqual(self.bad(command=cmd), [], cmd)
 
     def test_manual_vacuous_and_masking_rejected(self):
@@ -46,7 +49,10 @@ class CriteriaGate(unittest.TestCase):
                     "exec test -f /etc/passwd && test -s proofs/ui.png", "env exec test -s x",
                     "python3 -m pytest --help", "python3 -m pytest --collect-only", "pwd", "ls", "cat README.md",
                     "python3 -m http.server", "python3 test_x.py", "make -n test", "make", "npm run",
-                    "cd bin && python3 missing.py", "cd $HOME && python3 -m pytest", "grep needle"):
+                    "cd bin && python3 missing.py", "cd $HOME && python3 -m pytest", "grep needle",
+                    f"{sys.executable} -c pass", "/bin/ls", "/usr/bin/env true", "python3 -O -c 'assert False'",
+                    "PYTHONOPTIMIZE=1 python3 -c 'assert False'", "env PYTHONOPTIMIZE=1 python3 -m pytest",
+                    "export PYTHONOPTIMIZE=1 && python3 -m pytest", "python3 -OO -m pytest"):
             self.assertTrue(self.bad(command=cmd), cmd)
 
     def test_scripts_must_exist_and_be_executable(self):

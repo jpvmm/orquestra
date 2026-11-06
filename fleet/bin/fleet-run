@@ -141,6 +141,8 @@ class Criteria:
     GLOBAL_INFO = {"--help", "--version", "-V", "--collect-only", "--co", "--list", "--list-tests", "--dry-run",
                    "--setup-plan", "--fixtures", "--markers"}
     TEST_MODULES = {"pytest", "unittest", "nose2", "doctest"}
+    UNSAFE_ENV = {"PYTHONOPTIMIZE"}   # python -O: `assert` statements are skipped
+    CHECKERS = {"grep", "egrep", "fgrep", "rg", "cmp", "diff", "curl"}
     # program → allowed first operand (None = any); everything else not a script/interpreter/test is refused
     RUNNERS = {"pytest": None, "py.test": None, "jest": None, "vitest": {"run"}, "mocha": None, "bats": None,
                "tox": None, "nox": None, "rspec": None, "phpunit": None, "make": None,
@@ -189,6 +191,8 @@ class Criteria:
         w = list(w)
         while w:
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w[0]):
+                if w[0].split("=", 1)[0] in Criteria.UNSAFE_ENV:
+                    return [Criteria.BAD, f"{w[0].split('=', 1)[0]} disables checks (assertions)"]
                 w = w[1:]
             elif os.path.basename(w[0]) in Criteria.WRAPPERS:
                 wr = os.path.basename(w[0])
@@ -252,6 +256,8 @@ class Criteria:
         if first in Criteria.CONDITIONAL:
             return f"{first} may run nothing and still succeed: call the check directly"
         if first in Criteria.SETUP:
+            if first == "export" and any(x.split("=", 1)[0] in Criteria.UNSAFE_ENV for x in w[1:]):
+                return "exporting PYTHONOPTIMIZE disables assertions"
             return None
         if first in Criteria.VACUOUS:
             return "command proves nothing"
@@ -264,18 +270,26 @@ class Criteria:
             return None
         if any(x in Criteria.GLOBAL_INFO or (x == "-h" and first != "grep") for x in w[1:]):
             return "help/version/listing flags prove nothing"
+        known = (first in Criteria.INTERPRETERS or re.fullmatch(r"python3?(\.\d+)?", first)
+                 or first in Criteria.RUNNERS or first in Criteria.CHECKERS)
         if "/" in w[0]:
             f = Criteria.resolve(w[0], repo)
-            if repo and not (os.path.isfile(f) and os.access(f, os.X_OK)):
+            exists = os.path.isfile(f) and os.access(f, os.X_OK)
+            if not exists and (repo or os.path.isabs(w[0])):
                 return f"{w[0]!r} is not an executable file (relative = current dir; T/checks scripts by absolute path)"
-            return None                  # a script file: its content is the check
-        if not shutil.which(first, path=path):
+            if not known:                # a script: its content is the check; a binary by path proves nothing
+                if exists and not Criteria.is_script(f):
+                    return f"{w[0]!r} is a program, not a check script: call a test runner or a script"
+                return None
+        elif not shutil.which(first, path=path):
             return f"{first!r} is not an executable on PATH"
         if first in Criteria.INTERPRETERS or re.fullmatch(r"python3?(\.\d+)?", first):
             script, inline = None, False
             for i, x in enumerate(w[1:], 1):
                 if x in Criteria.INFO_FLAGS:
                     return f"{first} {x} proves nothing"
+                if first.startswith("python") and re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", x):
+                    return f"{first} {x} disables assertions"
                 if x == "-m":
                     mod = w[i + 1] if i + 1 < len(w) else ""
                     if mod not in Criteria.TEST_MODULES:
@@ -301,6 +315,16 @@ class Criteria:
                         f"absolute path; they exist before the run)")
             return None
         return Criteria.runner_problem(first, w)
+
+    @staticmethod
+    def is_script(f):
+        """A text check script (shell runs it), not a compiled program (ELF / binary bytes)."""
+        try:
+            with open(f, "rb") as fh:
+                head = fh.read(4096)
+        except OSError:
+            return False
+        return not head.startswith(b"\x7fELF") and b"\0" not in head
 
     @staticmethod
     def runner_problem(first, w):

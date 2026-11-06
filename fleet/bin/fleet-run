@@ -120,7 +120,16 @@ class Criteria:
     SUBST = re.compile(r"\$\(|`|<\(|>\(")
     VACUOUS = {"true", ":", "echo", "printf", "exit", "false", "yes", "sleep", "read"}
     SETUP = {"cd", "export", "set"}   # allowed before the proving command, never alone
+    BAD = "\0bad"     # words() result head for a refused wrapper option: [BAD, reason]
     WRAPPERS = {"env", "timeout", "nice", "command", "nohup", "time", "exec"}
+    # options each wrapper may take ("=" form allowed for long ones); anything else is refused, not skipped
+    WRAPPER_FLAGS = {"env": {"-i", "--ignore-environment", "-"}, "timeout": {"--preserve-status", "--foreground"},
+                     "nice": set(), "command": set(), "nohup": set(), "time": {"-p"}, "exec": set()}
+    WRAPPER_ARGS = {"env": {"-u", "--unset"}, "timeout": {"-k", "--kill-after", "-s", "--signal"},
+                    "nice": {"-n", "--adjustment"}}
+    SET_OK = re.compile(r"[-+][eux]+|[-+][eux]*o")         # set -e / -u / -x / -euo pipefail
+    SET_O_OK = {"pipefail", "errexit", "nounset", "xtrace"}
+    NOEXEC = re.compile(r"-[A-Za-z]*n[A-Za-z]*|--noexec|-o\s*noexec|\+o")
     CONDITIONAL = {"xargs", "parallel", "find"}   # may run nothing (empty input / no match) and still exit 0
     FILE_TESTS = {"-s", "-f", "-e", "-r", "-x", "-d"}
     SCRIPT_RUNNERS = {"bash", "sh"}
@@ -172,9 +181,24 @@ class Criteria:
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w[0]):
                 w = w[1:]
             elif os.path.basename(w[0]) in Criteria.WRAPPERS:
+                wr = os.path.basename(w[0])
                 w = w[1:]
-                while w and (w[0].startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", w[0])):
-                    w = w[1:]   # wrapper options / timeout duration
+                while w and w[0].startswith("-") and w[0] != "--":
+                    opt = w[0].split("=", 1)[0]
+                    if w[0] in Criteria.WRAPPER_FLAGS[wr]:
+                        w = w[1:]
+                    elif opt in Criteria.WRAPPER_ARGS.get(wr, ()):
+                        w = w[1:] if "=" in w[0] else w[2:]
+                    elif wr == "nice" and re.fullmatch(r"-\d+", w[0]):
+                        w = w[1:]
+                    else:
+                        return [Criteria.BAD, f"{wr} option {w[0]!r} is not allowed in a criterion"]
+                if w and w[0] == "--":
+                    w = w[1:]
+                if wr == "timeout":
+                    if not (w and re.fullmatch(r"[\d.]+[smhd]?", w[0])):
+                        return [Criteria.BAD, "timeout needs a duration"]
+                    w = w[1:]
             else:
                 break
         return w
@@ -188,7 +212,26 @@ class Criteria:
         """Reason this simple command proves nothing / cannot run, or None. w = argv after wrappers."""
         if not w:
             return "command proves nothing"
+        if w[0] == Criteria.BAD:
+            return w[1]
         first = os.path.basename(w[0])
+        if first == "set":
+            i = 1
+            while i < len(w):
+                if not Criteria.SET_OK.fullmatch(w[i]) or "n" in w[i]:
+                    return f"set {w[i]} is not allowed (only -e/-u/-x/-o pipefail)"
+                if w[i].endswith("o"):
+                    if w[i].startswith("+") or i + 1 >= len(w) or w[i + 1] not in Criteria.SET_O_OK:
+                        return "set -o: only pipefail/errexit/nounset/xtrace"
+                    i += 1
+                i += 1
+            return None
+        if first in Criteria.SCRIPT_RUNNERS:
+            for x in w[1:]:
+                if not x.startswith(("-", "+")):
+                    break
+                if Criteria.NOEXEC.fullmatch(x) or x == "-o":
+                    return f"{first} {x} may skip execution"
         if first in Criteria.SCRIPT_RUNNERS and len(w) >= 3 and w[1] == "-c":
             if depth:
                 return "nested shells are not allowed"

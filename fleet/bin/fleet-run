@@ -121,10 +121,11 @@ class Criteria:
     VACUOUS = {"true", ":", "echo", "printf", "exit", "false", "yes", "sleep", "read"}
     SETUP = {"cd", "export", "set"}   # allowed before the proving command, never alone
     BAD = "\0bad"     # words() result head for a refused wrapper option: [BAD, reason]
-    WRAPPERS = {"env", "timeout", "nice", "command", "nohup", "time", "exec"}
+    WRAPPERS = {"env", "timeout", "nice", "command", "nohup", "time"}
+    ENDS_SHELL = {"exec"}   # replaces the shell: the && checks after it never run
     # options each wrapper may take ("=" form allowed for long ones); anything else is refused, not skipped
     WRAPPER_FLAGS = {"env": {"-i", "--ignore-environment", "-"}, "timeout": {"--preserve-status", "--foreground"},
-                     "nice": set(), "command": set(), "nohup": set(), "time": {"-p"}, "exec": set()}
+                     "nice": set(), "command": set(), "nohup": set(), "time": {"-p"}}
     WRAPPER_ARGS = {"env": {"-u", "--unset"}, "timeout": {"-k", "--kill-after", "-s", "--signal"},
                     "nice": {"-n", "--adjustment"}}
     SET_OK = re.compile(r"[-+][eux]+|[-+][eux]*o")         # set -e / -u / -x / -euo pipefail
@@ -237,6 +238,8 @@ class Criteria:
                 return "nested shells are not allowed"
             inner = Criteria.segments(w[2])
             return inner if isinstance(inner, str) else Criteria.segments_problem(inner, path, repo, depth + 1)
+        if first in Criteria.ENDS_SHELL:
+            return f"{first} ends the shell: the checks after it would never run"
         if first in Criteria.CONDITIONAL:
             return f"{first} may run nothing and still succeed: call the check directly"
         if first in Criteria.SETUP:

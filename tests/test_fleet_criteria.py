@@ -38,7 +38,8 @@ class CriteriaGate(unittest.TestCase):
                     "node -e 'process.exit(0)'", "python3 -c",
                     "set -n && test -s proofs/ui.png", "env --split-string=true test -s proofs/ui.png",
                     "env -S true", "command -v test", "set -o noexec && test -s x", "bash -n checks/C1.sh",
-                    "sh -c 'set -n && test -s x'", "timeout --foo 5 test -s x", "nice --bogus test -s x"):
+                    "sh -c 'set -n && test -s x'", "timeout --foo 5 test -s x", "nice --bogus test -s x",
+                    "exec test -f /etc/passwd && test -s proofs/ui.png", "env exec test -s x"):
             self.assertTrue(self.bad(command=cmd), cmd)
 
     def test_scripts_must_exist_and_be_executable(self):

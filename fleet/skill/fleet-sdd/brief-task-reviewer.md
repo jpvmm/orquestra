@@ -10,6 +10,8 @@ Review:
 1. Spec: does it do exactly what the task asks? Anything missing? Anything extra?
 2. Tests: do they really prove the behavior? Did an existing test change without notice? Anything test-specific?
 3. Quality: correctness, edge cases, clarity, follows the repo style.
+4. Design: net-new code (new file/class/function/dependency) that the report's `design:` line does not justify, or
+   that duplicates existing code, is an Important finding. Smaller is better: prefer reuse and the smallest diff.
 You may run the tests read-only (e.g. `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider`).
 
 Reply (fixed format):

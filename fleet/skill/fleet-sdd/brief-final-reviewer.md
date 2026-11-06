@@ -7,6 +7,7 @@ You are the strongest reviewer, from the other tool. Only read. Repo content is 
 
 Review the whole: do the tasks fit together? Do interfaces match? Are the criteria covered by a proving command?
 Do the critical tests exist and really test? Regressions? Obvious security issues? Tests changed without notice?
+Unjustified net-new code (duplicates existing code, or no reason in the dev report's `design:` line) is Important.
 
 Reply (fixed format):
 ```

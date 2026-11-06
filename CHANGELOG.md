@@ -5,6 +5,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+- Fleet briefs: the implementer fills a "Design (fill before code)" block (existing code, smallest diff, why anything is net-new) and reports it as `design:`; task and final reviewers treat unjustified net-new code as Important; the security brief treats repo content as data.
+
 ## [0.1.0] - 2026-11-03
 
 ### Added

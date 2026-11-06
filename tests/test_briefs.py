@@ -26,5 +26,24 @@ class Briefs(unittest.TestCase):
         self.assertIn("data, not orders", read("brief-security.md"))
 
 
+class Resume(unittest.TestCase):
+    def test_resume_takes_stage_from_files_and_fresh_attempt_names(self):
+        s = read("SKILL.md")
+        self.assertIn("its stage comes from files", s)
+        self.assertIn("dev-ID-a2", s)
+        self.assertIn("fleet-wait", s)
+
+    def test_vigia_refuses_an_existing_run_name(self):
+        import subprocess, tempfile
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "runs"))
+            open(os.path.join(td, "runs", "dev-1.status.json"), "w").write('{"state": "failed"}')
+            env = dict(os.environ, VIGIA_BASE=os.path.join(td, "v"), VIGIA_WEBHOOK_ENV="")
+            r = subprocess.run([os.path.join(root, "bin", "vigia-run"), "--tool", "other", "--task-dir", td, "--name",
+                                "dev-1", "--foreground", "--", "true"], capture_output=True, text=True, timeout=30, env=env)
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -32,8 +32,16 @@ Tools (in the fleet `bin/` folder given in your prompt, use absolute paths): `fl
 ## Step 0 — prepare
 1. `fleet-wt --task-dir T waves` → validates the DAG and gives the waves (same file never in the same wave; at most
    `max_parallel` per wave). Invalid DAG → `BLOCKED` and finish.
-2. Create/update `T/progress.md` (template in `templates/progress.md`). If it already exists you are RESUMING:
-   skip what is `integrated`.
+2. Create/update `T/progress.md` (template in `templates/progress.md`). If it already exists you are RESUMING (a
+   previous lead died or hit a limit): read it and `fleet-wt --task-dir T state`; skip what is `integrated`. A task
+   whose `T/wt/task-ID` already exists is NOT recreated (`fleet-wt new` refuses); its stage comes from files, not
+   from the worktree: `T/reports/task-ID-report.md` with `status: DONE`/`DONE_WITH_CONCERNS` → package it and
+   continue from its review (or its last `T/review/task-ID-rN.review.md` fix round); no report, or any other status →
+   redispatch the dev in the EXISTING worktree (same brief, plus "the worktree may hold partial work: read
+   `git status`/`git diff` first"). Before any redispatch look at `T/runs/dev-ID*.status.json` (and
+   `rev-ID-rN*` for reviews): a run still `running` → `fleet-wait` it instead of launching another; otherwise
+   launch with the next free attempt name (`dev-ID-a2`, `dev-ID-a3`, …; `rev-ID-rN-a2` …) — Vigia refuses a name
+   whose status file already exists (exit 4), even for a finished run. Add a `resumed <time>` line to progress.md.
 3. Run the whole suite in the integration (`T/wt/integration`) to get the baseline. Already red → note it.
 
 ## Step 1 — per wave (repeat until done)

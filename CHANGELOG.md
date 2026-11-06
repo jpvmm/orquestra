@@ -6,6 +6,7 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Changed
+- fleet-sdd skill: a resumed lead takes each task's stage from its report/review files and redispatches with fresh attempt names (`dev-ID-a2`), waiting for runs still alive; Vigia refuses an existing run name.
 - Fleet briefs: the implementer fills a "Design (fill before code)" block (existing code, smallest diff, why anything is net-new) and reports it as `design:`; task and final reviewers treat unjustified net-new code as Important; the security brief treats repo content as data.
 
 ## [0.1.0] - 2026-11-03

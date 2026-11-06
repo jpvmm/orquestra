@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format is based on
 ### Fixed
 - `--protect-tests` only counts test paths inside the run cwd/worktree (scratch under `/tmp` no longer trips the loop detector).
 - `--protect-tests` protects only the tests that exist on the base commit (snapshot by fleet-run in `$VIGIA_BASE/protected/`, outside the agent-writable task dir; relative `../` paths are resolved against the run cwd; shell writes are denied too): new test files are allowed, so TDD works. The M/G lead now runs with it too; a subagent's denied attempt is an alert, not a kill of the lead, and the loop/scope detector counts only the run's own calls.
+- End-of-run gate for `--protect-tests`: fleet-run passes the base commit by argv (`vigia-run --protect-base`, also recorded for Codex devs); when the run ends, every base test in the cwd and `T/wt/*` is compared by content with the base (renames, index flags or any shell trick cannot hide a change). A changed/deleted base test, or one that cannot be verified, turns `done` into `loop`. Codex devs and the P Claude dev now run with `--protect-tests` too.
 
 
 ## [0.1.0] - 2026-11-03

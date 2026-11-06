@@ -128,6 +128,83 @@ class BaseSnapshot(unittest.TestCase):
         self.assertTrue(V.is_test(self.wt + "/tests/test_new.py", roots=[self.wt], task_dir=self.T))
 
 
+class TrustedBase(unittest.TestCase):
+    """The trusted base (vigia-run --protect-base → env, or the base fleet-run recorded) beats the list file; an empty
+    list is not trusted; the end-of-run gate compares file contents, whatever command changed them."""
+
+    def setUp(self):
+        import subprocess, tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = {k: os.environ.get(k) for k in ("VIGIA_PROTECT_BASE", "VIGIA_CWD")}
+        self.repo = os.path.join(self.tmp.name, "repo"); self.T = os.path.join(self.tmp.name, "T")
+        os.makedirs(os.path.join(self.repo, "tests"))
+        with open(os.path.join(self.repo, "tests", "test_old.py"), "w") as f:
+            f.write("x = 1\n")
+        self.e = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                      GIT_COMMITTER_EMAIL="t@t")
+        for c in (["git", "init", "-q"], ["git", "add", "."], ["git", "commit", "-qm", "b"]):
+            subprocess.run(c, cwd=self.repo, check=True, env=self.e)
+        self.base = V.rev_sha(self.repo, "HEAD")
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def test_tampered_or_empty_list(self):
+        V.ProtectedTests.snapshot(self.repo, "HEAD", self.T)
+        os.remove(V.ProtectedTests.base_path(self.T))
+        open(V.ProtectedTests.path(self.T), "w").close()            # truncated by an agent
+        self.assertIsNone(V.ProtectedTests.load(self.T))           # → every test-named path protected
+        os.environ["VIGIA_PROTECT_BASE"], os.environ["VIGIA_CWD"] = self.base, self.repo
+        self.assertEqual(V.ProtectedTests.load(self.T), frozenset({"tests/test_old.py"}))   # git, not the file
+
+    def test_modified_by_content(self):
+        import subprocess
+        g = lambda *c: subprocess.run(["git", *c], cwd=self.repo, check=True, env=self.e, capture_output=True)
+        self.assertEqual(V.ProtectedTests.modified(self.base, [self.repo]), [])
+        with open(os.path.join(self.repo, "tests", "test_new.py"), "w") as f:
+            f.write("y = 1\n")                                                       # new test: fine
+        self.assertEqual(V.ProtectedTests.modified(self.base, [self.repo]), [])
+        g("mv", "tests/test_old.py", "tests/test_moved.py")                         # staged rename
+        self.assertIn(f"{self.repo}: tests/test_old.py (deleted)", V.ProtectedTests.modified(self.base, [self.repo]))
+        g("mv", "tests/test_moved.py", "tests/test_old.py")
+        g("update-index", "--assume-unchanged", "tests/test_old.py")                 # hidden from git diff
+        with open(os.path.join(self.repo, "tests", "test_old.py"), "a") as f:
+            f.write("# x\n")
+        self.assertIn(f"{self.repo}: tests/test_old.py", V.ProtectedTests.modified(self.base, [self.repo]))
+        bad = V.ProtectedTests.modified("0" * 40, [self.repo, os.path.join(self.tmp.name, "nogit")])
+        self.assertEqual(len(bad), 2)
+        self.assertTrue(all("cannot verify" in b for b in bad))                      # fails closed
+
+    def test_repo_without_tests_can_add_its_first(self):
+        import subprocess
+        empty = os.path.join(self.tmp.name, "empty"); os.makedirs(empty)
+        for c in (["git", "init", "-q"], ["git", "commit", "-q", "--allow-empty", "-m", "b"]):
+            subprocess.run(c, cwd=empty, check=True, env=self.e)
+        T2 = os.path.join(self.tmp.name, "T2")
+        V.ProtectedTests.snapshot(empty, "HEAD", T2)
+        os.environ.pop("VIGIA_PROTECT_BASE", None); os.environ["VIGIA_CWD"] = empty
+        self.assertEqual(V.ProtectedTests.load(T2), frozenset())
+        self.assertFalse(V.is_test("tests/test_first.py", roots=[empty], task_dir=T2))
+
+    def test_vigia_run_end_gate_turns_done_into_loop(self):
+        import json, subprocess
+        env = dict(self.e, VIGIA_BASE=_BASE, VIGIA_WEBHOOK_ENV="", VIGIA_POLL_SEC="0.3")
+        cmd = [os.path.join(ROOT, "bin", "vigia-run"), "--tool", "other", "--task-dir", self.T, "--name", "gate",
+               "--cwd", self.repo, "--protect-tests", "--protect-base", self.base, "--foreground", "--",
+               "python3", "-c", "open('tests/test_old.py','a').write('#x')"]
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.T, "runs", "gate.status.json")) as f:
+            st = json.load(f)
+        self.assertEqual(st["state"], "loop")
+        self.assertIn("tests/test_old.py", st["loop_reason"])
+
+
 class ClaudeHook(unittest.TestCase):
     def hook(self, ev, **envx):
         import json, subprocess

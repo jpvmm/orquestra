@@ -95,7 +95,9 @@ inside the lead do NOT count (practical limit ~20). Hence `max_parallel=4`: lead
 - Codex dev has no network: HTTP/socket tests fail there; the lead runs those in the integration.
 - The lead runs with `--protect-tests`, scoped by a snapshot in `$VIGIA_BASE/protected/` (the base commit's test files,
   snapshot at `fleet-wt init`): devs may ADD test files (TDD) but not edit existing ones; a subagent's attempt is denied
-  and recorded as an alert, while the lead's own attempt stops the run as `loop`.
+  and recorded as an alert, while the lead's own attempt stops the run as `loop`. The hook is best effort; the hard
+  gate runs when the lead (or a dev) ends: fleet-run passes the base by argv and Vigia compares every base test's
+  content in the integration and task worktrees; any change → `loop`.
 - Vigia secret redaction may turn text like `pwd: ...` into `***` in conversation.md (false positive).
 
 ## Tests

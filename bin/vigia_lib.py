@@ -444,43 +444,118 @@ def _under_roots(path, roots):
     return False
 
 
+def rev_sha(repo, rev):
+    """Full commit sha of rev in repo (raises CalledProcessError if it is not a commit)."""
+    import subprocess
+    return subprocess.run(["git", "-C", repo, "rev-parse", "--verify", rev + "^{commit}"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+
+
 class ProtectedTests:
     """--protect-tests protects the test files that already exist on the base commit.
 
-    fleet-run snapshots them into $VIGIA_BASE/protected/<hash of T>.txt (one repo-relative path per line). The list
-    lives in Vigia's folder, not in T, because agents can write T. With the snapshot only those paths are
-    protected, so TDD can add NEW test files. Without it (older task folders, raw vigia-run) every test-named
-    path is protected, as before."""
+    fleet-run snapshots them into the Vigia's protected/<hash of T>.txt (one repo-relative path per line). With the
+    snapshot, only those paths are protected, so TDD can add NEW test files. Without it (older task folders,
+    raw vigia-run), every test-named path is protected, as before."""
 
     @staticmethod
     def path(task_dir):
+        """Kept in the Vigia's folder, not in T: agents write T (Codex workspace-write, Claude --add-dir)."""
         if not task_dir:
             return None
         return os.path.join(BASE, "protected", h(os.path.abspath(task_dir)) + ".txt")
 
     @staticmethod
     def snapshot(repo, rev, task_dir):
-        """Write the base commit's test files to task_dir's protected list; return (path, count)."""
+        """Write the base commit's test files to the protected list of task_dir; return (path, count)."""
         import subprocess
         out = subprocess.run(["git", "ls-tree", "-r", "-z", "--name-only", rev], cwd=repo,
                              capture_output=True, text=True, check=True).stdout
         tests = sorted(p for p in out.split("\0") if p and TEST_RE.search(p))
         dest = ProtectedTests.path(task_dir)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        tmp = dest + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write("".join(t + "\n" for t in tests))
-        os.replace(tmp, dest)
+        for path, txt in ((dest, "".join(t + "\n" for t in tests)), (ProtectedTests.base_path(task_dir), rev_sha(repo, rev) + "\n")):
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                f.write(txt)
+            os.replace(path + ".tmp", path)
         return dest, len(tests)
 
     @staticmethod
+    def base_path(task_dir):
+        """Sidecar with the base commit (Vigia folder): Codex devs launched by the lead get their --protect-base here."""
+        return ProtectedTests.path(task_dir)[:-4] + ".base"
+
+    @staticmethod
+    def recorded_base(task_dir):
+        try:
+            with open(ProtectedTests.base_path(task_dir), encoding="utf-8") as f:
+                return f.read().strip() or None
+        except (OSError, TypeError):
+            return None
+
+    @staticmethod
+    def from_git(repo, rev):
+        """Test files of commit rev, or None when git cannot read it."""
+        import subprocess
+        try:
+            out = subprocess.run(["git", "-C", repo, "ls-tree", "-r", "-z", "--name-only", rev],
+                                 capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        return frozenset(p for p in out.stdout.split("\0") if p and TEST_RE.search(p))
+
+    @staticmethod
     def load(task_dir):
-        """frozenset of protected repo-relative paths, or None when there is no snapshot."""
+        """frozenset of protected repo-relative paths, or None (= protect every test-named path).
+        The list always comes from git at the base commit: VIGIA_PROTECT_BASE (vigia-run argv, out of the agent's
+        reach) or the base recorded by fleet-run. Without a base, the snapshot file; an empty one is not trusted."""
+        base = os.environ.get("VIGIA_PROTECT_BASE") or ProtectedTests.recorded_base(task_dir)
+        repo = os.environ.get("VIGIA_CWD")
+        if base and repo:
+            return ProtectedTests.from_git(repo, base)   # None (git failed) → fail closed
         p = ProtectedTests.path(task_dir)
         if not p or not os.path.isfile(p):
             return None
         with open(p, encoding="utf-8") as f:
-            return frozenset(ln.rstrip("\n") for ln in f if ln.strip())
+            listed = frozenset(ln.rstrip("\n") for ln in f if ln.strip())
+        return listed or None
+
+    @staticmethod
+    def modified(base, dirs):
+        """Problems with the base tests in the git worktrees dirs, as 'dir: path' (changed or deleted) or
+        'dir: cannot verify ...'. Compares file CONTENT with the base blobs (git hash-object), so renames, index
+        flags (assume-unchanged/skip-worktree) or any shell trick cannot hide a change. Fails closed: anything
+        that cannot be checked is reported. vigia-run runs it when a protected run ends."""
+        import subprocess
+        out = []
+        for d in dirs:
+            try:
+                ls = subprocess.run(["git", "-C", d, "ls-tree", "-r", "-z", base], capture_output=True, text=True,
+                                    timeout=60)
+                if ls.returncode != 0:
+                    out.append(f"{d}: cannot verify protected tests (git ls-tree {base[:12]} failed)")
+                    continue
+                blobs = {}
+                for ent in ls.stdout.split("\0"):
+                    if "\t" in ent:
+                        meta, path = ent.split("\t", 1)
+                        if meta.split()[1] == "blob" and TEST_RE.search(path):
+                            blobs[path] = meta.split()[2]
+                present = [p for p in sorted(blobs) if os.path.isfile(os.path.join(d, p))]
+                out += [f"{d}: {p} (deleted)" for p in sorted(blobs) if p not in present]
+                if present:
+                    hs = subprocess.run(["git", "-C", d, "hash-object", "--stdin-paths"], input="\n".join(present) + "\n",
+                                        capture_output=True, text=True, timeout=120)
+                    got = hs.stdout.split()
+                    if hs.returncode != 0 or len(got) != len(present):
+                        out.append(f"{d}: cannot verify protected tests (git hash-object failed)")
+                        continue
+                    out += [f"{d}: {p}" for p, g in zip(present, got) if g != blobs[p]]
+            except (OSError, subprocess.SubprocessError) as e:
+                out.append(f"{d}: cannot verify protected tests ({type(e).__name__})")
+        return out
 
     @staticmethod
     def candidates(path, roots, task_dir):

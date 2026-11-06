@@ -22,7 +22,7 @@ a JSON object with the status path. Exit 0 = started; 2 = bad usage; 3 = active-
 Paths: state lives in $VIGIA_BASE (default $ORQUESTRA_HOME/vigia, default ~/.orquestra/vigia);
 per-run files live in <task-dir>/runs/.
 """
-import argparse, ctypes, json, os, re, shlex, signal, shutil, subprocess, sys, time
+import argparse, ctypes, glob, json, os, re, shlex, signal, shutil, subprocess, sys, time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -58,6 +58,9 @@ def parse():
                    help="expected tool calls: above this is an alert, above 2x is a loop (growing scope)")
     p.add_argument("--max-files", type=int, default=0, help="number of distinct edited files above which it counts as growing scope (loop)")
     p.add_argument("--protect-tests", action="store_true")
+    p.add_argument("--protect-base", default=None,
+                   help="commit whose tests are protected (fleet-run passes the base): the list comes from git, not a "
+                        "file, and when the run ends any changed/deleted base test in cwd or T/wt/* makes it a loop")
     p.add_argument("--loop-repeat", type=int, default=3, help="repetitions of the same error/cycle that count as a loop")
     p.add_argument("--cwd", default=None)
     p.add_argument("--foreground", action="store_true", help="do not detach (debug)")
@@ -74,7 +77,17 @@ def parse():
     a.cwd = os.path.abspath(a.cwd or os.getcwd())
     a.prompt_file = os.path.abspath(a.prompt_file) if a.prompt_file else None
     a.task = re.sub(r"\s+", " ", a.task).strip()[:300] if a.task else None
+    if a.protect_base:   # the supervisor's own checks read the same trusted base as the hooks
+        os.environ["VIGIA_PROTECT_BASE"], os.environ["VIGIA_CWD"] = a.protect_base, a.cwd
     return a
+
+
+def base_tests_changed(a):
+    """Command-agnostic gate: base tests changed/deleted (by content) in the run cwd or any T/wt/* worktree."""
+    if not (a.protect_tests and a.protect_base):
+        return []
+    dirs = [a.cwd] + sorted(glob.glob(os.path.join(a.task_dir, "wt", "*")))
+    return V.ProtectedTests.modified(a.protect_base, list(dict.fromkeys(dirs)))
 
 
 # ======================= event analysis =======================
@@ -526,7 +539,8 @@ def supervise(a, paths, key, notifier=None):
         "started_at": started, "ended_at": None, "exit_code": None, "last_event_at": None,
         "checked_at": None, "summary": "", "loop_reason": None, "alerts": [],
         "limits": {"stall_min": a.stall_min, "max_min": a.max_min, "max_turns_hint": a.max_turns_hint,
-                   "max_files": a.max_files, "protect_tests": a.protect_tests, "loop_repeat": a.loop_repeat},
+                   "max_files": a.max_files, "protect_tests": a.protect_tests, "loop_repeat": a.loop_repeat,
+                   "protect_base": a.protect_base},
         "stats": {}, "kill": None, "paths": paths,
         # per-bot webhook: VIGIA_WEBHOOK_ENV at launch is stored here so notifications go to the same bot even
         # when another process sends them (e.g. vigia-status cleaning up a dead supervisor). None = default.
@@ -581,6 +595,7 @@ def supervise(a, paths, key, notifier=None):
     env["VIGIA_HEARTBEAT"] = paths["hooks"]
     env["VIGIA_RUN"] = a.name
     env["VIGIA_PROTECT_TESTS"] = "1" if a.protect_tests else "0"
+    env["VIGIA_PROTECT_BASE"] = a.protect_base or ""
     env["VIGIA_CWD"] = a.cwd or ""
     env["VIGIA_TASK_DIR"] = a.task_dir or ""
 
@@ -742,6 +757,14 @@ def supervise(a, paths, key, notifier=None):
             st["state"] = "failed"
         if an.result and an.result.get("is_error") and st["state"] == "done":
             st["state"] = "failed"
+    changed = base_tests_changed(a)
+    if changed:
+        txt = "base tests changed: " + ", ".join(changed[:5])
+        if st["state"] == "done":
+            st["state"], st["loop_reason"], st["summary"] = "loop", txt, "loop: " + txt
+        elif txt not in an.alerts:
+            an.alerts.append(txt)
+            st["alerts"] = an.alerts
     st["exit_code"] = rc
     st["ended_at"] = V.now_iso()
     st["duration_sec"] = int(time.time() - w0)       # wall clock

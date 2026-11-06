@@ -138,6 +138,15 @@ class Criteria:
     INTERPRETERS = {"bash", "sh", "python", "python3", "node", "ruby", "perl"}
     INLINE = {"-c", "-m", "-e", "--eval", "-p", "--print", "-r"}
     INFO_FLAGS = {"--version", "-V", "--help", "-h", "-v"}
+    GLOBAL_INFO = {"--help", "--version", "-V", "--collect-only", "--co", "--list", "--list-tests", "--dry-run",
+                   "--setup-plan", "--fixtures", "--markers"}
+    TEST_MODULES = {"pytest", "unittest", "nose2", "doctest"}
+    # program → allowed first operand (None = any); everything else not a script/interpreter/test is refused
+    RUNNERS = {"pytest": None, "py.test": None, "jest": None, "vitest": {"run"}, "mocha": None, "bats": None,
+               "tox": None, "nox": None, "rspec": None, "phpunit": None, "make": None,
+               "go": {"test", "vet"}, "cargo": {"test", "nextest", "clippy"}, "npm": {"test", "t", "run"},
+               "pnpm": {"test", "t", "run"}, "yarn": {"test", "run"}, "npx": {"jest", "vitest", "playwright", "mocha"},
+               "dotnet": {"test"}, "mvn": {"test", "verify"}, "gradle": {"test", "check"}}
     RUNNER_FLAGS = {"--test"}
     TRIVIAL_STMT = re.compile(r"(pass|None|True|False|\d+|true|:|exit(\s*0|\(\s*0?\s*\))?|(sys\.|process\.|os\._)?exit\(\s*0?\s*\)"
                               r"|import [\w., ]+|print\(.*\)|console\.log\(.*\)|puts\b.*|\(\s*\))?")
@@ -253,23 +262,30 @@ class Criteria:
             if len(args) != 2 or args[0] not in Criteria.FILE_TESTS:
                 return "test/[ must be a single file check (-s/-f/-e/-r/-x/-d FILE)"
             return None
+        if any(x in Criteria.GLOBAL_INFO or (x == "-h" and first != "grep") for x in w[1:]):
+            return "help/version/listing flags prove nothing"
         if "/" in w[0]:
             f = Criteria.resolve(w[0], repo)
             if repo and not (os.path.isfile(f) and os.access(f, os.X_OK)):
-                return f"{w[0]!r} is not an executable file (relative = repo; T/checks scripts by absolute path)"
-        elif not shutil.which(first, path=path):
+                return f"{w[0]!r} is not an executable file (relative = current dir; T/checks scripts by absolute path)"
+            return None                  # a script file: its content is the check
+        if not shutil.which(first, path=path):
             return f"{first!r} is not an executable on PATH"
         if first in Criteria.INTERPRETERS or re.fullmatch(r"python3?(\.\d+)?", first):
             script, inline = None, False
             for i, x in enumerate(w[1:], 1):
                 if x in Criteria.INFO_FLAGS:
                     return f"{first} {x} proves nothing"
-                if x in Criteria.INLINE:   # inline code or a module (python3 -m pytest): no script operand
+                if x == "-m":
+                    mod = w[i + 1] if i + 1 < len(w) else ""
+                    if mod not in Criteria.TEST_MODULES:
+                        return f"{first} -m {mod or '?'}: only test runners ({', '.join(sorted(Criteria.TEST_MODULES))})"
+                    inline = True
+                    break
+                if x in Criteria.INLINE:   # inline code: no script operand
                     code = w[i + 1] if i + 1 < len(w) else ""
-                    if x != "-m" and Criteria.trivial_code(code):
+                    if Criteria.trivial_code(code):
                         return f"inline code {code!r} proves nothing"
-                    if not code:
-                        return f"{first} {x} needs an argument"
                     inline = True
                     break
                 if x in Criteria.RUNNER_FLAGS:
@@ -279,17 +295,55 @@ class Criteria:
                     script = x
                     break
             if script is None and not inline:   # a bare interpreter reads stdin and exits 0 on EOF
-                return f"{first} needs a script file, a module or a real inline check"
+                return f"{first} needs a script file, a test module or a real inline check"
             if script is not None and repo and not os.path.isfile(Criteria.resolve(script, repo)):
-                return (f"script {script!r} does not exist (relative = repo; T/checks scripts by absolute path; "
-                        f"they exist before the run)")
-        return None
+                return (f"script {script!r} does not exist (relative = current dir after any cd; T/checks scripts by "
+                        f"absolute path; they exist before the run)")
+            return None
+        return Criteria.runner_problem(first, w)
+
+    @staticmethod
+    def runner_problem(first, w):
+        """Allowlist of proving programs that are not scripts/interpreters: test runners and plain checkers."""
+        args = w[1:]
+        ops = [x for x in args if not x.startswith("-")]
+        if first in Criteria.RUNNERS:
+            sub = Criteria.RUNNERS[first]
+            if sub is None or (ops and ops[0] in sub):
+                if first == "make" and any(re.fullmatch(r"-[A-Za-z]*[nq][A-Za-z]*|--(dry-run|just-print|recon|question)", x)
+                                           for x in args):
+                    return "make dry-run/question flags run nothing"
+                if first == "make" and not ops:
+                    return "make needs an explicit target"
+                if first in ("npm", "pnpm", "yarn") and ops and ops[0] == "run" and len(ops) < 2:
+                    return f"{first} run needs a script name"
+                return None
+            return f"{first} must run tests ({first} {'/'.join(sorted(sub))} ...)"
+        if first in ("grep", "egrep", "fgrep", "rg") and len(ops) >= 2:
+            return None                  # pattern + file: fails when the text is missing
+        if first in ("cmp", "diff") and len(ops) >= 2:
+            return None
+        if first == "curl" and any(x in ("-f", "--fail", "--fail-with-body") or re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", x)
+                                   for x in args) and ops:
+            return None
+        return (f"{first!r} is not a recognised proving command: use a test runner (pytest, go test, npm test...), "
+                f"`test -s FILE`, grep/diff/cmp on files, `curl --fail URL`, or a script (T/checks/ID.sh)")
 
     @staticmethod
     def segments_problem(segs, path, repo, depth=0):
-        """First problem of a list of &&-joined segments; setup commands (cd/export/set) alone prove nothing."""
+        """First problem of a list of &&-joined segments; setup commands (cd/export/set) alone prove nothing.
+        `cd DIR` moves the directory later relative paths resolve against (like the shell would)."""
+        cur = repo
         for sg in segs:
-            why = Criteria.segment_problem(Criteria.words(sg), path, repo, depth)
+            w = Criteria.words(sg)
+            if w and w[0] != Criteria.BAD and os.path.basename(w[0]) == "cd":
+                if len(w) != 2 or w[1] == "-" or "$" in w[1] or re.match(r"~[^/]", w[1]):
+                    return "cd needs one literal directory"
+                d = os.path.expanduser(w[1])   # the shell expands ~ and ~/ the same way
+                nxt = os.path.normpath(Criteria.resolve(d, cur)) if cur or os.path.isabs(d) else None
+                cur = nxt
+                continue
+            why = Criteria.segment_problem(w, path, cur, depth)
             if why:
                 return why
         if all(os.path.basename((Criteria.words(sg) or [""])[0]) in Criteria.SETUP for sg in segs):

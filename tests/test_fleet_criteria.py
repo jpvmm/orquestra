@@ -22,8 +22,12 @@ class CriteriaGate(unittest.TestCase):
         return R.Criteria.problems([{"id": "C1", **c}], PATH, repo=self.tmp.name)
 
     def test_executable_commands_pass(self):
+        os.makedirs(os.path.join(self.tmp.name, "bin"), exist_ok=True)
+        open(os.path.join(self.tmp.name, "bin", "test_x.py"), "w").write("assert True\n")
         for cmd in ("python3 -m pytest -q", "test -s proofs/x.png", "[ -f out.txt ]", "FOO=1 python3 -c 'print(1); x'",
-                    "cd sub && python3 -m pytest -q 2>&1", "bash -c 'python3 -m pytest -q'", "timeout 60 python3 -m pytest"):
+                    "cd sub && python3 -m pytest -q 2>&1", "bash -c 'python3 -m pytest -q'", "timeout 60 python3 -m pytest",
+                    "cd bin && python3 test_x.py", "bash -c 'cd bin && python3 test_x.py'", "grep -q needle README.md",
+                    "diff out.txt expected.txt"):
             self.assertEqual(self.bad(command=cmd), [], cmd)
 
     def test_manual_vacuous_and_masking_rejected(self):
@@ -39,7 +43,10 @@ class CriteriaGate(unittest.TestCase):
                     "set -n && test -s proofs/ui.png", "env --split-string=true test -s proofs/ui.png",
                     "env -S true", "command -v test", "set -o noexec && test -s x", "bash -n checks/C1.sh",
                     "sh -c 'set -n && test -s x'", "timeout --foo 5 test -s x", "nice --bogus test -s x",
-                    "exec test -f /etc/passwd && test -s proofs/ui.png", "env exec test -s x"):
+                    "exec test -f /etc/passwd && test -s proofs/ui.png", "env exec test -s x",
+                    "python3 -m pytest --help", "python3 -m pytest --collect-only", "pwd", "ls", "cat README.md",
+                    "python3 -m http.server", "python3 test_x.py", "make -n test", "make", "npm run",
+                    "cd bin && python3 missing.py", "cd $HOME && python3 -m pytest", "grep needle"):
             self.assertTrue(self.bad(command=cmd), cmd)
 
     def test_scripts_must_exist_and_be_executable(self):

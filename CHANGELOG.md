@@ -8,7 +8,7 @@ All notable changes to this project are documented here. The format is based on
 ### Added
 - Fleet criteria template ships a `C-UI` visual-proof criterion (screenshot or Playwright journey log) for UI tasks.
 - fleet-run criteria gate: refuses manual, vacuous (`true`, `echo`, `test 1`), unknown or failure-masking commands
-  (`||`, `;`, `|`, `&`, subshells, `$(...)`), commands that may run nothing (`xargs`, `find -exec`, a bare interpreter, `--version`, no-op inline code like `python3 -c pass`, `set -n` or other no-exec shell options, unknown wrapper options such as `env -S`, `exec`), long commands (→ `T/checks/<id>.sh`), missing/non-executable scripts,
+  (`||`, `;`, `|`, `&`, subshells, `$(...)`), commands that may run nothing (`xargs`, `find -exec`, a bare interpreter, `--version`, no-op inline code like `python3 -c pass`, `set -n` or other no-exec shell options, unknown wrapper options such as `env -S`, `exec`), anything that is not a test runner (`pytest`, `python3 -m pytest`, `go test`, `npm test`...), a file test, `grep`/`diff`/`cmp` on files, `curl --fail` or a script; help/version/collect-only flags are refused and relative scripts resolve after any `cd`, long commands (→ `T/checks/<id>.sh`), missing/non-executable scripts,
   and UI criteria whose command does not check their `artifact`. The skill states criteria never change in a run.
 
 

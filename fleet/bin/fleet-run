@@ -164,10 +164,10 @@ class Criteria:
         """[argv, ...] of the `&&`-joined simple commands, or a str with the reason it is not acceptable."""
         if Criteria.SUBST.search(command):
             return "`$`, backticks, backslashes and process substitution are not allowed: arguments must be literal"
+        command = re.sub(r"(?<!\S)2>&1(?!\S)", " ", command)   # the one allowed redirection (stderr into the log)
         why = Criteria.unquoted_problem(command)
         if why:
             return why
-        command = re.sub(r"\d*>&\d+", " ", command)   # 2>&1 is a redirection, not a background job
         try:
             lx = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
             lx.whitespace_split = True
@@ -203,6 +203,8 @@ class Criteria:
                 continue                                         # the `[ -s X ]` command words
             elif ch in "*?[]{}":
                 return f"unquoted {ch!r} expands in the shell: quote the argument"
+            elif ch in "<>":
+                return "redirections are not allowed (only `2>&1`): `> file` can truncate the check before it runs"
             elif ch == "~" and not re.search(r"(^|&&)\s*cd\s+$", command[:i]):
                 return "`~` is only allowed as the start of a `cd` directory"
         return None

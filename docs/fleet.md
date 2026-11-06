@@ -35,7 +35,7 @@ Criteria gate (fleet-run refuses the start otherwise): each `command` is a WHITE
 with `&&` (no `||`, `;`, `|`, `&`, subshells or `$(...)`, so nothing masks a failure). Allowed simple commands:
 `cd DIR` (literal; later relative paths resolve from it) and `VAR=value` prefixes (not `PATH`, `HOME`, `PYTHONHOME`,
 `PYTHONOPTIMIZE`, `BASH_ENV`, nor `PYTEST_*`/`LD_*`/`GO*`/`CARGO*`/`NODE_*`/`npm_*` variables); arguments must be literal
-(no `$`, backslashes, or unquoted `*?[]{}~`); a test runner — `pytest`, `python3 -m pytest|unittest`, `npm|pnpm|yarn test`,
+(no `$`, backslashes, or unquoted `*?[]{}~`) and no redirection except `2>&1`; a test runner — `pytest`, `python3 -m pytest|unittest`, `npm|pnpm|yarn test`,
 `go test`, `cargo test` (bare, or by path only when it is a real Python binary or the same file `PATH` resolves the runner to; `python -m`
 refuses a `pytest.py`/`unittest`/`sitecustomize.py` that would shadow the runner in the cwd or `PYTHONPATH`), without
 a whitelist of arguments per runner (no help/listing/no-run modes, `-exec`, plugins, config files or name filters that can select nothing); an existing text script under `T/checks/` (absolute path, or `bash|sh` + that

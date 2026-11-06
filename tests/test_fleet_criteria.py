@@ -102,6 +102,15 @@ class CriteriaGate(unittest.TestCase):
         self.assertEqual(self.bad(command="go test -count=1 -timeout 5m ./..."), [])
         self.assertEqual(self.bad(command="python3 -m unittest discover -s tests -p 'test_*.py'"), [])
 
+    def test_redirections_refused(self):
+        """`> T/checks/C1.sh` empties the script before bash runs it: success without the proof."""
+        for cmd in (f"bash {self.c1} > {self.c1}", f"{self.c1} >{self.c1}", f"bash {self.c1} >> log",
+                    f"bash {self.c1} < /dev/null", "python3 -m pytest -q > /dev/null", "python3 -m pytest 1>&2",
+                    "python3 -m pytest >&2", "python3 -m pytest 2>/dev/null", "python3 -m pytest &>log"):
+            self.assertTrue(self.bad(command=cmd), cmd)
+        self.assertEqual(self.bad(command="python3 -m pytest -q 2>&1"), [])
+        self.assertEqual(self.bad(command="python3 -m pytest -q -k 'a or b'"), [])
+
     def test_fake_test_path_and_inline_code(self):
         """Round-10 bypasses: a fake `test` path and assignment-only inline code."""
         for cmd in ("/does/not/exist/test -s proof.png", "python3 -c 'x=1'"):

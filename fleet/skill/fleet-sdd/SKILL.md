@@ -65,7 +65,8 @@ For each task of the wave:
    - Claude dev → `codex-reviewer --task-dir T --name rev-ID-rN --cwd WT --prompt-file T/briefs/rev-ID-rN.md
      --output T/review/task-ID-rN.review.md` (brief from `brief-task-reviewer.md`).
    - Codex dev → Agent `subagent_type: reviewer-claude`, `model: roles.reviewer.model`.
-   - Security (`roles.security.enabled` or a task with `"security": true`): Agent `security` in parallel (brief from `brief-security.md`).
+   - Security per task ONLY for the ids in `roles.security.tasks` (tasks.json justified them): Agent `security` in
+     parallel (brief from `brief-security.md`). Other tasks get no per-task security review.
    The wave's reviews go out together (several Codex: `--no-wait` + `fleet-wait`).
 3. Critical/Important → fix brief (`brief-fixer.md`) for the SAME kind of dev (fresh, review attached) in the SAME WT,
    new package `rN+1`, new review. Max 3 rounds; 3rd rejected → BLOCKED for that task.
@@ -85,6 +86,7 @@ For each approved task, in topological order (dependencies first):
 2. Final reviewer = strongest model of the OTHER tool (`roles.final_reviewer`): Claude dev → `codex-reviewer
    --model <final_reviewer.model>`; Codex dev → Agent `reviewer-claude` with `model: opus`. Brief:
    `brief-final-reviewer.md` (includes the whole criteria.json and the critical tests).
+   If `roles.security.final` is true, run ONE Agent `security` (opus) over the same final package in parallel.
 3. Critical/Important findings → ONE fixer (fresh dev) in the integration with all findings; then run the
    suite and the criteria commands. No new final round (note what is left).
 

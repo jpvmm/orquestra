@@ -116,10 +116,10 @@ class Integration(Base):
 
 
 class FleetRunDry(Base):
-    def prepare(self, plan="Add two numbers."):
+    def prepare(self, plan="Add two numbers.", n=2):
         write(os.path.join(self.T, "plan.md"), plan)
         write(os.path.join(self.T, "criteria.json"), json.dumps({"criteria": [{"id": "C1", "command": "true", "passes": False}]}))
-        self.tasks([{"id": "1", "files": ["calc.py"]}, {"id": "2", "files": ["sub.py"]}])
+        self.tasks([{"id": "1", "files": ["calc.py"]}, {"id": "2", "files": ["sub.py"]}][:n])   # P takes 1 task
 
     def run_dry(self, *extra, check=True, env=None):
         return sh([RUN, "--task-dir", self.T, "--task", "test", "--repo", self.repo, "--dry-run", *extra], check=check, env=env)
@@ -138,9 +138,9 @@ class FleetRunDry(Base):
         self.assertEqual(cmd[0], os.path.join(ROOT, "bin", "vigia-run"))   # VIGIA_BIN default: bin/ next to fleet/
 
     def test_claude_runs_cannot_publish(self):
-        self.prepare()
         for extra in (("--complexity", "M", "--lead", "claude"), ("--complexity", "P", "--lead", "claude"),
                       ("--complexity", "P", "--lead", "codex", "--stage", "review")):
+            self.prepare(n=1 if "P" in extra else 2)
             cmd = json.loads(self.run_dry(*extra).stdout)["command"]
             i = cmd.index("--disallowedTools")
             for rule in ("Bash(git commit:*)", "Bash(git push:*)", "Bash(git merge:*)", "Bash(git rebase:*)",
@@ -159,7 +159,7 @@ class FleetRunDry(Base):
         self.assertEqual(r.returncode, 2); self.assertIn("without a proving command", r.stdout)
 
     def test_p_codex_dev_has_claude_reviewer(self):
-        self.prepare()
+        self.prepare(n=1)
         out = json.loads(self.run_dry("--complexity", "P", "--lead", "codex").stdout)
         self.assertIn("codex-dev", out["command"][0])
         out = json.loads(self.run_dry("--complexity", "P", "--lead", "codex", "--stage", "review").stdout)
@@ -168,7 +168,7 @@ class FleetRunDry(Base):
             self.assertFalse(os.path.exists(os.path.join(self.T, "briefs", f)))
 
     def test_p_claude_dev_has_codex_reviewer(self):
-        self.prepare()
+        self.prepare(n=1)
         out = json.loads(self.run_dry("--complexity", "P", "--lead", "claude").stdout)
         self.assertIn("vigia-run", out["command"][0]); self.assertIn("dev", out["command"])
         out = json.loads(self.run_dry("--complexity", "P", "--lead", "claude", "--stage", "review").stdout)

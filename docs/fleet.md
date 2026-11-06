@@ -44,8 +44,12 @@ fleet-run ... --dry-run                                                # print t
 - **M/G**: 1 team-lead run (Claude opus). It creates worktrees, dispatches devs/reviewers in parallel,
   integrates and writes `T/FINAL-SUMMARY.md`. Orquestra sleeps until the notification.
 - **`--lead codex`** for M/G: EXPERIMENTAL, not tested end to end.
-- Security: `--security auto` (default) enables the security reviewer on G, on a task with `"security": true`,
-  or when the plan mentions auth/secret/input/network. `yes|no` forces it.
+- Sizing (fleet-run refuses otherwise): P = 1 task, ≤5 files, ≤45 min; M = 2–6 tasks, ≤120 min; G = 7–8 tasks,
+  ≤240 min; above 8 tasks, split into several fleets. `"judgment": true` (opus dev) needs `"judgment_reason"`; more
+  than ~30% judgment tasks is a warning in `fleet.json` `sizing_warnings`.
+- Security: per task only where tasks.json sets `"security": true` with `"security_reason"`; otherwise ONE final
+  opus security pass over the whole delivery on M/G (`roles.security.final`). `--security yes` = every task (each
+  still needs a reason); `no` = none.
 - A fleet lead that exits without a fresh `T/FINAL-SUMMARY.md` ends as `incomplete` in the Vigia (with a `detected`
   notification), not `done`.
 

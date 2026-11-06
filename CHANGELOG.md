@@ -5,6 +5,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+- fleet-run sizing gate: P = 1 task/≤5 files/≤45 min, M = 2–6 tasks/≤120 min, G = 7–8 tasks/≤240 min (else split); `judgment`/`security` tasks need a `*_reason`; >30% judgment is a warning. Security no longer auto-enables on plan keywords: per-task review only where justified, plus one final opus pass on M/G.
+
 ## [0.1.0] - 2026-11-03
 
 ### Added

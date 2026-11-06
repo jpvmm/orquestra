@@ -21,7 +21,7 @@ Paths: VIGIA_BIN (default: the bin/ next to this fleet/ folder, i.e. $ORQUESTRA_
 VIGIA_BASE (default $ORQUESTRA_HOME/vigia; ORQUESTRA_HOME defaults to this install, else ~/.orquestra).
 Output: JSON with name, status_path, conversation_path. Exit codes: 2 invalid input, 3 Vigia cap full,
 4 name in use, 5 command not found."""
-import argparse, json, os, re, subprocess, sys, time
+import argparse, json, math, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))          # .../fleet
 BIN = os.path.join(HERE, "bin")
@@ -38,9 +38,6 @@ SKILL = os.path.join(HERE, "skill", "fleet-sdd", "SKILL.md")
 OTHER = {"claude": "codex", "codex": "claude"}
 MODELS = {"claude": {"top": "opus", "mid": "sonnet", "cheap": "haiku"},
           "codex": {"top": "gpt-6-astra", "mid": "gpt-6.1-sol", "cheap": "gpt-6-luna"}}
-# security keywords (English plus a few Portuguese ones, for plans written in Portuguese)
-SEC_WORDS = re.compile(r"\b(auth|login|senha|password|token|segredo|secret|credential|credencia|oauth|jwt|cookie|session|sess[aã]o|"
-                       r"http|rede|network|socket|url|upload|user input|entrada do usu|input|sql|webhook|api key)", re.I)
 
 
 def fail(msg, code=2):
@@ -54,6 +51,41 @@ def read_json(p, default=None):
         return default
     except ValueError as e:
         fail(f"{p}: invalid JSON: {e}")
+
+
+class Sizing:
+    """P/M/G limits: a G above 8 tasks is split into several fleets, not stretched."""
+
+    TASKS = {"P": (1, 1), "M": (2, 6), "G": (7, 8)}
+    MAX_MIN = {"P": 45, "M": 120, "G": 240}
+    P_MAX_FILES = 5
+    JUDGMENT_SHARE = 0.30
+
+    @staticmethod
+    def problems(cx, tasks, max_min):
+        out = []
+        ts = (tasks or {}).get("tasks") or []
+        lo, hi = Sizing.TASKS[cx]
+        if ts and not lo <= len(ts) <= hi:
+            hint = "split it into several fleets" if len(ts) > 8 else "use the size that fits"
+            out.append(f"{cx} takes {lo}-{hi} tasks, tasks.json has {len(ts)}: {hint}")
+        if cx == "P" and ts and len(ts[0].get("files") or []) > Sizing.P_MAX_FILES:
+            out.append(f"P touches at most {Sizing.P_MAX_FILES} files")
+        if max_min and max_min > Sizing.MAX_MIN[cx]:
+            out.append(f"{cx} runs at most {Sizing.MAX_MIN[cx]} min (asked {max_min:g}): split instead")
+        for t in ts:
+            for flag in ("judgment", "security"):
+                if t.get(flag) and not str(t.get(flag + "_reason") or "").strip():
+                    out.append(f"task {t.get('id')}: \"{flag}\": true needs \"{flag}_reason\" (why sonnet/one final pass is not enough)")
+        return out
+
+    @staticmethod
+    def warnings(tasks):
+        ts = (tasks or {}).get("tasks") or []
+        j = sum(1 for t in ts if t.get("judgment"))
+        if len(ts) > 1 and j > math.ceil(Sizing.JUDGMENT_SHARE * len(ts)):
+            return [f"judgment (opus dev) on {j}/{len(ts)} tasks; target <= 30%"]
+        return []
 
 
 def default_roles(cx, lead):
@@ -129,6 +161,8 @@ def main():
     no_cmd = [c.get("id", "?") for c in items if not str(c.get("command", "")).strip()]
     if no_cmd: fail(f"criterion without a proving command: {no_cmd}")
     tasks = read_json(os.path.join(T, "tasks.json"))
+    bad = Sizing.problems(cx, tasks, a.max_min)
+    if bad: fail("sizing: " + "; ".join(bad))
     if cx in ("M", "G"):
         if not tasks: fail("M/G requires tasks.json (DAG: id, files, depends_on)")
         r = subprocess.run([os.path.join(BIN, "fleet-wt"), "--task-dir", T, "waves"], capture_output=True, text=True)
@@ -144,18 +178,25 @@ def main():
     roles = default_roles(cx, a.lead)
     for k, v in (fj.get("roles") or {}).items():   # whatever was already written wins
         if k in roles: roles[k].update(v)
-    text = open(os.path.join(T, "plan.md")).read() + json.dumps(tasks or {}, ensure_ascii=False)
-    sec = {"yes": True, "no": False}.get(a.security)
-    if sec is None:
-        sec = cx == "G" or any(t.get("security") for t in (tasks or {}).get("tasks", [])) or bool(SEC_WORDS.search(text))
-    roles["security"]["enabled"] = sec
+    # Security: per task only where tasks.json justifies it ("security": true + "security_reason"); otherwise ONE final
+    # opus pass over the whole delivery (M/G). --security yes = every task (each still needs a reason); no = none.
+    all_ids = [str(t.get("id")) for t in (tasks or {}).get("tasks", [])]
+    if a.security == "yes":
+        nr = [str(t.get("id")) for t in (tasks or {}).get("tasks", []) if not str(t.get("security_reason") or "").strip()]
+        if nr: fail(f"--security yes: tasks without security_reason: {nr}")
+    per_task = {"yes": all_ids, "no": []}.get(a.security,
+                                             [str(t.get("id")) for t in (tasks or {}).get("tasks", []) if t.get("security")])
+    roles["security"].update(enabled=bool(per_task), tasks=per_task, final=cx != "P" and a.security != "no")
+    sizing_warnings = Sizing.warnings(tasks)
+    for w in sizing_warnings:
+        print(f"fleet-run: warning: {w}", file=sys.stderr)
 
     env = dict(os.environ)
     if os.environ.get("FLEET_WEBHOOK_ENV"):           # per-bot option: another bot's webhook file
         env["VIGIA_WEBHOOK_ENV"] = os.environ["FLEET_WEBHOOK_ENV"]
     webhook = env.get("VIGIA_WEBHOOK_ENV")             # None = Vigia default (Orquestra); "" = muted
     fj.update(complexity=cx, lead=a.lead, task=a.task, repo=repo, roles=roles,
-              max_parallel=int(fj.get("max_parallel", 4)), waves=waves,
+              max_parallel=int(fj.get("max_parallel", 4)), waves=waves, sizing_warnings=sizing_warnings,
               webhook_env=webhook if webhook is not None else f"(Vigia default: {VIGIA_DEFAULT_WEBHOOK})",
               vigia_cap="5 active runs in total (all bots); the lead run counts 1; each Codex run counts 1; Claude subagents do not count",
               updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
@@ -265,7 +306,8 @@ def main():
     if not a.dry_run:
         with open(os.path.join(T, "fleet.json"), "w") as f:
             json.dump(fj, f, indent=2, ensure_ascii=False)
-    print(json.dumps({"fleet_json": os.path.join(T, "fleet.json"), "role": run_role, "webhook_env": webhook, **info}, ensure_ascii=False))
+    print(json.dumps({"fleet_json": os.path.join(T, "fleet.json"), "role": run_role, "webhook_env": webhook,
+                      "security": roles["security"], **info}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

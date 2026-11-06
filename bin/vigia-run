@@ -88,7 +88,8 @@ def base_tests_changed(a):
         return []
     dirs = [a.cwd] + sorted(glob.glob(os.path.join(a.task_dir, "wt", "*")))
     expected = V.ProtectedTests.snapshot_for(a.task_dir, a.cwd, a.protect_base)
-    return V.ProtectedTests.modified(a.protect_base, list(dict.fromkeys(dirs)), expected)
+    manifest = V.ProtectedTests.manifest_for(a.task_dir, a.cwd, a.protect_base)
+    return V.ProtectedTests.modified(a.protect_base, list(dict.fromkeys(dirs)), expected, manifest)
 
 
 # ======================= event analysis =======================

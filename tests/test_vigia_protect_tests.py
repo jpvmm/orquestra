@@ -210,6 +210,35 @@ class TrustedBase(unittest.TestCase):
         open(f, "wb").write(data.replace(b"\n", b"\r\n") + b"# weakened\r\n")
         self.assertEqual(V.ProtectedTests.modified(self.base, [self.repo]), [f"{self.repo}: tests/test_old.py"])
 
+    def test_trusted_manifest_beats_rewritten_git_objects(self):
+        import subprocess
+        V.ProtectedTests.snapshot(self.repo, "HEAD", self.T)
+        f = os.path.join(self.repo, "tests", "test_old.py")
+        open(f, "w").write("# weakened\n")
+        for c in (["git", "add", "."], ["git", "commit", "-qm", "w"]):
+            subprocess.run(c, cwd=self.repo, check=True, env=self.e)
+        forged = V.rev_sha(self.repo, "HEAD")      # stands for git objects rewritten to match the weakened file
+        self.assertEqual(V.ProtectedTests.modified(forged, [self.repo]), [])
+        man = V.ProtectedTests.manifest_for(self.T, self.repo, self.base)
+        self.assertEqual(set(man), {"tests/test_old.py"})
+        self.assertEqual(V.ProtectedTests.modified(forged, [self.repo], manifest=man), [f"{self.repo}: tests/test_old.py"])
+        self.assertIsNone(V.ProtectedTests.manifest_for(self.T, self.repo, forged))   # other base: not trusted
+
+    def test_non_utf8_test_name_does_not_crash(self):
+        import subprocess
+        name = os.fsdecode(b"test_\xff.py")
+        open(os.path.join(self.repo, "tests", name), "w").write("y = 2\n")
+        for c in (["git", "add", "."], ["git", "commit", "-qm", "n"]):
+            subprocess.run(c, cwd=self.repo, check=True, env=self.e)
+        base = V.rev_sha(self.repo, "HEAD")
+        V.ProtectedTests.snapshot(self.repo, base, self.T)
+        man = V.ProtectedTests.manifest_for(self.T, self.repo, base)
+        self.assertIn("tests/" + name, man)
+        self.assertEqual(V.ProtectedTests.modified(base, [self.repo]), [])
+        self.assertEqual(V.ProtectedTests.modified(base, [self.repo], manifest=man), [])
+        os.remove(os.path.join(self.repo, "tests", name))
+        self.assertEqual(len(V.ProtectedTests.modified(base, [self.repo], manifest=man)), 1)
+
     def test_clean_filter_cannot_hide_a_change(self):
         import shutil, subprocess
         keep = os.path.join(self.tmp.name, "orig.py")

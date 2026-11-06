@@ -1066,7 +1066,10 @@ def run_supervisor(a, paths, key, entry):
             if fb.get("pending"):
                 fleet_bin = os.environ.get("FLEET_BIN") or os.path.join(os.path.dirname(V.BIN), "fleet", "bin")
                 fb.pop("pending")
-                fb["relaunch"] = V.LimitFallback.launch_codex_review(st, fleet_bin=fleet_bin)
+                try:
+                    fb["relaunch"] = V.LimitFallback.launch_codex_review(st, fleet_bin=fleet_bin)
+                except Exception as e:   # never leave the non-final limit_handoff behind
+                    fb["relaunch"] = {"launched": False, "error": f"{type(e).__name__}: {e}"}
                 with V.run_lock(paths["status"]):
                     cur = V.read_json(paths["status"]) or st
                     cur["limit_fallback"] = fb
@@ -1076,13 +1079,26 @@ def run_supervisor(a, paths, key, entry):
                         cur["summary"] = (f"Claude limit: review relaunched on Codex as {fb['relaunch']['name']} | "
                                           + (cur.get("summary") or ""))[:500]
                     else:
-                        cur["state"] = fb.get("prior_state") or "failed"
+                        # no review was produced: a clean exit (done) is a failure here; keep a worse prior state
+                        prior = fb.get("prior_state")
+                        cur["state"] = prior if prior in ("failed", "stalled", "timeout", "loop", "killed") else "failed"
                         cur["summary"] = (f"Claude limit: Codex fallback FAILED to launch "
                                           f"({fb['relaunch'].get('error', '?')[:160]}) | " + (cur.get("summary") or ""))[:500]
                     V.write_json_atomic(paths["status"], C.redact_obj(cur))
                     st = cur
         except Exception as e:
             print(f"limit fallback failed: {e}", file=sys.stderr)
+            try:   # persist a final state: waiters must not stay on limit_handoff
+                with V.run_lock(paths["status"]):
+                    cur = V.read_json(paths["status"]) or st or {}
+                    if cur.get("state") == "limit_handoff":
+                        cur["state"] = "failed"
+                        cur["summary"] = (f"Claude limit: Codex fallback FAILED ({type(e).__name__}: {str(e)[:160]}) | "
+                                          + (cur.get("summary") or ""))[:500]
+                        V.write_json_atomic(paths["status"], C.redact_obj(cur))
+                        st = cur
+            except Exception as e2:
+                print(f"could not write the fallback's final state: {e2}", file=sys.stderr)
         # end notification: exactly one (vigia-notify also dedupes per run), after pending notifications
         try:
             if notifier is not None:

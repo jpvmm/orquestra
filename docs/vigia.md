@@ -122,7 +122,7 @@ It kills whatever is left of the group, marks the run `killed` and sends the not
 | `killed` | stopped by `vigia-stop`, by an external signal, or because the supervisor died | check who stopped it |
 | `incomplete` | exited 0 but did not deliver: a fleet lead (`fleet-*-lead-*`) without a fresh, non-empty `T/FINAL-SUMMARY.md` (`incomplete_reason`) | treat as a failure, not `done`: read the alert and decide whether to resume |
 | `limit_paused` | a Claude run (`--tool claude`) hit the subscription usage limit and its role is lead/implement/plan/unknown | wait for the reset in `limit`; relaunch `resume_command` from `T/.fleet/limit-resume.json` (the exact launcher argv, from `ORQ_RELAUNCH_ARGV`) |
-| `limit_fallback` | a Claude **review** hit the limit and was relaunched on Codex (`fleet-codex reviewer`); `limit_fallback.relaunch` has the new run's `name`/`status_path`/`output` (also `fallback_status_path`) | wait on the new run; if the relaunch failed, the state goes back to what it was and `summary` says `fallback FAILED` |
+| `limit_fallback` | a Claude **review** hit the limit and was relaunched on Codex (`fleet-codex reviewer`); `limit_fallback.relaunch` has the new run's `name`/`status_path`/`output` (also `fallback_status_path`) | wait on the new run; if the relaunch failed (or raised), the state is `failed` (no review was produced) and `summary` says `fallback FAILED` |
 | `limit_handoff` | not final: a Claude review hit the limit and the Codex relaunch is being decided (seconds) | keep waiting |
 
 Killing: SIGTERM to the whole group (and to descendants that changed group), wait 10 s (`VIGIA_KILL_GRACE`), then SIGKILL.

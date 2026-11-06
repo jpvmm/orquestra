@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
-- Detect Claude CLI 5-hour usage limit (Claude runs only); a review is really relaunched on Codex (`fleet-codex reviewer`, verified, state `limit_fallback`), a lead/implement/plan/unknown role pauses as `limit_paused` with `T/.fleet/limit-resume.json` holding the exact launcher command (`ORQ_RELAUNCH_ARGV`). The role comes from `vigia-run --role` (set by fleet-run), else the run's own `fleet.json` entry, else its name. Usage lines append to `progress.md` when present. fleet-wait/fleet-codex treat both states as terminal. The limit is also found in the final result text (stdout, exit 0); while the Codex relaunch is decided the run shows the non-final `limit_handoff`, so waiters never see a final state before the new run exists.
+- Detect Claude CLI 5-hour usage limit (Claude runs only); a review is really relaunched on Codex (`fleet-codex reviewer`, verified, state `limit_fallback`), a lead/implement/plan/unknown role pauses as `limit_paused` with `T/.fleet/limit-resume.json` holding the exact launcher command (`ORQ_RELAUNCH_ARGV`). The role comes from `vigia-run --role` (set by fleet-run), else the run's own `fleet.json` entry, else its name. Usage lines append to `progress.md` when present. fleet-wait/fleet-codex treat both states as terminal. The limit is also found in the final result text (stdout, exit 0); while the Codex relaunch is decided the run shows the non-final `limit_handoff`, so waiters never see a final state before the new run exists. A relaunch that fails or raises ends the run as `failed`.
 
 
 ## [0.1.0] - 2026-11-03

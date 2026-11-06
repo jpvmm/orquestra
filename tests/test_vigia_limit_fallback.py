@@ -176,7 +176,14 @@ class VigiaRunEndToEnd(unittest.TestCase):
     def test_failed_relaunch_restores_the_prior_state(self):
         with tempfile.TemporaryDirectory() as td:
             st = self.review_with_stdout_limit(td, "#!/bin/sh\necho '{\"error\": \"cap\"}'\nexit 3\n")
-            self.assertNotIn(st["state"], ("limit_handoff", "limit_fallback"))
+            self.assertEqual(st["state"], "failed")      # exit 0 but no review produced: not done
+            self.assertIn("FAILED", st["summary"])
+
+    def test_fallback_exception_still_ends_in_a_final_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            open(os.path.join(td, ".fleet"), "w").close()   # the fallback prompt file cannot be written
+            st = self.review_with_stdout_limit(td, "#!/bin/sh\necho '{\"state\": \"running\"}'\n")
+            self.assertEqual(st["state"], "failed")
             self.assertIn("FAILED", st["summary"])
 
     def test_codex_run_is_not_a_claude_limit(self):

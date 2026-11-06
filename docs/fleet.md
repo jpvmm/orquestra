@@ -31,6 +31,19 @@ so nothing is rendered at install time.
 then the fleet writes `fleet.json`, `fleet-state.json`, `progress.md`, `briefs/`, `reports/`, `review/`, `patches/`,
 `wt/integration`, `wt/task-ID`, `FINAL-SUMMARY.md`.
 
+Criteria gate (fleet-run refuses the start otherwise): each `command` is a WHITELISTED proof, ≤240 chars, joined only
+with `&&` (no `||`, `;`, `|`, `&`, subshells or `$(...)`, so nothing masks a failure). Allowed simple commands:
+`cd DIR` (literal; later relative paths resolve from it) and `VAR=value` prefixes (not `PATH`, `HOME`, `PYTHONHOME`,
+`PYTHONOPTIMIZE`, `BASH_ENV`, nor `PYTEST_*`/`LD_*`/`GO*`/`CARGO*`/`NODE_*`/`npm_*` variables); arguments must be literal
+(no `$`, backslashes, or unquoted `*?[]{}~`) no redirection except `2>&1`, and no quoted operator characters (`'&&'` would be a mere argument); a test runner — `pytest`, `python3 -m pytest|unittest`, `npm|pnpm|yarn test`,
+`go test`, `cargo test` (bare, or by path only when it is a real Python binary or the same file `PATH` resolves the runner to; `python -m`
+refuses a `pytest.py`/`unittest`/`sitecustomize.py` that would shadow the runner in the cwd or `PYTHONPATH`), without
+a whitelist of arguments per runner (no help/listing/no-run modes, `-exec`, plugins, config files or name filters that can select nothing); an existing text script under `T/checks/` (absolute path, or `bash|sh` + that
+path). Everything else is refused: inline code (`python3 -c`, `node -e`, `bash -c`), other programs, wrappers (`env`,
+`exec`, `timeout`, `xargs`, `find`) and shell options. A UI criterion (`"when": "ui"` or id `C-UI*`) names its proof
+file in `artifact` and always checks it explicitly with `test -s ARTIFACT` (`test -s` is allowed only there; a
+`T/checks` script may check more). Criteria never change during a run; only a replan changes them.
+
 ## Usage
 ```
 export PATH="$HOME/.orquestra/fleet/bin:$HOME/.local/bin:$PATH"     # or $ORQUESTRA_HOME/fleet/bin
@@ -43,7 +56,8 @@ fleet-run ... --dry-run                                                # print t
 - **P**: no lead. 1 dev run + 1 reviewer run of the other tool (2 Orquestra wake-ups). One task (`task-1`) per folder.
 - **M/G**: 1 team-lead run (Claude opus). It creates worktrees, dispatches devs/reviewers in parallel,
   integrates and writes `T/FINAL-SUMMARY.md`. Orquestra sleeps until the notification.
-- **`--lead codex`** for M/G: EXPERIMENTAL, not tested end to end.
+- **`--lead codex`** is P only: fleet-run refuses a Codex M/G lead (its sandbox has no network, so it could not
+  launch agents; turning network on is what push/exfiltration needs).
 - Security: `--security auto` (default) enables the security reviewer on G, on a task with `"security": true`,
   or when the plan mentions auth/secret/input/network. `yes|no` forces it.
 - A fleet lead that exits without a fresh `T/FINAL-SUMMARY.md` ends as `incomplete` in the Vigia (with a `detected`
@@ -51,7 +65,8 @@ fleet-run ... --dry-run                                                # print t
 
 ## What the fleet may not do (and why)
 The fleet never publishes. `fleet-run` launches every Claude run (lead, dev, reviewer) with
-`--disallowedTools "Bash(git commit:*)" "Bash(git push:*)" "Bash(git merge:*)" "Bash(git rebase:*)" "Bash(gh:*)" "Bash(rm -rf *)"`.
+`--disallowedTools "Bash(git commit:*)" "Bash(git push:*)" "Bash(git merge:*)" "Bash(git rebase:*)" "Bash(gh:*)" "Bash(rm -rf *)"`,
+plus `curl`/`wget` and Read/Edit/Write of `.env*`/`webhook.env`, and `--strict-mcp-config` (no MCP servers).
 Each task becomes a patch (git *tree* snapshots, no commits) and the result stays in `T/wt/integration`
 (detached at BASE, changes in index/tree). Orquestra checks the integration (criteria commands, suite) and only
 then commits, pushes and opens/merges the PR itself, per the AUTONOMY section of its prompt. Codex devs run in the
@@ -93,7 +108,11 @@ inside the lead do NOT count (practical limit ~20). Hence `max_parallel=4`: lead
 - `tasks.json` `files` must list EVERY file a task may edit (including "only if needed" ones): waves only keep
   same-file tasks apart through that list.
 - Codex dev has no network: HTTP/socket tests fail there; the lead runs those in the integration.
-- The lead does NOT use the Vigia's `--protect-tests` (devs write tests first on purpose).
+- The lead runs with `--protect-tests`, scoped by a snapshot in `$VIGIA_BASE/protected/` (the base commit's test files,
+  snapshot at `fleet-wt init`): devs may ADD test files (TDD) but not edit existing ones; a subagent's attempt is denied
+  and recorded as an alert, while the lead's own attempt stops the run as `loop`. The hook is best effort; the hard
+  gate runs when the lead (or a dev) ends: fleet-run passes the base by argv and Vigia compares every base test's
+  content in the integration and task worktrees; any change → `loop`.
 - Vigia secret redaction may turn text like `pwd: ...` into `***` in conversation.md (false positive).
 
 ## Tests

@@ -52,7 +52,8 @@ $B/vigia-run --tool codex --task-dir /path/to/task --name t1-codex --task "revie
 | `--max-min N` | 20 | maximum wall-clock time |
 | `--max-turns-hint N` | none | more than N tool calls: alert; more than 2N: loop (growing scope) |
 | `--max-files N` | none | more than N distinct files edited: loop (growing scope) |
-| `--protect-tests` | off | any write to a test file is a loop; the hook also **denies** the edit (Edit/Write in Claude, `apply_patch` in Codex) |
+| `--protect-tests` | off | a write to a protected test file is a loop; the hook also **denies** the edit (Edit/Write in Claude, `apply_patch` in Codex, and shell writes such as `>`, `sed -i`, `rm`). Protected = listed in fleet-run's snapshot `$VIGIA_BASE/protected/<hash of TASK_DIR>.txt` (base tests; new test files allowed; kept outside the agent-writable task dir), or any test-named file inside the run cwd when that list does not exist |
+| `--protect-base SHA` | none | with `--protect-tests`: the protected list comes from git at SHA, and when the run ends any base test changed/deleted (by content) in cwd or `TASK_DIR/wt/*` turns `done` into `loop` (fails closed if it cannot verify). The expected contents come from fleet-run's manifest (taken before launch) when it matches SHA |
 | `--loop-repeat N` | 3 | how many repetitions count as a loop |
 | `--task TEXT` | none | short task description shown in status, notifications and `vigia-status` |
 | `--role ROLE` | none | the run's real role (`plan`, `review`, `implement`, `lead`); decides the Claude usage-limit follow-up |

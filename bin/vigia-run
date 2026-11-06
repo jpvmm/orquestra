@@ -22,7 +22,7 @@ a JSON object with the status path. Exit 0 = started; 2 = bad usage; 3 = active-
 Paths: state lives in $VIGIA_BASE (default $ORQUESTRA_HOME/vigia, default ~/.orquestra/vigia);
 per-run files live in <task-dir>/runs/.
 """
-import argparse, ctypes, hashlib, json, os, re, shlex, signal, shutil, subprocess, sys, time
+import argparse, ctypes, glob, hashlib, json, os, re, shlex, signal, shutil, subprocess, sys, time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -58,6 +58,9 @@ def parse():
                    help="expected tool calls: above this is an alert, above 2x is a loop (growing scope)")
     p.add_argument("--max-files", type=int, default=0, help="number of distinct edited files above which it counts as growing scope (loop)")
     p.add_argument("--protect-tests", action="store_true")
+    p.add_argument("--protect-base", default=None,
+                   help="commit whose tests are protected (fleet-run passes the base): the list comes from git, not a "
+                        "file, and when the run ends any changed/deleted base test in cwd or T/wt/* makes it a loop")
     p.add_argument("--loop-repeat", type=int, default=3, help="repetitions of the same error/cycle that count as a loop")
     p.add_argument("--cwd", default=None)
     p.add_argument("--foreground", action="store_true", help="do not detach (debug)")
@@ -76,7 +79,19 @@ def parse():
     a.cwd = os.path.abspath(a.cwd or os.getcwd())
     a.prompt_file = os.path.abspath(a.prompt_file) if a.prompt_file else None
     a.task = re.sub(r"\s+", " ", a.task).strip()[:300] if a.task else None
+    if a.protect_base:   # the supervisor's own checks read the same trusted base as the hooks
+        os.environ["VIGIA_PROTECT_BASE"], os.environ["VIGIA_CWD"] = a.protect_base, a.cwd
     return a
+
+
+def base_tests_changed(a):
+    """Command-agnostic gate: base tests changed/deleted (by content) in the run cwd or any T/wt/* worktree."""
+    if not (a.protect_tests and a.protect_base):
+        return []
+    dirs = [a.cwd] + sorted(glob.glob(os.path.join(a.task_dir, "wt", "*")))
+    expected = V.ProtectedTests.snapshot_for(a.task_dir, a.cwd, a.protect_base)
+    manifest = V.ProtectedTests.manifest_for(a.task_dir, a.cwd, a.protect_base)
+    return V.ProtectedTests.modified(a.protect_base, list(dict.fromkeys(dirs)), expected, manifest)
 
 
 # ======================= event analysis =======================
@@ -128,19 +143,38 @@ class Analyzer:
         if self.error_counts[sig] >= self.a.loop_repeat and not self.loop:
             self.loop = f"same error {self.error_counts[sig]}x ({origin}): {str(msg_text).strip()[:200]}"
 
-    def _edit(self, path, file_content=""):
+    def _protect_roots(self):
+        """Run cwd (+ task_dir if distinct): --protect-tests only applies inside these."""
+        rs = []
+        for c in (getattr(self.a, "cwd", None), getattr(self.a, "task_dir", None)):
+            if c and c not in rs:
+                rs.append(c)
+        return rs
+
+    def _edit(self, path, file_content="", own=True):
+        """own=False: an edit by a subagent of this run (the lead's devs). The hook already denies protected tests
+        for them; here it is only an alert and it does not count toward this run's scope/loop signals."""
         if not path:
+            return
+        protected = self.a.protect_tests and V.is_test(path, roots=self._protect_roots(), task_dir=self.a.task_dir)
+        if not own:
+            if protected:
+                self._plain_alert(f"subagent tried to edit a protected test: {path}")
             return
         self.files.add(path)
         self.edits_since_test.append(V.h(path, file_content))
-        if self.a.protect_tests and V.is_test(path) and not self.loop:
+        if protected and not self.loop:
             self.loop = f"touched a protected test file: {path}"
         if self.a.max_files and len(self.files) > self.a.max_files and not self.loop:
             self.loop = f"growing scope: {len(self.files)} files edited (> --max-files {self.a.max_files})"
 
-    def _shell(self, cmd):
-        for p in V.shell_test_writes(cmd):
-            self._edit(p, "shell:" + cmd)
+    def _plain_alert(self, txt):
+        if txt not in self.alerts and len(self.alerts) < 10:
+            self.alerts.append(txt)
+
+    def _shell(self, cmd, own=True):
+        for p in V.shell_test_writes(cmd, roots=self._protect_roots(), task_dir=self.a.task_dir):
+            self._edit(p, "shell:" + cmd, own)
 
     def _test(self, cmd, output, failed):
         sig = V.h(sorted(self.edits_since_test), V.normalize(cmd, 200), V.normalize(output, 600), failed)
@@ -182,12 +216,14 @@ class Analyzer:
                         self.conv.subagent_call(c.get("id"), inp.get("subagent_type"), inp.get("description"), inp.get("prompt"))
                     else:
                         self._conv("tool", C.tool_line(name, inp), who)
-                    self._tool_call()
+                    own = not who   # loop/scope signals count only this run's own calls, not its subagents'
+                    if own:
+                        self._tool_call()
                     if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
                         self._edit(inp.get("file_path") or inp.get("notebook_path"),
-                                   json.dumps(inp, sort_keys=True)[:5000])
+                                   json.dumps(inp, sort_keys=True)[:5000], own)
                     elif name == "Bash":
-                        self._shell(inp.get("command", ""))
+                        self._shell(inp.get("command", ""), own)
                 elif c.get("type") == "text" and c.get("text"):
                     if not who:
                         self.last_msg = c["text"]
@@ -204,9 +240,12 @@ class Analyzer:
                 if name in ("Task", "Agent"):
                     self._conv("sub_result", content, (inp or {}).get("subagent_type") or "subagent")
                 if c.get("is_error"):
-                    self._error(f"tool:{name}", content)
+                    if ev.get("parent_tool_use_id"):   # a subagent's failed call: not this run's loop signal
+                        self._alert(str(content))
+                    else:
+                        self._error(f"tool:{name}", content)
                     self._conv("error", f"{name}: {str(content)[:300]}")
-                if name == "Bash" and V.TEST_CMD_RE.search(inp.get("command", "")):
+                if name == "Bash" and V.TEST_CMD_RE.search(inp.get("command", "")) and not ev.get("parent_tool_use_id"):
                     self._test(inp.get("command", ""), content, bool(c.get("is_error")))
         elif t == "rate_limit_event":
             info = ev.get("rate_limit_info") or {}
@@ -314,19 +353,24 @@ class Analyzer:
             return self.codex_hook(ev)
         if self.stream_claude:
             return
+        own = not ev.get("agent_id")   # hook events from a subagent carry agent_id
         if event_name == "PostToolUse" or event_name == "PostToolUseFailure":
             name, inp = ev.get("tool_name"), ev.get("tool_input") or {}
-            self._tool_call()
+            if own:
+                self._tool_call()
             if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
-                self._edit(inp.get("file_path") or inp.get("notebook_path"), ev.get("edit_sig", ""))
+                self._edit(inp.get("file_path") or inp.get("notebook_path"), ev.get("edit_sig", ""), own)
             if name == "Bash":
-                self._shell(inp.get("command", ""))
-                if V.TEST_CMD_RE.search(inp.get("command", "")):
+                self._shell(inp.get("command", ""), own)
+                if own and V.TEST_CMD_RE.search(inp.get("command", "")):
                     self._test(inp.get("command", ""), ev.get("output", ""), event_name == "PostToolUseFailure")
             if event_name == "PostToolUseFailure":
-                self._error(f"tool:{name}", ev.get("error", ""))
+                if own:
+                    self._error(f"tool:{name}", ev.get("error", ""))
+                else:
+                    self._alert(ev.get("error", ""))
         elif event_name == "PreToolUse" and ev.get("denied"):
-            self._edit(ev.get("path"), "denied")
+            self._edit(ev.get("path"), "denied", own)
         elif event_name == "StopFailure":
             self._alert(str(ev.get("error", "")) + " " + str(ev.get("matcher", "")))
         elif event_name == "SubagentStop":
@@ -500,7 +544,7 @@ def supervise(a, paths, key, notifier=None):
         "checked_at": None, "summary": "", "loop_reason": None, "alerts": [],
         "limits": {"stall_min": a.stall_min, "max_min": a.max_min, "max_turns_hint": a.max_turns_hint,
                    "max_files": a.max_files, "protect_tests": a.protect_tests, "loop_repeat": a.loop_repeat,
-                   "role": a.role},
+                   "protect_base": a.protect_base, "role": a.role},
         "role": a.role, "output": os.path.abspath(a.output) if a.output else None,
         "relaunch_argv": relaunch_argv_from_environ(),
         "stats": {}, "kill": None, "paths": paths,
@@ -565,6 +609,9 @@ def supervise(a, paths, key, notifier=None):
     env["VIGIA_HEARTBEAT"] = paths["hooks"]
     env["VIGIA_RUN"] = a.name
     env["VIGIA_PROTECT_TESTS"] = "1" if a.protect_tests else "0"
+    env["VIGIA_PROTECT_BASE"] = a.protect_base or ""
+    env["VIGIA_CWD"] = a.cwd or ""
+    env["VIGIA_TASK_DIR"] = a.task_dir or ""
 
     ev_f = open(paths["events"], "ab")
     err_f = open(paths["stderr"], "ab")
@@ -724,6 +771,14 @@ def supervise(a, paths, key, notifier=None):
             st["state"] = "failed"
         if an.result and an.result.get("is_error") and st["state"] == "done":
             st["state"] = "failed"
+    changed = base_tests_changed(a)
+    if changed:
+        txt = "base tests changed: " + ", ".join(changed[:5])
+        if st["state"] == "done":
+            st["state"], st["loop_reason"], st["summary"] = "loop", txt, "loop: " + txt
+        elif txt not in an.alerts:
+            an.alerts.append(txt)
+            st["alerts"] = an.alerts
     st["exit_code"] = rc
     st["ended_at"] = V.now_iso()
     st["duration_sec"] = int(time.time() - w0)       # wall clock

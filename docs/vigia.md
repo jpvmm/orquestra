@@ -204,7 +204,7 @@ Example (`finished` after `vigia-stop`):
 ```
 
 **Redaction.** Before anything is written to `prompt.md`, `conversation.md`, `status.json`, `events.jsonl` or the webhook payload, likely secrets are masked: API keys (`sk-...`, `ghp_...`, `xox...`, `AKIA...`, JWTs...), `Bearer` tokens, private-key blocks, and `NAME=value` pairs whose name looks like a secret (`*_KEY`, `*TOKEN*`, `PASSWORD`...). Test: `python3 tests/test_vigia_comms.py`.
-The raw CLI files (`<name>.events.jsonl`, `stderr.log`, `hooks.jsonl`) and `vigia.log` are **not** redacted; treat them as sensitive.
+The raw CLI files (`<name>.events.jsonl`, `stderr.log`) and `vigia.log` are **not** redacted; treat them as sensitive. `hooks.jsonl` is redacted by the hooks themselves (each field before it is shortened; structured tool responses before they are serialized; quoted values are masked whole).
 
 ### Set up the wake-up webhook
 
@@ -239,7 +239,7 @@ The file is parsed as `KEY=value` and never executed. To test without touching t
 - Events enabled: SessionStart, PreToolUse, PostToolUse, PostToolUseFailure, Stop, SubagentStop and StopFailure.
 - Each one writes a line to `<name>.hooks.jsonl`, through the `VIGIA_HEARTBEAT` variable that `vigia-run` sets.
 - Outside Vigia, without that variable, the hook does nothing.
-- The hook writes nothing to stdout and always exits 0. The only exception is `--protect-tests`: it then returns `permissionDecision: deny` on PreToolUse for Edit, Write, MultiEdit or NotebookEdit on a test file.
+- The hook writes nothing to stdout and always exits 0. Exceptions (PreToolUse `permissionDecision: deny`): any tool call that names a secret file (`.env`, `.env.*` except `.example`/`.sample`/`.template`, `webhook.env`, or a glob that could match them), always; and, with `--protect-tests`, Edit, Write, MultiEdit or NotebookEdit on a protected test file. A denied secret access is recorded as `"denied": "secret"` and becomes an alert, not a loop signal.
 - Test files: `tests/`, `test/`, `__tests__/`, `spec/`, `test_*`, `*_test.*`, `*.spec.*`, `*.test.*` and `conftest.py`.
 - Warning: in `-p` mode an invalid settings file is silently ignored. If `hooks.jsonl` stays empty, be suspicious.
 - Tip: if a global PreToolUse hook in `~/.claude/settings.json` points to a script that does not exist and fails closed, every tool call in `claude -p` gets blocked. Check your global settings if runs fail that way.

@@ -2,7 +2,7 @@
 """Claude Code hook (enabled per run via `--settings $ORQUESTRA_HOME/bin/claude-hooks.json`).
 Reads the hook event JSON on stdin and appends a short line to $VIGIA_HEARTBEAT (set by vigia-run).
 Outside Vigia (no VIGIA_HEARTBEAT) it does nothing. Never prints to stdout and always exits 0,
-except: with VIGIA_PROTECT_TESTS=1 it denies (PreToolUse) edits and Bash writes to protected test files (the ones
+except: it denies (PreToolUse) any read/write of secret files (.env, webhook.env); with VIGIA_PROTECT_TESTS=1 it denies (PreToolUse) edits and Bash writes to protected test files (the ones
 that exist on the base, per fleet-run's snapshot; without it, any test) inside the run cwd/task dir. Rule: HookPolicy."""
 import hashlib, json, os, sys
 from datetime import datetime
@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vigia_lib import HookPolicy
+from vigia_comms import redact, redact_obj
 EDIT = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 
 
@@ -37,25 +38,25 @@ def main():
             rec["agent_id"] = ev.get("agent_id")
         if tool:
             rec["tool_name"] = tool
-            rec["tool_input"] = {k: (str(v)[:500]) for k, v in inp.items()
+            rec["tool_input"] = {k: redact(str(v))[:500] for k, v in inp.items()
                                    if k in ("file_path", "notebook_path", "command", "pattern", "path", "url")}
             if tool in EDIT:
                 rec["edit_sig"] = hashlib.sha1(json.dumps(inp, sort_keys=True).encode()).hexdigest()[:16]
         if name == "PostToolUse" and tool == "Bash":
             resp = ev.get("tool_response")
-            rec["output"] = (json.dumps(resp, ensure_ascii=False) if not isinstance(resp, str) else resp)[-1500:]
+            rec["output"] = redact(json.dumps(redact_obj(resp), ensure_ascii=False) if not isinstance(resp, str) else resp)[-1500:]
         if name in ("PostToolUseFailure", "StopFailure"):
-            rec["error"] = str(ev.get("error") or ev.get("error_message") or ev.get("tool_response") or "")[-1500:]
+            rec["error"] = redact(str(redact_obj(ev.get("error") or ev.get("error_message") or ev.get("tool_response") or "")))[-1500:]
             rec["matcher"] = ev.get("error_type") or ev.get("matcher")
         if name in ("Stop", "SubagentStop"):
             rec["agent_type"] = ev.get("agent_type")
-            rec["last_message"] = str(ev.get("last_assistant_message") or "")[:300]
+            rec["last_message"] = redact(str(ev.get("last_assistant_message") or ""))[:300]
         if deny:
-            rec["denied"] = True
-            rec["path"] = file_path or str(inp.get("command") or "")[:200]
+            rec["denied"] = "secret" if deny == HookPolicy.SECRET else "test"
+            rec["path"] = file_path or redact(str(inp.get("command") or ""))[:200]
         try:
             with open(target, "a") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.write(json.dumps(redact_obj(rec), ensure_ascii=False) + "\n")
         except Exception:
             pass
     if deny:

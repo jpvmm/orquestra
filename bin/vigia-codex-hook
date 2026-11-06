@@ -2,13 +2,14 @@
 """Codex CLI hook (vigia-run injects it via `-c hooks.*` + `--dangerously-bypass-hook-trust`, for that run only).
 Reads the hook event JSON on stdin and appends a short line to $VIGIA_HEARTBEAT (same format as
 vigia-claude-hook). Outside Vigia (no VIGIA_HEARTBEAT) it does nothing. Never prints to stdout and always exits 0,
-except: with VIGIA_PROTECT_TESTS=1 it denies (PreToolUse) an apply_patch or shell write that touches a protected
+except: it denies (PreToolUse) any read/write of secret files (.env, webhook.env); with VIGIA_PROTECT_TESTS=1 it denies (PreToolUse) an apply_patch or shell write that touches a protected
 test file. Rule: HookPolicy."""
 import hashlib, json, os, re, sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vigia_lib import HookPolicy, is_test, now_iso
+from vigia_lib import HookPolicy, is_test, now_iso, touches_secret
+from vigia_comms import redact, redact_obj
 
 PATCH_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$", re.M)
 
@@ -44,24 +45,26 @@ def main():
                 rec["files"] = files[:50]
                 rec["edit_sig"] = hashlib.sha1(str(inp.get("command")).encode()).hexdigest()[:16]
             else:
-                rec["tool_input"] = {k: str(v)[:500] for k, v in inp.items()
+                rec["tool_input"] = {k: redact(str(v))[:500] for k, v in inp.items()
                                        if k in ("command", "file_path", "path", "pattern", "url", "query")}
         if name == "PostToolUse" and tool in ("Bash", "apply_patch"):
             resp = ev.get("tool_response")
-            rec["output"] = (resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False))[-1500:]
+            rec["output"] = redact(resp if isinstance(resp, str) else json.dumps(redact_obj(resp), ensure_ascii=False))[-1500:]
         if name == "SessionStart":
             rec["source"] = ev.get("source")
             rec["model"] = ev.get("model")
         if name in ("Stop", "SubagentStop"):
             rec["agent_type"] = ev.get("agent_type")
-            rec["last_message"] = str(ev.get("last_assistant_message") or "")[:300]
+            rec["last_message"] = redact(str(ev.get("last_assistant_message") or ""))[:300]
         if deny:
-            rec["denied"] = True
-            rec["path"] = next((p for p in files if is_test(p, roots=[env["VIGIA_CWD"]], task_dir=env.get("VIGIA_TASK_DIR") or None)),
-                               str(inp.get("command") or "")[:200])
+            secret = deny == HookPolicy.SECRET
+            rec["denied"] = "secret" if secret else "test"
+            hit = (lambda p: touches_secret(p)) if secret else \
+                (lambda p: is_test(p, roots=[env["VIGIA_CWD"]], task_dir=env.get("VIGIA_TASK_DIR") or None))
+            rec["path"] = next((p for p in files if hit(p)), redact(str(inp.get("command") or ""))[:200])
         try:
             with open(target, "a") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.write(json.dumps(redact_obj(rec), ensure_ascii=False) + "\n")
         except Exception:
             pass
     if deny:

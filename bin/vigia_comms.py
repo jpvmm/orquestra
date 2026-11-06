@@ -18,7 +18,9 @@ PREVIEW = 500
 # ---------------------------------------------------------------- redaction
 
 _ENV_NAME = r"(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|private[_-]?key|key|token|secret|password|passwd|pwd|pass|passphrase|credentials?|auth)"
-_ASSIGN_RE = re.compile(r"\b(" + _ENV_NAME + r")(\b[\"']?\s*(?:=|:)\s*)([\"']?)([^\s\"',;]+)", re.I)
+# value: \"escaped\" (inside serialized JSON) | "quoted" / 'quoted' (whole value, spaces included) | bare
+_ASSIGN_RE = re.compile(r"\b(" + _ENV_NAME + r")(\b\\?[\"']?\s*(?:=|:)\s*)"
+                        r"(?:(\\\")((?:[^\"\\\n]|\\[^\"\n])*)\\\"|([\"'])([^\n]*?)\5|([\"']?)([^\s\"',;\\]+))", re.I)
 _SECRET_RES = [
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S),
      "-----BEGIN PRIVATE KEY-----***-----END PRIVATE KEY-----"),
@@ -42,11 +44,18 @@ def _looks_secret(v):
 
 
 def _assign(m):
-    name, sep, q, val = m.group(1), m.group(2), m.group(3), m.group(4)
+    name, sep = m.group(1), m.group(2)
+    if m.group(3):
+        q, val, close = m.group(3), m.group(4), m.group(3)
+    elif m.group(5):
+        q, val, close = m.group(5), m.group(6), m.group(5)
+    else:
+        q, val, close = m.group(7), m.group(8), ""
     env_style = name.isupper() and "=" in sep  # FOO_KEY=..., TOKEN=...: always masked
-    if val.startswith("***") or not (env_style or _looks_secret(val)):
+    quoted_secret = bool(close) and len(val.strip()) >= 6 and not val.startswith(("$", "<"))
+    if val.startswith("***") or not (env_style or quoted_secret or _looks_secret(val)):
         return m.group(0)
-    return f"{name}{sep}{q}***"
+    return f"{name}{sep}{q}***{close}"
 
 
 def redact(text):

@@ -645,26 +645,41 @@ class ProtectedTests:
         return bool(ProtectedTests.candidates(path, roots, task_dir) & listed)
 
 
+SECRET_RE = re.compile(r"(^|[\s/'\"=<>:])(\.env(\.(?!example\b|sample\b|template\b)[\w.-]+)?|webhook\.env)(?=$|[\s'\";|&)<>])"
+                        r"|(^|[\s/'\"=<>:])[.*?\[\]]*\.?e[*?\[\]nv]*[*?\[\]][\w*?\[\].-]*(?=$|[\s'\";|&)<>])"   # globs: .env*, .e?v
+                        r"|webhook[*?\[]")
+
+
+def touches_secret(text):
+    """Command/path that names a .env (not .env.example/.sample/.template) or webhook.env file."""
+    return bool(SECRET_RE.search(str(text or "")))
+
+
 class HookPolicy:
-    """PreToolUse decision shared by vigia-claude-hook and vigia-codex-hook (one place for the rule)."""
+    """PreToolUse decisions shared by vigia-claude-hook and vigia-codex-hook (one place for the rules)."""
 
     EDIT = ("Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch")
     SHELL = ("Bash", "shell", "local_shell", "exec_command")
     TEST = "Test file protected by Vigia (it exists on the base): do not edit it; add a new test file if needed."
+    SECRET = "Secret file (.env / webhook.env) blocked by Vigia: do not read or write it."
 
     @staticmethod
     def deny_reason(event, tool, inp, files=(), env=None):
         """Reason to deny this tool call, or None. files = paths an apply_patch touches."""
-        env = os.environ if env is None else env
-        if event != "PreToolUse" or env.get("VIGIA_PROTECT_TESTS") != "1":
+        if event != "PreToolUse":
             return None
+        env = os.environ if env is None else env
         inp = inp if isinstance(inp, dict) else {}
+        cmd = str(inp.get("command") or inp.get("cmd") or "") if tool in HookPolicy.SHELL else ""
+        paths = [p for p in (inp.get("file_path"), inp.get("notebook_path"), inp.get("path")) if p] + list(files)
+        if any(touches_secret(p) for p in paths) or (cmd and touches_secret(cmd)):   # always on, any tool
+            return HookPolicy.SECRET
+        if env.get("VIGIA_PROTECT_TESTS") != "1":
+            return None
         task_dir = env.get("VIGIA_TASK_DIR") or None
         roots = [x for x in (env.get("VIGIA_CWD"), task_dir) if x] or None
-        paths = [p for p in (inp.get("file_path"), inp.get("notebook_path")) if p] + list(files)
         if tool in HookPolicy.EDIT and any(is_test(p, roots=roots, task_dir=task_dir) for p in paths):
             return HookPolicy.TEST
-        cmd = str(inp.get("command") or inp.get("cmd") or "") if tool in HookPolicy.SHELL else ""
         if cmd and shell_test_writes(cmd, roots=roots, task_dir=task_dir):
             return HookPolicy.TEST
         return None

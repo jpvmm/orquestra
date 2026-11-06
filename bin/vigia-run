@@ -132,6 +132,10 @@ class Analyzer:
             if m not in self.alerts and len(self.alerts) < 10:
                 self.alerts.append(m)
 
+    def _free_alert(self, txt):
+        if txt not in self.alerts and len(self.alerts) < 10:
+            self.alerts.append(txt)
+
     def _error(self, origin, msg_text):
         self.last_error = str(msg_text)[-300:]
         self._alert(msg_text)
@@ -269,6 +273,9 @@ class Analyzer:
             self.model = self.model or ev.get("model")
         if event_name == "SubagentStop":
             self._conv("sub_result", ev.get("last_message") or "(no message)", ev.get("agent_type") or "subagent")
+        if event_name == "PreToolUse" and ev.get("denied") == "secret":
+            self._free_alert(f"denied: tried to touch a secret file ({name})")
+            return
         if event_name == "PreToolUse" and ev.get("denied"):
             # a denied apply_patch does not show up in --json: count it as an attempt to touch a test
             self._edit(ev.get("path"), "denied")
@@ -366,6 +373,8 @@ class Analyzer:
                     self._error(f"tool:{name}", ev.get("error", ""))
                 else:
                     self._alert(ev.get("error", ""))
+        elif event_name == "PreToolUse" and ev.get("denied") == "secret":
+            self._free_alert(f"denied: tried to touch a secret file ({ev.get('tool_name')})")
         elif event_name == "PreToolUse" and ev.get("denied"):
             self._edit(ev.get("path"), "denied", own)
         elif event_name == "StopFailure":

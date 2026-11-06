@@ -447,19 +447,20 @@ def _under_roots(path, roots):
 class ProtectedTests:
     """--protect-tests protects the test files that already exist on the base commit.
 
-    fleet-run snapshots them into T/.fleet/protected-tests.txt (one repo-relative path per line). With the
-    snapshot only those paths are protected, so TDD can add NEW test files. Without it (older task folders,
-    raw vigia-run) every test-named path is protected, as before."""
-
-    REL = os.path.join(".fleet", "protected-tests.txt")
+    fleet-run snapshots them into $VIGIA_BASE/protected/<hash of T>.txt (one repo-relative path per line). The list
+    lives in Vigia's folder, not in T, because agents can write T. With the snapshot only those paths are
+    protected, so TDD can add NEW test files. Without it (older task folders, raw vigia-run) every test-named
+    path is protected, as before."""
 
     @staticmethod
     def path(task_dir):
-        return os.path.join(task_dir, ProtectedTests.REL) if task_dir else None
+        if not task_dir:
+            return None
+        return os.path.join(BASE, "protected", h(os.path.abspath(task_dir)) + ".txt")
 
     @staticmethod
     def snapshot(repo, rev, task_dir):
-        """Write the base commit's test files to T/.fleet/protected-tests.txt; return (path, count)."""
+        """Write the base commit's test files to task_dir's protected list; return (path, count)."""
         import subprocess
         out = subprocess.run(["git", "ls-tree", "-r", "-z", "--name-only", rev], cwd=repo,
                              capture_output=True, text=True, check=True).stdout
@@ -483,10 +484,13 @@ class ProtectedTests:
 
     @staticmethod
     def candidates(path, roots, task_dir):
-        """Repo-relative forms of path: after T/wt/<worktree>/, or relative to a root, or as given."""
+        """Repo-relative forms of path: after T/wt/<worktree>/, or relative to a root. A relative path is resolved
+        against the run cwd (first root) first, so ../task-1/tests/x.py is seen as that worktree's file."""
         p = str(path)
         if not os.path.isabs(p):
-            return {os.path.normpath(p)}
+            if not roots:
+                return {os.path.normpath(p)}
+            p = os.path.join(roots[0], p)
         p = os.path.abspath(p)
         out = set()
         if task_dir:
@@ -503,7 +507,11 @@ class ProtectedTests:
 
     @staticmethod
     def is_protected(path, roots=None, task_dir=None):
-        if not path or not _under_roots(str(path), roots):
+        if not path:
+            return False
+        if roots and not os.path.isabs(str(path)):
+            path = os.path.abspath(os.path.join(roots[0], str(path)))
+        if not _under_roots(str(path), roots):
             return False
         listed = ProtectedTests.load(task_dir)
         if listed is None:
@@ -511,8 +519,33 @@ class ProtectedTests:
         return bool(ProtectedTests.candidates(path, roots, task_dir) & listed)
 
 
+class HookPolicy:
+    """PreToolUse decision shared by vigia-claude-hook and vigia-codex-hook (one place for the rule)."""
+
+    EDIT = ("Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch")
+    SHELL = ("Bash", "shell", "local_shell", "exec_command")
+    TEST = "Test file protected by Vigia (it exists on the base): do not edit it; add a new test file if needed."
+
+    @staticmethod
+    def deny_reason(event, tool, inp, files=(), env=None):
+        """Reason to deny this tool call, or None. files = paths an apply_patch touches."""
+        env = os.environ if env is None else env
+        if event != "PreToolUse" or env.get("VIGIA_PROTECT_TESTS") != "1":
+            return None
+        inp = inp if isinstance(inp, dict) else {}
+        task_dir = env.get("VIGIA_TASK_DIR") or None
+        roots = [x for x in (env.get("VIGIA_CWD"), task_dir) if x] or None
+        paths = [p for p in (inp.get("file_path"), inp.get("notebook_path")) if p] + list(files)
+        if tool in HookPolicy.EDIT and any(is_test(p, roots=roots, task_dir=task_dir) for p in paths):
+            return HookPolicy.TEST
+        cmd = str(inp.get("command") or inp.get("cmd") or "") if tool in HookPolicy.SHELL else ""
+        if cmd and shell_test_writes(cmd, roots=roots, task_dir=task_dir):
+            return HookPolicy.TEST
+        return None
+
+
 def is_test(path, roots=None, task_dir=None):
-    """Protected test file? Only inside the cwd/worktree when roots is given; with T/.fleet/protected-tests.txt
+    """Protected test file? Only inside the cwd/worktree when roots is given; with fleet-run's snapshot
     only the base's existing tests count (new test files are allowed)."""
     return ProtectedTests.is_protected(path, roots, task_dir)
 

@@ -2,15 +2,15 @@
 """Codex CLI hook (vigia-run injects it via `-c hooks.*` + `--dangerously-bypass-hook-trust`, for that run only).
 Reads the hook event JSON on stdin and appends a short line to $VIGIA_HEARTBEAT (same format as
 vigia-claude-hook). Outside Vigia (no VIGIA_HEARTBEAT) it does nothing. Never prints to stdout and always exits 0,
-except: with VIGIA_PROTECT_TESTS=1 it denies (PreToolUse) an apply_patch that touches a test file."""
+except: with VIGIA_PROTECT_TESTS=1 it denies (PreToolUse) an apply_patch or shell write that touches a protected
+test file. Rule: HookPolicy."""
 import hashlib, json, os, re, sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vigia_lib import is_test, now_iso
+from vigia_lib import HookPolicy, is_test, now_iso
 
 PATCH_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$", re.M)
-DENY_MSG = "Test file protected by Vigia: do not edit tests in this task."
 
 
 def patch_files(txt):
@@ -30,10 +30,9 @@ def main():
     patch = tool == "apply_patch"
     files = patch_files(inp.get("command")) if patch else []
     # --protect-tests: only paths inside the run cwd (and task dir if set)
-    task_dir = os.environ.get("VIGIA_TASK_DIR") or None
-    roots = [x for x in (os.environ.get("VIGIA_CWD"), task_dir, os.getcwd()) if x]
-    tests = [p for p in files if is_test(p, roots=roots, task_dir=task_dir)]
-    deny = name == "PreToolUse" and patch and os.environ.get("VIGIA_PROTECT_TESTS") == "1" and tests
+    env = dict(os.environ)
+    env["VIGIA_CWD"] = env.get("VIGIA_CWD") or os.getcwd()
+    deny = HookPolicy.deny_reason(name, tool, inp, files, env)
     if target:
         rec = {"ts": now_iso(), "hook_event_name": name, "session_id": ev.get("session_id"), "origin": "codex"}
         if ev.get("turn_id"):
@@ -58,7 +57,8 @@ def main():
             rec["last_message"] = str(ev.get("last_assistant_message") or "")[:300]
         if deny:
             rec["denied"] = True
-            rec["path"] = tests[0]
+            rec["path"] = next((p for p in files if is_test(p, roots=[env["VIGIA_CWD"]], task_dir=env.get("VIGIA_TASK_DIR") or None)),
+                               str(inp.get("command") or "")[:200])
         try:
             with open(target, "a") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -66,7 +66,7 @@ def main():
             pass
     if deny:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                                 "permissionDecisionReason": DENY_MSG}}))
+                                                 "permissionDecisionReason": deny}}))
     return 0
 
 

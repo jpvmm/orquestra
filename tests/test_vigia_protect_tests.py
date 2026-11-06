@@ -2,8 +2,11 @@
 """--protect-tests must ignore test-named paths outside the run cwd/worktree.
 Regression: a /tmp scratch matching TEST_RE used to kill the run as loop.
 Run: python3 tests/test_vigia_protect_tests.py"""
-import os, sys, unittest
+import atexit, os, shutil, sys, tempfile, unittest
 sys.dont_write_bytecode = True
+_BASE = tempfile.mkdtemp(prefix="vigia-test-")   # snapshots go to $VIGIA_BASE/protected: keep them out of ~/vigia
+atexit.register(shutil.rmtree, _BASE, True)
+os.environ["VIGIA_BASE"] = _BASE
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "bin"))
@@ -107,6 +110,15 @@ class BaseSnapshot(unittest.TestCase):
             self.assertTrue(V.is_test(p, roots=[integ, self.T], task_dir=self.T), p)
         self.assertTrue(V.is_test("tests/test_old.py", roots=[self.wt], task_dir=self.T))
 
+    def test_snapshot_lives_outside_task_dir(self):
+        """Agents can write T, so the list must not be there."""
+        self.assertFalse(os.path.abspath(self.path).startswith(os.path.abspath(self.T) + os.sep))
+        self.assertTrue(self.path.startswith(os.path.join(_BASE, "protected")))
+
+    def test_relative_dotdot_into_other_worktree_is_protected(self):
+        integ = os.path.join(self.T, "wt", "integration")
+        self.assertTrue(V.is_test("../task-1/tests/test_old.py", roots=[integ, self.T], task_dir=self.T))
+
     def test_new_test_file_allowed(self):
         self.assertFalse(V.is_test(self.wt + "/tests/test_new.py", roots=[self.wt, self.T], task_dir=self.T))
         self.assertFalse(V.is_test("tests/test_new.py", roots=[self.wt], task_dir=self.T))
@@ -125,8 +137,9 @@ class ClaudeHook(unittest.TestCase):
     def test_deny_existing_allow_new_tag_subagent(self):
         import json, tempfile
         with tempfile.TemporaryDirectory() as td:
-            T = os.path.join(td, "T"); wt = os.path.join(T, "wt", "task-1"); os.makedirs(os.path.join(T, ".fleet"))
-            open(os.path.join(T, ".fleet", "protected-tests.txt"), "w").write("tests/test_old.py\n")
+            T = os.path.join(td, "T"); wt = os.path.join(T, "wt", "task-1")
+            dest = V.ProtectedTests.path(T); os.makedirs(os.path.dirname(dest), exist_ok=True)
+            open(dest, "w").write("tests/test_old.py\n")
             hb = os.path.join(td, "hooks.jsonl")
             env = dict(VIGIA_HEARTBEAT=hb, VIGIA_PROTECT_TESTS="1", VIGIA_CWD=wt, VIGIA_TASK_DIR=T)
             pre = {"hook_event_name": "PreToolUse", "tool_name": "Edit"}
@@ -137,6 +150,23 @@ class ClaudeHook(unittest.TestCase):
             first = json.loads(open(hb).readline())
             self.assertEqual(first.get("agent_id"), "a1")
             self.assertTrue(first.get("denied"))
+            bash = {"hook_event_name": "PreToolUse", "tool_name": "Bash"}
+            r = self.hook({**bash, "tool_input": {"command": "sed -i s/1/2/ tests/test_old.py"}}, **env)
+            self.assertIn('"deny"', r.stdout)
+            r = self.hook({**bash, "tool_input": {"command": "echo x > tests/test_new.py"}}, **env)
+            self.assertEqual(r.stdout.strip(), "")
+
+
+class CodexHook(unittest.TestCase):
+    def test_shell_write_to_protected_test_denied(self):
+        import json, subprocess, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            wt = os.path.join(td, "T", "wt", "task-1"); os.makedirs(wt)
+            env = dict(os.environ, VIGIA_PROTECT_TESTS="1", VIGIA_CWD=wt, VIGIA_TASK_DIR="")
+            ev = {"hook_event_name": "PreToolUse", "tool_name": "shell", "tool_input": {"command": "rm tests/test_a.py"}}
+            r = subprocess.run([os.path.join(ROOT, "bin", "vigia-codex-hook")], input=json.dumps(ev),
+                               capture_output=True, text=True, env=env)
+            self.assertIn('"deny"', r.stdout)
 
 
 class OwnCallsOnly(unittest.TestCase):

@@ -125,9 +125,13 @@ class Criteria:
     MANUAL = re.compile(r"\b(manual(ly)?|by hand|visual(ly)? (check|inspect)|eyeball|n/a|tbd|todo)\b|^\s*(\.\.\.|-|none|see\b|"
                         r"check\b|verify\b|inspect\b|look\b|open\b)", re.I)
     FORBIDDEN_OPS = {"||", ";", "|", "&", "|&", ";;", "(", ")", ";&", "&&&"}
-    SUBST = re.compile(r"\$\(|`|<\(|>\(")
-    UNSAFE_ENV = {"PYTHONOPTIMIZE", "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTHONSTARTUP", "PYTHONINSPECT", "BASH_ENV",
-                  "ENV", "LD_PRELOAD", "NODE_OPTIONS", "npm_config_script_shell", "GOFLAGS", "CARGO_BUILD_RUSTFLAGS"}
+    SUBST = re.compile(r"\$|`|<\(|>\(|\\")       # any expansion/escape: arguments must be literal
+    # VAR=value prefixes that would change which program/module runs or how: refused (by name or prefix)
+    UNSAFE_ENV = {"PATH", "HOME", "ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS", "IFS", "PYTHONHOME", "PYTHONOPTIMIZE",
+                  "PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONEXECUTABLE", "PYTHONSAFEPATH", "PYTHONPLATLIBDIR"}
+    UNSAFE_ENV_PREFIX = ("PYTEST_", "LD_", "NODE_", "npm_", "NPM_", "YARN_", "PNPM_", "GO", "CARGO", "RUST")
+    SHADOW = ("pytest.py", "pytest", "_pytest", "py.test", "unittest.py", "unittest", "sitecustomize.py",
+              "usercustomize.py")
     PY = re.compile(r"python(3(\.\d+)?)?")
     PY_MODULES = {"pytest", "unittest"}
     PY_FLAGS = {"-B", "-u"}           # harmless interpreter flags allowed before -m
@@ -148,12 +152,21 @@ class Criteria:
         "npm": (set(), set(), False), "pnpm": (set(), set(), False), "yarn": (set(), set(), False),
     }
     SCRIPT_SHELLS = {"bash", "sh"}
+    POS_INT = r"[1-9]\d*"
+    # (runner, option) → required shape of its value; any other valued option takes a non-empty literal
+    VALUES = {("pytest", "--tb"): r"auto|long|short|line|native|no", ("pytest", "--maxfail"): POS_INT,
+              ("pytest", "--durations"): r"\d+", ("go", "-count"): POS_INT, ("go", "-p"): POS_INT,
+              ("go", "-timeout"): r"([1-9]\d*(\.\d+)?(ns|us|ms|s|m|h))+", ("cargo", "-j"): POS_INT,
+              ("cargo", "--jobs"): POS_INT, ("cargo", "-p"): r"[A-Za-z0-9_.-]+", ("cargo", "--package"): r"[A-Za-z0-9_.-]+"}
 
     @staticmethod
     def segments(command):
         """[argv, ...] of the `&&`-joined simple commands, or a str with the reason it is not acceptable."""
         if Criteria.SUBST.search(command):
-            return "command substitution / process substitution is not allowed"
+            return "`$`, backticks, backslashes and process substitution are not allowed: arguments must be literal"
+        why = Criteria.unquoted_problem(command)
+        if why:
+            return why
         command = re.sub(r"\d*>&\d+", " ", command)   # 2>&1 is a redirection, not a background job
         try:
             lx = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
@@ -175,6 +188,24 @@ class Criteria:
         if any(not sg for sg in segs):
             return "empty command around &&"
         return segs
+
+    @staticmethod
+    def unquoted_problem(command):
+        """Unquoted glob/brace/tilde characters expand in the shell (a file named `--help` would become an option)."""
+        q = None
+        for i, ch in enumerate(command):
+            if q:
+                q = None if ch == q else q
+                continue
+            if ch in "'\"":
+                q = ch
+            elif ch in "[]" and (i == 0 or command[i - 1].isspace()) and (i + 1 == len(command) or command[i + 1].isspace()):
+                continue                                         # the `[ -s X ]` command words
+            elif ch in "*?[]{}":
+                return f"unquoted {ch!r} expands in the shell: quote the argument"
+            elif ch == "~" and not re.search(r"(^|&&)\s*cd\s+$", command[:i]):
+                return "`~` is only allowed as the start of a `cd` directory"
+        return None
 
     @staticmethod
     def resolve(p, base):
@@ -208,22 +239,45 @@ class Criteria:
         return None, real
 
     @staticmethod
-    def runner_name(w0, path):
-        """Runner/python name of argv[0] when it is a real executable of a known runner, else None."""
+    def runner_name(w0, path, cur):
+        """Runner/python name of argv[0], or None. By path it must be the real thing: a python interpreter binary, or
+        the same file PATH resolves the runner name to (a renamed /bin/true is not pytest)."""
         name = os.path.basename(w0)
         if not (name in Criteria.RUNNERS or Criteria.PY.fullmatch(name)):
             return None
-        if "/" in w0:
-            return name if os.path.isfile(w0) and os.access(w0, os.X_OK) else None
-        return name          # bare name: PATH decides; a missing runner fails the run, it cannot pass it
+        if "/" not in w0:
+            return name      # bare name: PATH decides (PATH= is refused); a missing runner fails the run
+        real = os.path.realpath(Criteria.resolve(w0, cur))
+        if not (os.path.isfile(real) and os.access(real, os.X_OK)):
+            return None
+        if Criteria.PY.fullmatch(name):
+            try:
+                with open(real, "rb") as fh:
+                    elf = fh.read(4) == b"\x7fELF"
+            except OSError:
+                elf = False
+            return name if elf and Criteria.PY.fullmatch(os.path.basename(real)) else None
+        on_path = shutil.which(name, path=path)
+        return name if on_path and os.path.realpath(on_path) == real else None
+
+    @staticmethod
+    def shadowed(dirs):
+        """A module file that would replace pytest/unittest (or run at startup) in one of these directories."""
+        for d in dirs:
+            for x in Criteria.SHADOW:
+                if d and os.path.lexists(os.path.join(d, x)):
+                    return os.path.join(d, x)
+        return None
 
     @staticmethod
     def classify(w, path, cur, task_dir, art):
         """('setup'|'runner'|'script'|'artifact', detail) or ('bad', reason) for one simple command (after cd)."""
+        env = {}
         while w and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w[0]):
-            var = w[0].split("=", 1)[0]
-            if var in Criteria.UNSAFE_ENV:
+            var, val = w[0].split("=", 1)
+            if var in Criteria.UNSAFE_ENV or var.startswith(Criteria.UNSAFE_ENV_PREFIX):
                 return "bad", f"{var} changes what the check runs"
+            env[var] = val
             w = w[1:]
         if not w:
             return "bad", "command proves nothing"
@@ -244,7 +298,7 @@ class Criteria:
                 return "bad", f"{w0}: only `{w0} /abs/T/checks/ID.sh` (no options, no inline code)"
             why, real = Criteria.check_script(w[1], cur, task_dir, need_exec=False)
             return ("bad", why) if why else ("script", real)
-        name = Criteria.runner_name(w0, path)
+        name = Criteria.runner_name(w0, path, cur)
         if name is None and "/" in w0:
             why, real = Criteria.check_script(w0, cur, task_dir, need_exec=True)
             return ("bad", why) if why else ("script", real)
@@ -258,6 +312,10 @@ class Criteria:
             if i + 1 >= len(w) or w[i] != "-m" or w[i + 1] not in Criteria.PY_MODULES:
                 return "bad", f"{name}: only `{name} -m pytest|unittest ...` (no inline code, scripts or other flags)"
             key, args = w[i + 1], w[i + 2:]
+            pp = [Criteria.resolve(x, cur) for x in env.get("PYTHONPATH", "").split(os.pathsep) if x]
+            bad = Criteria.shadowed([cur or os.getcwd()] + pp)
+            if bad:
+                return "bad", f"{bad} would replace the test runner (python -m puts the cwd/PYTHONPATH first)"
             if key == "unittest" and args[:1] == ["discover"]:
                 key, args = "unittest discover", args[1:]
         else:
@@ -278,13 +336,16 @@ class Criteria:
             if a.startswith("-"):
                 if a in alone:
                     i += 1; continue
-                k = a.split("=", 1)[0]
-                if k in valued and "=" in a:
-                    i += 1; continue
-                if a in valued:
-                    if i + 1 >= len(args) or args[i + 1].startswith("-"):
-                        return f"{runner}: {a} needs a value"
-                    i += 2; continue
+                k, eq, v = a.partition("=")
+                if k in valued:
+                    if not eq:
+                        if i + 1 >= len(args):
+                            return f"{runner}: {a} needs a value"
+                        v = args[i + 1]
+                    shape = Criteria.VALUES.get((runner.split()[0], k))
+                    if not v or v.startswith("-") or (shape and not re.fullmatch(shape, v)):
+                        return f"{runner}: bad value {v!r} for {k}"
+                    i += 1 if eq else 2; continue
                 return (f"{runner}: option {a!r} is not allowed here (allowed: "
                         f"{' '.join(sorted(alone | valued)) or 'none'})")
             if not positional or a.startswith("@"):

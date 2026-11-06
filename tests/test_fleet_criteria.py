@@ -78,7 +78,31 @@ class CriteriaGate(unittest.TestCase):
                     "python3 -m unittest discover -h", "python3 -m unittest --locals x"):
             self.assertTrue(self.bad(command=cmd), cmd)
 
-    def test_r10_regressions(self):
+    def test_literal_args_values_and_runner_identity(self):
+        for cmd in ("python3 -m unittest ${UNSET:---help}", "python3 -m unittest $X", "pytest \\--co", "pytest *",
+                    "pytest {--co,}", "pytest ~/x", "pytest 'a'$'--co'", "go test -count=0 ./...",
+                    "go test -count 0 ./...", "go test -p=0 ./...", "go test -timeout=x ./...",
+                    "pytest --maxfail=0", "pytest --tb=--co", "cargo test -j 0", "PATH=/tmp/fake pytest",
+                    "PYTEST_ADDOPTS=--co pytest", "GOFLAGS=-run=^$ go test ./...", "CARGO_TARGET_DIR=x cargo test",
+                    "HOME=/tmp cd ~ && pytest", "LD_PRELOAD=x pytest", "PYTHONHOME=/x python3 -m pytest"):
+            self.assertTrue(self.bad(command=cmd), cmd)
+        fake = os.path.join(self.tmp.name, "fake")
+        os.makedirs(fake)
+        for n in ("pytest", "python3", "go"):
+            os.symlink("/bin/true", os.path.join(fake, n))
+            self.assertTrue(self.bad(command=os.path.join(fake, n) + (" -m pytest" if n == "python3" else " test")), n)
+        write(os.path.join(fake, "python3.12"), "#!/bin/sh\nexit 0\n"); os.chmod(os.path.join(fake, "python3.12"), 0o755)
+        self.assertTrue(self.bad(command=os.path.join(fake, "python3.12") + " -m pytest"))
+        self.assertEqual(self.bad(command=f"{os.path.realpath(sys.executable)} -m pytest -q"), [])
+        write(os.path.join(self.repo, "pytest.py"), "")                     # would shadow the real pytest
+        self.assertTrue(self.bad(command="python3 -m pytest -q"))
+        os.remove(os.path.join(self.repo, "pytest.py"))
+        os.makedirs(os.path.join(self.repo, "src", "unittest"))
+        self.assertTrue(self.bad(command="PYTHONPATH=src python3 -m unittest"))
+        self.assertEqual(self.bad(command="go test -count=1 -timeout 5m ./..."), [])
+        self.assertEqual(self.bad(command="python3 -m unittest discover -s tests -p 'test_*.py'"), [])
+
+    def test_fake_test_path_and_inline_code(self):
         """Round-10 bypasses: a fake `test` path and assignment-only inline code."""
         for cmd in ("/does/not/exist/test -s proof.png", "python3 -c 'x=1'"):
             self.assertTrue(self.bad(command=cmd), cmd)

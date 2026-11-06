@@ -33,9 +33,11 @@ then the fleet writes `fleet.json`, `fleet-state.json`, `progress.md`, `briefs/`
 
 Criteria gate (fleet-run refuses the start otherwise): each `command` is a WHITELISTED proof, ≤240 chars, joined only
 with `&&` (no `||`, `;`, `|`, `&`, subshells or `$(...)`, so nothing masks a failure). Allowed simple commands:
-`cd DIR` (literal; later relative paths resolve from it) and `VAR=value` prefixes (not `PYTHONOPTIMIZE`,
-`PYTEST_ADDOPTS`, `BASH_ENV`...); a test runner — `pytest`, `python3 -m pytest|unittest`, `npm|pnpm|yarn test`,
-`go test`, `cargo test` (bare, or the path of an existing executable named like the runner), without
+`cd DIR` (literal; later relative paths resolve from it) and `VAR=value` prefixes (not `PATH`, `HOME`, `PYTHONHOME`,
+`PYTHONOPTIMIZE`, `BASH_ENV`, nor `PYTEST_*`/`LD_*`/`GO*`/`CARGO*`/`NODE_*`/`npm_*` variables); arguments must be literal
+(no `$`, backslashes, or unquoted `*?[]{}~`); a test runner — `pytest`, `python3 -m pytest|unittest`, `npm|pnpm|yarn test`,
+`go test`, `cargo test` (bare, or by path only when it is a real Python binary or the same file `PATH` resolves the runner to; `python -m`
+refuses a `pytest.py`/`unittest`/`sitecustomize.py` that would shadow the runner in the cwd or `PYTHONPATH`), without
 a whitelist of arguments per runner (no help/listing/no-run modes, `-exec`, plugins, config files or name filters that can select nothing); an existing text script under `T/checks/` (absolute path, or `bash|sh` + that
 path). Everything else is refused: inline code (`python3 -c`, `node -e`, `bash -c`), other programs, wrappers (`env`,
 `exec`, `timeout`, `xargs`, `find`) and shell options. A UI criterion (`"when": "ui"` or id `C-UI*`) names its proof

@@ -62,6 +62,8 @@ def parse():
     p.add_argument("--cwd", default=None)
     p.add_argument("--foreground", action="store_true", help="do not detach (debug)")
     p.add_argument("--task", default=None, help="short task description (goes into the status, notifications and prompt.md)")
+    p.add_argument("--role", default=None, help="the run's real role (plan|review|implement|lead): decides the Claude-limit follow-up")
+    p.add_argument("--output", default=None, help="expected result file; a Codex fallback of a Claude review writes there")
     p.add_argument("--prompt-file", default=None,
                    help="file holding the prompt (when the prompt comes from stdin/'-', or to record the full prompt)")
     a = p.parse_args(ours)
@@ -497,7 +499,10 @@ def supervise(a, paths, key, notifier=None):
         "started_at": started, "ended_at": None, "exit_code": None, "last_event_at": None,
         "checked_at": None, "summary": "", "loop_reason": None, "alerts": [],
         "limits": {"stall_min": a.stall_min, "max_min": a.max_min, "max_turns_hint": a.max_turns_hint,
-                   "max_files": a.max_files, "protect_tests": a.protect_tests, "loop_repeat": a.loop_repeat},
+                   "max_files": a.max_files, "protect_tests": a.protect_tests, "loop_repeat": a.loop_repeat,
+                   "role": a.role},
+        "role": a.role, "output": os.path.abspath(a.output) if a.output else None,
+        "relaunch_argv": relaunch_argv_from_environ(),
         "stats": {}, "kill": None, "paths": paths,
         # per-bot webhook: VIGIA_WEBHOOK_ENV at launch is stored here so notifications go to the same bot even
         # when another process sends them (e.g. vigia-status cleaning up a dead supervisor). None = default.
@@ -741,17 +746,21 @@ def supervise(a, paths, key, notifier=None):
             blob += " " + _ef.read()[-2000:]
     except OSError:
         pass
-    lim = V.detect_claude_limit(blob)
+    lim = V.detect_claude_limit(blob) if a.tool == "claude" else None   # a Codex run echoes text: no false hits
     if lim:
         st["limit"] = lim
-        role = None
-        try:
-            fj = V.read_json(os.path.join(a.task_dir, "fleet.json")) or {}
-            if fj.get("runs"):
-                role = (fj["runs"][-1] or {}).get("role")
-        except Exception:
-            pass
-        fb = V.limit_fallback_plan(role or a.name or "")
+        role = V.LimitFallback.role_of(a.role, a.task_dir, a.name)
+        fb = dict(V.limit_fallback_plan(role))
+        fb["role"] = role
+        if fb["action"] == "fallback_tool":
+            fb["pending"] = True          # launched by run_supervisor once this run has left active/
+        else:
+            try:
+                fb["resume_file"] = V.LimitFallback.resume_file(a.task_dir, name=a.name, role=role,
+                                                                resets=lim.get("resets"),
+                                                                relaunch_argv=st.get("relaunch_argv"))
+            except OSError as e:
+                fb["resume_error"] = str(e)
         st["limit_fallback"] = fb
         if fb["action"] == "pause" and st.get("state") in ("done", "failed", "running"):
             st["state"] = "limit_paused"
@@ -1003,6 +1012,15 @@ def webhook_env_from_environ():
     return os.path.abspath(os.path.expanduser(v)) if v else ""
 
 
+def relaunch_argv_from_environ():
+    """ORQ_RELAUNCH_ARGV (JSON list) = the launcher command line that started this run (e.g. fleet-run)."""
+    try:
+        v = json.loads(os.environ.get("ORQ_RELAUNCH_ARGV") or "null")
+    except ValueError:
+        return None
+    return [str(x) for x in v] if isinstance(v, list) and v else None
+
+
 def run_supervisor(a, paths, key, entry):
     st = None
     notifier = None
@@ -1036,6 +1054,27 @@ def run_supervisor(a, paths, key, entry):
                     pass
         except Exception:
             pass
+        # Claude limit on a review: relaunch it on Codex now that this run left active/
+        try:
+            fb = (st or {}).get("limit_fallback") or {}
+            if fb.get("pending"):
+                fleet_bin = os.environ.get("FLEET_BIN") or os.path.join(os.path.dirname(V.BIN), "fleet", "bin")
+                fb.pop("pending")
+                fb["relaunch"] = V.LimitFallback.launch_codex_review(st, fleet_bin=fleet_bin)
+                with V.run_lock(paths["status"]):
+                    cur = V.read_json(paths["status"]) or st
+                    cur["limit_fallback"] = fb
+                    if fb["relaunch"].get("launched"):
+                        cur["state"] = "limit_fallback"
+                        cur["summary"] = (f"Claude limit: review relaunched on Codex as {fb['relaunch']['name']} | "
+                                          + (cur.get("summary") or ""))[:500]
+                    else:
+                        cur["summary"] = (f"Claude limit: Codex fallback FAILED to launch "
+                                          f"({fb['relaunch'].get('error', '?')[:160]}) | " + (cur.get("summary") or ""))[:500]
+                    V.write_json_atomic(paths["status"], C.redact_obj(cur))
+                    st = cur
+        except Exception as e:
+            print(f"limit fallback failed: {e}", file=sys.stderr)
         # end notification: exactly one (vigia-notify also dedupes per run), after pending notifications
         try:
             if notifier is not None:

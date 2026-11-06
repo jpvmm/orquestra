@@ -30,7 +30,7 @@ ACTIVE_DIR = os.path.join(BASE, "active")
 EVENTS_FILE = os.path.join(BASE, "events.jsonl")
 MAX_ACTIVE = int(os.environ.get("VIGIA_MAX_ACTIVE", "5"))
 TZ = ZoneInfo(os.environ["VIGIA_TZ"]) if os.environ.get("VIGIA_TZ") else None
-FINAL_STATES = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete")
+FINAL_STATES = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete", "limit_paused", "limit_fallback")
 # watchdog (watch_active): heartbeat = mtime of status.json (the supervisor touches it every poll)
 HB_STALE = float(os.environ.get("VIGIA_HB_STALE_SEC", "180"))
 WD_GRACE = float(os.environ.get("VIGIA_WD_GRACE_SEC", "120"))
@@ -442,13 +442,96 @@ def detect_claude_limit(text):
 
 def limit_fallback_plan(role):
     """What to do when Claude hits the usage limit, by run role.
-    review → fall back to Codex; lead/plan/implement → pause with a clear state (no loop)."""
-    role = (role or "").lower()
-    if role in ("review", "reviewer", "final_reviewer", "security"):
+    review → relaunch the review on Codex (LimitFallback.launch_codex_review); lead/plan/implement → pause with
+    state limit_paused and T/.fleet/limit-resume.json (no loop). Unknown role → pause (safe side)."""
+    role = LimitFallback.ROLE.get((role or "").lower())
+    if role == "review":
         return {"action": "fallback_tool", "tool": "codex", "state": "limit_fallback",
-                "summary": "Claude usage limit: review falls back to Codex"}
+                "summary": "Claude usage limit: review relaunched on Codex (codex-reviewer)"}
     return {"action": "pause", "tool": None, "state": "limit_paused",
-            "summary": "Claude usage limit: lead/run paused — do not loop; wait for reset or switch tool"}
+            "summary": "Claude usage limit: run paused — resume after the reset with T/.fleet/limit-resume.json"}
+
+
+class LimitFallback:
+    """Claude usage limit → real follow-up: relaunch a review on Codex, or write the resume file for a pause."""
+
+    ROLE = {"review": "review", "reviewer": "review", "final_reviewer": "review", "security": "review",
+            "plan": "plan", "lead": "lead", "team-lead": "lead", "implement": "implement", "dev": "implement"}
+
+    @staticmethod
+    def role_of(role, task_dir, name):
+        """The ACTUAL run's role: --role from the launcher, else this run's entry in fleet.json, else its name."""
+        if role:
+            return LimitFallback.ROLE.get(role.lower(), role.lower())
+        fj = read_json(os.path.join(task_dir, "fleet.json")) if task_dir else None
+        for r in (fj or {}).get("runs") or []:
+            if (r or {}).get("name") == name and r.get("role"):
+                return LimitFallback.ROLE.get(r["role"].lower(), r["role"].lower())
+        n = name or ""
+        if "-lead-" in n:
+            return "lead"
+        if "-rev-" in n or "review" in n:
+            return "review"
+        if "-dev-" in n:
+            return "implement"
+        return None
+
+    @staticmethod
+    def prompt_of(cmd):
+        """The prompt of a `claude -p PROMPT ...` command line (None if absent)."""
+        cmd = list(cmd or [])
+        for flag in ("-p", "--print"):
+            if flag in cmd and cmd.index(flag) + 1 < len(cmd):
+                return cmd[cmd.index(flag) + 1]
+        return None
+
+    @staticmethod
+    def resume_file(task_dir, *, name, role, resets, relaunch_argv=None):
+        """Lead/implement/plan paused by the limit: record what to relaunch and when. relaunch_argv is the exact
+        launcher command line of THIS run (recorded at launch via ORQ_RELAUNCH_ARGV), so options are kept."""
+        dest = os.path.join(task_dir, ".fleet", "limit-resume.json")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        write_json_atomic(dest, {"paused_run": name, "role": role, "resets": resets, "written_at": now_iso(),
+                                 "resume_command": list(relaunch_argv) if relaunch_argv else None,
+                                 "note": "after the reset, relaunch resume_command; "
+                                         "the lead resumes from progress.md + fleet-state.json"})
+        return dest
+
+    @staticmethod
+    def launch_codex_review(st, *, fleet_bin, env=None, timeout=240):
+        """`fleet-codex reviewer --no-wait` with the same prompt/cwd/output. Call AFTER this run left active/.
+        launched=True only when the Vigia registered the new run."""
+        import subprocess
+        td, name = st.get("task_dir"), st.get("name") or "run"
+        prompt = LimitFallback.prompt_of(st.get("cmd"))
+        if not td or not prompt:
+            return {"launched": False, "error": "no task_dir or prompt to relaunch"}
+        fb = os.path.join(td, ".fleet")
+        os.makedirs(fb, exist_ok=True)
+        pf = os.path.join(fb, f"{name}.limit-fallback.prompt.md")
+        with open(pf, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        out = st.get("output") or os.path.join(td, "review", f"{name}.codex-fallback.md")
+        new = name[:76] + "-cx"
+        cmd = [os.path.join(fleet_bin, "fleet-codex"), "reviewer", "--task-dir", td, "--name", new,
+               "--prompt-file", pf, "--output", out, "--cwd", st.get("cwd") or td, "--no-wait",
+               "--slot-wait", str(max(30, timeout - 60)), "--task", f"limit fallback of {name}"]
+        e = dict(env if env is not None else os.environ)
+        if st.get("webhook_env") != "":   # the replaced run notified the bot: so does its replacement
+            e["FLEET_NOTIFY_SUBRUNS"] = "1"
+        try:
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=e, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            return {"launched": False, "error": f"{type(ex).__name__}: {ex}", "command": cmd}
+        try:
+            info = json.loads((r.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            info = {}
+        ok = r.returncode == 0 and info.get("state") == "running" and bool(info.get("status_path"))
+        res = {"launched": ok, "name": new, "output": out, "command": cmd, "status_path": info.get("status_path")}
+        if not ok:
+            res["error"] = (info.get("error") or r.stderr or r.stdout or f"exit {r.returncode}")[-600:]
+        return res
 
 
 def append_usage_progress(task_dir, *, name, tool, model, usage=None, limit_info=None):
@@ -469,7 +552,7 @@ def append_usage_progress(task_dir, *, name, tool, model, usage=None, limit_info
     if limit_info:
         parts.append(f"LIMIT {limit_info.get('kind')} resets={limit_info.get('resets')}")
         fb = limit_fallback_plan(usage.get("role"))
-        parts.append(f"fallback={fb['action']}:{fb.get('tool') or fb['state']}")
+        parts.append(f"role={usage.get('role') or '?'} fallback={fb['action']}:{fb.get('tool') or fb['state']}")
     line = " ".join(parts) + "\n"
     try:
         with open(path, "a", encoding="utf-8") as f:

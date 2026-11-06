@@ -18,7 +18,7 @@ import argparse, json, os, subprocess, sys, time
 
 FLEET = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 VIGIA_BIN = os.path.expanduser(os.environ.get("VIGIA_BIN") or os.path.join(os.path.dirname(FLEET), "bin"))
-TERMINAL = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete")
+TERMINAL = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete", "limit_paused", "limit_fallback")
 
 
 def default_model(td, role):

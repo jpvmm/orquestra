@@ -2,7 +2,7 @@
 """fleet-wait STATUS.json... [--max SEC]  — waits for Vigia runs to finish (default 540 s, fits one Bash call).
 Prints one JSON per run: name, state, summary. Exits 0 if all finished, 2 if any is still running (call again)."""
 import json, sys, time
-TERMINAL = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete")
+TERMINAL = ("done", "failed", "stalled", "timeout", "loop", "killed", "incomplete", "limit_paused", "limit_fallback")
 args = sys.argv[1:]
 mx = 540.0
 if "--max" in args:

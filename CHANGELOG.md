@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
-- Detect Claude CLI 5-hour usage limit; review falls back to Codex, lead/other roles pause as `limit_paused` (no silent loop). Usage lines append to `progress.md` when present.
+- Detect Claude CLI 5-hour usage limit (Claude runs only); a review is really relaunched on Codex (`fleet-codex reviewer`, verified, state `limit_fallback`), a lead/implement/plan/unknown role pauses as `limit_paused` with `T/.fleet/limit-resume.json` holding the exact launcher command (`ORQ_RELAUNCH_ARGV`). The role comes from `vigia-run --role` (set by fleet-run), else the run's own `fleet.json` entry, else its name. Usage lines append to `progress.md` when present. fleet-wait/fleet-codex treat both states as terminal.
 
 
 ## [0.1.0] - 2026-11-03

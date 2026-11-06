@@ -126,18 +126,26 @@ class Analyzer:
         if self.error_counts[sig] >= self.a.loop_repeat and not self.loop:
             self.loop = f"same error {self.error_counts[sig]}x ({origin}): {str(msg_text).strip()[:200]}"
 
+    def _protect_roots(self):
+        """Run cwd (+ task_dir if distinct): --protect-tests only applies inside these."""
+        rs = []
+        for c in (getattr(self.a, "cwd", None), getattr(self.a, "task_dir", None)):
+            if c and c not in rs:
+                rs.append(c)
+        return rs
+
     def _edit(self, path, file_content=""):
         if not path:
             return
         self.files.add(path)
         self.edits_since_test.append(V.h(path, file_content))
-        if self.a.protect_tests and V.is_test(path) and not self.loop:
+        if self.a.protect_tests and V.is_test(path, roots=self._protect_roots()) and not self.loop:
             self.loop = f"touched a protected test file: {path}"
         if self.a.max_files and len(self.files) > self.a.max_files and not self.loop:
             self.loop = f"growing scope: {len(self.files)} files edited (> --max-files {self.a.max_files})"
 
     def _shell(self, cmd):
-        for p in V.shell_test_writes(cmd):
+        for p in V.shell_test_writes(cmd, roots=self._protect_roots()):
             self._edit(p, "shell:" + cmd)
 
     def _test(self, cmd, output, failed):
@@ -552,6 +560,8 @@ def supervise(a, paths, key, notifier=None):
     env["VIGIA_HEARTBEAT"] = paths["hooks"]
     env["VIGIA_RUN"] = a.name
     env["VIGIA_PROTECT_TESTS"] = "1" if a.protect_tests else "0"
+    env["VIGIA_CWD"] = a.cwd or ""
+    env["VIGIA_TASK_DIR"] = a.task_dir or ""
 
     ev_f = open(paths["events"], "ab")
     err_f = open(paths["stderr"], "ab")

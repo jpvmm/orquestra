@@ -5,6 +5,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- `--protect-tests` only counts test paths inside the run cwd/worktree (scratch under `/tmp` no longer trips the loop detector).
+
+
 ## [0.1.0] - 2026-11-03
 
 ### Added

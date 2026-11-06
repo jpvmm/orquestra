@@ -422,11 +422,39 @@ STDERR_ALERT_RE = re.compile(r"Background tasks still running", re.I)
 LEAD_RE = re.compile(r"fleet-.+-lead-.+")  # fleet lead: must leave T/FINAL-SUMMARY.md
 
 
-def is_test(path):
-    return bool(path) and bool(TEST_RE.search(str(path)))
+def _under_roots(path, roots):
+    """True if path (abs or relative) falls under one of the absolute roots.
+    Relatives count as inside (resolved against the run cwd). Absolute paths
+    outside the roots (e.g. /tmp/test_foo.py) do NOT — avoids false positives
+    from --protect-tests on scratch outside the worktree."""
+    if not roots:
+        return True
+    p = str(path)
+    if not os.path.isabs(p):
+        return True
+    abs_p = os.path.abspath(p)
+    for r in roots:
+        if not r:
+            continue
+        root = os.path.abspath(r)
+        if root == os.sep:
+            return True  # filesystem root contains everything
+        if abs_p == root or abs_p.startswith(root + os.sep):
+            return True
+    return False
 
 
-def shell_test_writes(cmd):
+def is_test(path, roots=None):
+    """Is this a test file? If roots is given, only paths inside the cwd/worktree count."""
+    if not path:
+        return False
+    p = str(path)
+    if not _under_roots(p, roots):
+        return False
+    return bool(TEST_RE.search(p))
+
+
+def shell_test_writes(cmd, roots=None):
     """Heuristic: test-file paths that a shell command appears to write or delete."""
     found = []
     for m in SHELL_WRITE_RE.finditer(cmd or ""):
@@ -435,7 +463,7 @@ def shell_test_writes(cmd):
             tok = tok.strip("'\"")
             if tok.startswith("-") or tok == "/dev/null":
                 continue
-            if is_test(tok):
+            if is_test(tok, roots=roots):
                 found.append(tok)
     return found
 

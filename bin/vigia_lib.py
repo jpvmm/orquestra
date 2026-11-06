@@ -450,7 +450,11 @@ def git_plain(repo, *args, **kw):
     env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
     for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         env.pop(k, None)
-    return subprocess.run(["git", "--no-replace-objects", "-C", repo, *args], capture_output=True, text=True, env=env, **kw)
+    r = subprocess.run(["git", "--no-replace-objects", "-C", repo, *args], capture_output=True, env=env, **kw)
+    # paths are bytes: surrogateescape keeps any non-UTF-8 name usable with os.path (never raises)
+    r.stdout = r.stdout.decode("utf-8", "surrogateescape")
+    r.stderr = r.stderr.decode("utf-8", "replace")
+    return r
 
 
 def rev_sha(repo, rev):
@@ -480,18 +484,53 @@ class ProtectedTests:
     def snapshot(repo, rev, task_dir):
         """Write the base commit's test files to the protected list of task_dir; return (path, count)."""
         import subprocess
-        r = git_plain(repo, "ls-tree", "-r", "-z", "--name-only", rev)
+        r = git_plain(repo, "ls-tree", "-r", "-z", rev)
         if r.returncode != 0:
             raise subprocess.CalledProcessError(r.returncode, "git ls-tree", r.stdout, r.stderr)
-        out = r.stdout
-        tests = sorted(p for p in out.split("\0") if p and TEST_RE.search(p))
+        manifest = ProtectedTests.parse_tree(r.stdout)
+        tests = sorted(manifest)
         dest = ProtectedTests.path(task_dir)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         for path, txt in ((dest, "".join(t + "\n" for t in tests)), (ProtectedTests.base_path(task_dir), rev_sha(repo, rev) + "\n")):
-            with open(path + ".tmp", "w", encoding="utf-8") as f:
+            with open(path + ".tmp", "w", encoding="utf-8", errors="surrogateescape") as f:
                 f.write(txt)
             os.replace(path + ".tmp", path)
+        mp = ProtectedTests.manifest_path(task_dir)   # trusted blob ids/modes, taken before any agent runs
+        with open(mp + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"base": rev_sha(repo, rev), "tests": manifest}, f)
+        os.replace(mp + ".tmp", mp)
         return dest, len(tests)
+
+    @staticmethod
+    def parse_tree(out):
+        """{path: [mode, blob id]} of the test files in `git ls-tree -r -z` output."""
+        blobs = {}
+        for ent in out.split("\0"):
+            if "\t" in ent:
+                meta, path = ent.split("\t", 1)
+                parts = meta.split()
+                if len(parts) == 3 and parts[1] == "blob" and TEST_RE.search(path):
+                    blobs[path] = [parts[0], parts[2]]
+        return blobs
+
+    @staticmethod
+    def manifest_path(task_dir):
+        return ProtectedTests.path(task_dir)[:-4] + ".manifest.json"
+
+    @staticmethod
+    def manifest_for(task_dir, repo, base):
+        """The trusted manifest when it was taken at this same base commit, else None."""
+        import subprocess
+        try:
+            with open(ProtectedTests.manifest_path(task_dir), encoding="utf-8") as f:
+                m = json.load(f)
+        except (OSError, ValueError, TypeError):
+            return None
+        try:
+            same = m.get("base") == rev_sha(repo, base)
+        except (OSError, subprocess.SubprocessError):
+            same = str(m.get("base") or "").startswith(base) and len(base) >= 7
+        return {p: tuple(v) for p, v in (m.get("tests") or {}).items()} if same else None
 
     @staticmethod
     def base_path(task_dir):
@@ -538,7 +577,7 @@ class ProtectedTests:
         """Paths in the snapshot file written by fleet-run before any agent ran (empty set if none)."""
         p = ProtectedTests.path(task_dir)
         try:
-            with open(p, encoding="utf-8") as f:
+            with open(p, encoding="utf-8", errors="surrogateescape") as f:
                 return frozenset(ln.rstrip("\n") for ln in f if ln.strip())
         except (OSError, TypeError):
             return frozenset()
@@ -580,27 +619,25 @@ class ProtectedTests:
         return algo(b"blob %d\0" % len(data) + data).hexdigest()
 
     @staticmethod
-    def modified(base, dirs, expected=frozenset()):
+    def modified(base, dirs, expected=frozenset(), manifest=None):
         """Problems with the base tests in the git worktrees dirs, as 'dir: path' (changed or deleted) or
         'dir: cannot verify ...'. Compares the raw file bytes with the base blobs (hashed here, no git filters, no
         replace refs), so renames, index flags, clean filters or any shell trick cannot hide a change; symlinks are
         compared by target, a symlinked parent directory or a changed exec bit is reported. Fails closed: anything that cannot be checked is reported. expected = paths that must be in the base (fleet-run's snapshot); one
-        missing from the base tree is reported too. vigia-run runs it when a protected run ends."""
+        missing from the base tree is reported too. manifest = fleet-run's {path: (mode, blob)} taken before launch:
+        when given, git objects in the (agent-writable) repo are not consulted at all. vigia-run runs it at run end."""
         import subprocess
         out = []
         for d in dirs:
             try:
-                ls = git_plain(d, "ls-tree", "-r", "-z", base, timeout=60)
-                if ls.returncode != 0:
-                    out.append(f"{d}: cannot verify protected tests (git ls-tree {base[:12]} failed)")
-                    continue
-                blobs = {}
-                for ent in ls.stdout.split("\0"):
-                    if "\t" in ent:
-                        meta, path = ent.split("\t", 1)
-                        mode, kind, oid = meta.split()
-                        if kind == "blob" and TEST_RE.search(path):
-                            blobs[path] = (mode, oid)
+                if manifest is not None:
+                    blobs = dict(manifest)
+                else:
+                    ls = git_plain(d, "ls-tree", "-r", "-z", base, timeout=60)
+                    if ls.returncode != 0:
+                        out.append(f"{d}: cannot verify protected tests (git ls-tree {base[:12]} failed)")
+                        continue
+                    blobs = {p: tuple(v) for p, v in ProtectedTests.parse_tree(ls.stdout).items()}
                 out += [f"{d}: {p} (not in the base tree: cannot verify)" for p in sorted(set(expected) - set(blobs))]
                 for p in sorted(blobs):
                     mode, oid = blobs[p]
@@ -622,7 +659,7 @@ class ProtectedTests:
                         out.append(f"{d}: {p} (deleted)" if not os.path.lexists(f) else f"{d}: {p}")
                     elif not ProtectedTests.same_blob(f, oid):
                         out.append(f"{d}: {p}")
-            except (OSError, subprocess.SubprocessError) as e:
+            except (OSError, subprocess.SubprocessError, ValueError) as e:
                 out.append(f"{d}: cannot verify protected tests ({type(e).__name__})")
         return out
 

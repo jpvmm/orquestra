@@ -180,8 +180,8 @@ fleet-run ... --dry-run                                         # print the comm
 - **M/G**: one Claude team-lead run that creates a worktree per task, dispatches devs and cross reviewers in
   parallel waves (same file never in the same wave), integrates the patches into `T/wt/integration`, runs a final
   review by the strongest model of the other tool, and writes `T/FINAL-SUMMARY.md`.
-- The fleet never publishes: `fleet-run` passes `--disallowedTools` for `git commit/push/merge/rebase`, `gh` and
-  `rm -rf` to every Claude run it launches. The bot verifies the integration and commits itself.
+- The fleet never publishes: `fleet-run` passes `--disallowedTools` for `git commit/push/merge/rebase`, `gh`,
+  `rm -rf`, `curl`/`wget` and secret files, plus `--strict-mcp-config`, to every Claude run it launches. The bot verifies the integration and commits itself.
 - Webhook: lead runs notify the default routine; `FLEET_WEBHOOK_ENV` routes to another bot; Codex sub-runs are muted
   unless `FLEET_NOTIFY_SUBRUNS=1`.
 

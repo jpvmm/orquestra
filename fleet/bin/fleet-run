@@ -15,8 +15,8 @@ Values already in T/fleet.json["roles"] and "max_parallel" are kept (that is how
 Webhook: by default fleet-run does NOT set VIGIA_WEBHOOK_ENV, so the Vigia uses its default
 $VIGIA_BASE/webhook.env (Orquestra's own "Vigia" routine). Per-bot option: FLEET_WEBHOOK_ENV=/abs/path
 exports VIGIA_WEBHOOK_ENV=that file (another bot's webhook). An inherited VIGIA_WEBHOOK_ENV="" (empty) = muted (tests).
-Every Claude run it launches gets --disallowedTools for git commit/push/merge/rebase, gh and `rm -rf`: the fleet
-works with patches and never publishes; Orquestra commits after checking the integration.
+Every Claude run it launches gets --disallowedTools for git commit/push/merge/rebase, gh, `rm -rf`, curl, wget and
+.env/webhook.env files, plus --strict-mcp-config (no MCP servers): the fleet works with patches and never publishes; Orquestra commits after checking the integration.
 Paths: VIGIA_BIN (default: the bin/ next to this fleet/ folder, i.e. $ORQUESTRA_HOME/bin once installed),
 VIGIA_BASE (default $ORQUESTRA_HOME/vigia; ORQUESTRA_HOME defaults to this install, else ~/.orquestra).
 Output: JSON with name, status_path, conversation_path. Exit codes: 2 invalid input, 3 Vigia cap full,
@@ -33,7 +33,10 @@ VIGIA_BASE = os.path.expanduser(os.environ.get("VIGIA_BASE") or os.path.join(ORQ
 VIGIA_DEFAULT_WEBHOOK = os.path.join(VIGIA_BASE, "webhook.env")   # only documented; never read here
 # the fleet never publishes: Orquestra commits/pushes after checking the integration (see docs/fleet.md)
 DISALLOWED = ["Bash(git commit:*)", "Bash(git push:*)", "Bash(git merge:*)", "Bash(git rebase:*)", "Bash(gh:*)",
-              "Bash(rm -rf *)"]
+              "Bash(rm -rf *)", "Bash(curl:*)", "Bash(wget:*)",
+              "Read(**/.env)", "Read(**/.env.*)", "Read(**/webhook.env)",
+              "Edit(**/.env)", "Edit(**/.env.*)", "Edit(**/webhook.env)",
+              "Write(**/.env)", "Write(**/.env.*)", "Write(**/webhook.env)"]
 SKILL = os.path.join(HERE, "skill", "fleet-sdd", "SKILL.md")
 OTHER = {"claude": "codex", "codex": "claude"}
 MODELS = {"claude": {"top": "opus", "mid": "sonnet", "cheap": "haiku"},
@@ -144,6 +147,11 @@ def main():
     roles = default_roles(cx, a.lead)
     for k, v in (fj.get("roles") or {}).items():   # whatever was already written wins
         if k in roles: roles[k].update(v)
+    if cx in ("M", "G") and roles["team-lead"]["tool"] != "claude":
+        # A Codex lead runs its agents inside its own sandbox; giving that sandbox network (what they need to reach a
+        # model API) is also what push/exfiltration needs. Fail closed instead.
+        fail("M/G team-lead must be claude (a Codex lead's sandbox has no network to launch agents); "
+             "use --lead claude, or split into P tasks with --lead codex")
     text = open(os.path.join(T, "plan.md")).read() + json.dumps(tasks or {}, ensure_ascii=False)
     sec = {"yes": True, "no": False}.get(a.security)
     if sec is None:
@@ -181,7 +189,7 @@ def main():
     def claude_cmd(prompt, agent, model, turns, tools, extra_dirs):
         c = ["claude", "-p", prompt, "--agent", agent, "--agents", agents, "--model", model,
              "--max-turns", str(turns), "--output-format", "stream-json", "--verbose", "--settings", hooks,
-             "--allowedTools", tools, "--disallowedTools", *DISALLOWED]
+             "--allowedTools", tools, "--disallowedTools", *DISALLOWED, "--strict-mcp-config"]
         for d in extra_dirs: c += ["--add-dir", d]
         if a.budget_usd: c += ["--max-budget-usd", str(a.budget_usd)]
         return c
@@ -199,13 +207,8 @@ def main():
         mx = a.max_min or (120 if cx == "M" else 240)
         vr = ["--tool", lead["tool"], "--task-dir", T, "--name", name, "--cwd", integ, "--task", a.task,
               "--max-min", str(mx), "--stall-min", "20", "--max-files", "80"]
-        if lead["tool"] == "claude":
-            env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"   # headless: a background subagent dies when the turn ends
-            cmd = claude_cmd(prompt, "team-lead", lead["model"], 200 if cx == "M" else 400, tools_rw, [T, HERE])
-        else:  # EXPERIMENTAL: a Codex lead needs network/writes outside its sandbox to call claude/vigia-run
-            cmd = ["codex", "exec", "--json", "-m", lead["model"], "-C", integ, "-s", "workspace-write",
-                   "--add-dir", T, "--add-dir", VIGIA_BASE, "-c", "sandbox_workspace_write.network_access=true",
-                   "-o", os.path.join(T, "FINAL-SUMMARY.md"), prompt]
+        env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"   # headless: a background subagent dies when the turn ends
+        cmd = claude_cmd(prompt, "team-lead", lead["model"], 200 if cx == "M" else 400, tools_rw, [T, HERE])
         info = vigia_run(vr, cmd, env, a.dry_run)
         run_role = "team-lead"
     else:

@@ -59,6 +59,33 @@ class OrqLaunch(unittest.TestCase):
         self.assertIn("read-only", data["cmd"])
         self.assertNotIn("--protect-tests", data["vigia_args"])
 
+    def test_claude_denies_and_no_mcp(self):
+        for role in ("implement", "review", "lead", "plan"):
+            cmd = json.loads(self.run_l("--force-lock", role=role).stdout)["cmd"]
+            self.assertIn("--strict-mcp-config", cmd)
+            deny = cmd[cmd.index("--disallowedTools") + 1:]
+            for rule in ("Bash(git push:*)", "Bash(git commit:*)", "Bash(gh:*)", "Bash(curl:*)", "Read(**/.env)"):
+                self.assertIn(rule, deny, role)
+            self.assertEqual(cmd[cmd.index("-p") + 1], "hi")
+
+    def test_plan_has_no_bash_and_lead_protects_tests(self):
+        plan = json.loads(self.run_l("--force-lock", role="plan").stdout)["cmd"]
+        self.assertNotIn("Bash", plan[plan.index("--allowedTools") + 1])
+        lead = json.loads(self.run_l("--force-lock", role="lead").stdout)
+        self.assertIn("--protect-tests", lead["vigia_args"])
+
+    def test_codex_write_roles_have_network_off(self):
+        for role in ("implement", "lead"):
+            cmd = json.loads(self.run_l("--force-lock", tool="codex", role=role).stdout)["cmd"]
+            self.assertIn("sandbox_workspace_write.network_access=false", cmd)
+            self.assertNotIn("sandbox_workspace_write.network_access=true", cmd)
+
+    def test_output_schema_only_read_only(self):
+        rev = json.loads(self.run_l("--force-lock", "--output-schema", "s.json", tool="codex", role="review").stdout)["cmd"]
+        self.assertIn("--output-schema", rev)
+        dev = json.loads(self.run_l("--force-lock", "--output-schema", "s.json", tool="codex", role="dev").stdout)["cmd"]
+        self.assertNotIn("--output-schema", dev)
+
 
 if __name__ == "__main__":
     unittest.main()

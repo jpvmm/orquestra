@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 - `orq-launch`: optional per-role Claude/Codex flag builder and task-dir+role concurrency lock (fleet runners stay unchanged).
+- `orq-launch` safety: Claude gets `--disallowedTools` (git commit/push/merge/rebase, gh, curl, wget, rm -rf, secret files) and `--strict-mcp-config`; Codex write roles get `network_access=false` (fleet-run now refuses a Codex M/G lead instead of giving its sandbox network); plan is read-only (no Bash); lead protects tests; `--output-schema` for read-only Codex roles.
 
 
 ## [0.1.0] - 2026-11-03

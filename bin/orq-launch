@@ -21,7 +21,7 @@ ALIAS = {
 
 ROLE_FLAGS = {
     "plan": {
-        "claude_tools": "Read,Grep,Glob,Bash",
+        "claude_tools": "Read,Grep,Glob",   # a plan critique only reads: no Bash, no file writes
         "protect_tests": False,
         "codex_sandbox": "read-only",
         "max_min": 30,
@@ -44,14 +44,25 @@ ROLE_FLAGS = {
     },
     "lead": {
         "claude_tools": "Agent,Read,Edit,Write,Grep,Glob,Bash",
-        "protect_tests": False,
+        "protect_tests": True,   # its dev subagents run inside this process: the hook protects base tests for them
         "codex_sandbox": "workspace-write",
         "max_min": 120,
         "max_files": 80,
         "max_turns": 200,
-        "codex_network": True,
+        # no network for the lead: orchestration needs none, and network in a workspace-write sandbox is what
+        # push/exfiltration needs. Run socket tests outside the sandbox.
     },
 }
+
+# Every Claude role, enforced by the CLI (prompts only describe it): no history rewrite/publish, no downloads,
+# no secret files, no MCP servers (--strict-mcp-config without --mcp-config). The CLI rules are prefix matches.
+CLAUDE_DENY = (
+    "Bash(git commit:*)", "Bash(git push:*)", "Bash(git merge:*)", "Bash(git rebase:*)", "Bash(gh:*)",
+    "Bash(curl:*)", "Bash(wget:*)", "Bash(rm -rf *)",
+    "Read(**/.env)", "Read(**/.env.*)", "Read(**/webhook.env)",
+    "Edit(**/.env)", "Edit(**/.env.*)", "Edit(**/webhook.env)",
+    "Write(**/.env)", "Write(**/.env.*)", "Write(**/webhook.env)",
+)
 
 
 class Lock:
@@ -149,7 +160,9 @@ def build_cmd(a, prompt, flags):
                 "--max-turns", str(a.max_turns or flags["max_turns"]),
                 "--output-format", "stream-json", "--verbose",
                 "--settings", a.settings or os.path.join(VIGIA_BIN, "claude-hooks.json"),
-                "--allowedTools", a.tools or flags["claude_tools"]]
+                "--allowedTools", a.tools or flags["claude_tools"],
+                "--disallowedTools", *CLAUDE_DENY,
+                "--strict-mcp-config"]
         seen = set()
         for d in [cwd, td] + add_dirs:
             if d not in seen:
@@ -167,8 +180,11 @@ def build_cmd(a, prompt, flags):
         for d in add_dirs:
             if os.path.abspath(d) != td:
                 cmd += ["--add-dir", d]
-    if flags.get("codex_network"):
-        cmd += ["-c", "sandbox_workspace_write.network_access=true"]
+    if flags["codex_sandbox"] == "workspace-write":
+        # explicit: a user/global codex config must not turn network on for these runs
+        cmd += ["-c", "sandbox_workspace_write.network_access=false"]
+    if a.output_schema and flags["codex_sandbox"] == "read-only":
+        cmd += ["--output-schema", os.path.abspath(a.output_schema)]
     if a.skip_git or (not os.path.isdir(os.path.join(cwd, ".git")) and not os.path.isfile(os.path.join(cwd, ".git"))):
         cmd += ["--skip-git-repo-check"]
     cmd += [prompt]
@@ -200,7 +216,8 @@ def main(argv=None):
     p.add_argument("--model")
     p.add_argument("--prompt")
     p.add_argument("--prompt-file")
-    p.add_argument("--output")
+    p.add_argument("--output", help="codex -o: file for the final reply")
+    p.add_argument("--output-schema", help="codex read-only roles: JSON schema of the final reply")
     p.add_argument("--task")
     p.add_argument("--max-min", type=float)
     p.add_argument("--max-turns", type=int)

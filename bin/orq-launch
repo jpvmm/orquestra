@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""orq-launch — build Claude/Codex argv per role + task-dir+role lock.
+
+Optional helper for callers that want consistent role flags (tools, sandbox,
+protect-tests, caps) and to refuse two concurrent runs of the same role in the
+same task dir. fleet-run / fleet-codex keep working without it.
+"""
+from __future__ import annotations
+import argparse, json, os, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+VIGIA_BIN = os.environ.get("VIGIA_BIN", HERE)
+VIGIA_BASE = os.environ.get("VIGIA_BASE", os.path.join(os.path.dirname(HERE), "vigia"))
+
+# Fleet role aliases → launcher role
+ALIAS = {
+    "plan": "plan", "review": "review", "reviewer": "review", "final_reviewer": "review",
+    "security": "review", "implement": "implement", "dev": "implement", "lead": "lead",
+    "team-lead": "lead",
+}
+
+ROLE_FLAGS = {
+    "plan": {
+        "claude_tools": "Read,Grep,Glob,Bash",
+        "protect_tests": False,
+        "codex_sandbox": "read-only",
+        "max_min": 30,
+        "max_turns": 40,
+    },
+    "review": {
+        "claude_tools": "Read,Grep,Glob,Bash",
+        "protect_tests": False,
+        "codex_sandbox": "read-only",
+        "max_min": 30,
+        "max_turns": 40,
+    },
+    "implement": {
+        "claude_tools": "Read,Edit,Write,Grep,Glob,Bash",
+        "protect_tests": True,
+        "codex_sandbox": "workspace-write",
+        "max_min": 40,
+        "max_files": 30,
+        "max_turns": 80,
+    },
+    "lead": {
+        "claude_tools": "Agent,Read,Edit,Write,Grep,Glob,Bash",
+        "protect_tests": False,
+        "codex_sandbox": "workspace-write",
+        "max_min": 120,
+        "max_files": 80,
+        "max_turns": 200,
+        "codex_network": True,
+    },
+}
+
+
+class Lock:
+    """task-dir + role lock; stale if pid dead AND no matching running active entry."""
+
+    @staticmethod
+    def path(task_dir, role):
+        return os.path.join(task_dir, f".orq-launch-{role}.lock")
+
+    @staticmethod
+    def pid_alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def active_running(task_dir, role, name=None):
+        active = os.path.join(VIGIA_BASE, "active")
+        if not os.path.isdir(active):
+            return None
+        td = os.path.abspath(task_dir)
+        for fn in os.listdir(active):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(active, fn)) as f:
+                    e = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if e.get("state") not in (None, "running"):
+                if e.get("state") and e["state"] != "running":
+                    continue
+            if os.path.abspath(e.get("task_dir") or "") != td:
+                continue
+            if name and e.get("name") == name:
+                return e
+            n = e.get("name") or ""
+            if role == "lead" and "-lead-" in n:
+                return e
+            if role == "implement" and ("-dev-" in n or n.startswith("orq-implement")):
+                return e
+            if role == "review" and ("-rev-" in n or "review" in n):
+                return e
+            if e.get("limits", {}).get("role") == role:
+                return e
+        return None
+
+    @classmethod
+    def acquire(cls, task_dir, role, name):
+        os.makedirs(task_dir, exist_ok=True)
+        lp = cls.path(task_dir, role)
+        if os.path.exists(lp):
+            try:
+                with open(lp) as f:
+                    data = json.load(f)
+                pid = int(data.get("pid") or 0)
+                held_name = data.get("name")
+                if pid and cls.pid_alive(pid):
+                    return False, data
+                if cls.active_running(task_dir, role, held_name):
+                    return False, {**data, "via": "active"}
+                os.remove(lp)
+            except (OSError, ValueError, json.JSONDecodeError):
+                try:
+                    os.remove(lp)
+                except OSError:
+                    pass
+        hit = cls.active_running(task_dir, role)
+        if hit:
+            return False, {"via": "active", "entry": hit.get("name"), "task_dir": hit.get("task_dir")}
+        payload = {"pid": os.getpid(), "role": role, "name": name, "ts": time.time(),
+                   "lock": "orq-launch"}
+        fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+        return True, payload
+
+
+def build_cmd(a, prompt, flags):
+    cwd = os.path.abspath(a.cwd)
+    td = os.path.abspath(a.task_dir)
+    add_dirs = []
+    for d in (a.add_dir or []):
+        add_dirs.append(os.path.abspath(d))
+    if a.tool == "claude":
+        # Prompt IMMEDIATELY after -p (variadic flags swallow a trailing prompt).
+        cmd = ["claude", "-p", prompt]
+        if a.agent:
+            cmd += ["--agent", a.agent]
+        if a.agents:
+            cmd += ["--agents", a.agents]
+        cmd += ["--model", a.model or ("opus" if a.role in ("lead", "plan", "review") else "sonnet"),
+                "--max-turns", str(a.max_turns or flags["max_turns"]),
+                "--output-format", "stream-json", "--verbose",
+                "--settings", a.settings or os.path.join(VIGIA_BIN, "claude-hooks.json"),
+                "--allowedTools", a.tools or flags["claude_tools"]]
+        seen = set()
+        for d in [cwd, td] + add_dirs:
+            if d not in seen:
+                cmd += ["--add-dir", d]
+                seen.add(d)
+        if a.budget_usd:
+            cmd += ["--max-budget-usd", str(a.budget_usd)]
+        return cmd
+    model = a.model or "gpt-6.1-sol"
+    cmd = ["codex", "exec", "--json", "-m", model, "-C", cwd, "-s", flags["codex_sandbox"]]
+    if a.output:
+        cmd += ["-o", os.path.abspath(a.output)]
+    if flags["codex_sandbox"] == "workspace-write":
+        cmd += ["--add-dir", td]
+        for d in add_dirs:
+            if os.path.abspath(d) != td:
+                cmd += ["--add-dir", d]
+    if flags.get("codex_network"):
+        cmd += ["-c", "sandbox_workspace_write.network_access=true"]
+    if a.skip_git or (not os.path.isdir(os.path.join(cwd, ".git")) and not os.path.isfile(os.path.join(cwd, ".git"))):
+        cmd += ["--skip-git-repo-check"]
+    cmd += [prompt]
+    return cmd
+
+
+def vigia_args(a, flags):
+    args = ["--tool", a.tool, "--task-dir", os.path.abspath(a.task_dir), "--name", a.name,
+            "--cwd", os.path.abspath(a.cwd), "--max-min", str(a.max_min or flags["max_min"])]
+    if a.stall_min:
+        args += ["--stall-min", str(a.stall_min)]
+    if flags.get("protect_tests") or a.protect_tests:
+        args.append("--protect-tests")
+    mf = a.max_files if a.max_files is not None else flags.get("max_files")
+    if mf:
+        args += ["--max-files", str(mf)]
+    if a.task:
+        args += ["--task", a.task]
+    return args
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="orq-launch")
+    p.add_argument("--tool", required=True, choices=["claude", "codex"])
+    p.add_argument("--role", required=True, help="plan|review|implement|lead (aliases: dev, reviewer, team-lead, …)")
+    p.add_argument("--cwd", required=True)
+    p.add_argument("--task-dir", required=True)
+    p.add_argument("--name", default=None)
+    p.add_argument("--model")
+    p.add_argument("--prompt")
+    p.add_argument("--prompt-file")
+    p.add_argument("--output")
+    p.add_argument("--task")
+    p.add_argument("--max-min", type=float)
+    p.add_argument("--max-turns", type=int)
+    p.add_argument("--max-files", type=int)
+    p.add_argument("--stall-min", type=float)
+    p.add_argument("--budget-usd", type=float)
+    p.add_argument("--agent")
+    p.add_argument("--agents", help="path to agents.json for Claude --agents")
+    p.add_argument("--settings")
+    p.add_argument("--tools", help="override allowedTools")
+    p.add_argument("--add-dir", action="append", default=[])
+    p.add_argument("--protect-tests", action="store_true")
+    p.add_argument("--skip-git-repo-check", dest="skip_git", action="store_true")
+    p.add_argument("--force-lock", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    a = p.parse_args(argv)
+    role = ALIAS.get(a.role)
+    if not role:
+        p.error(f"unknown role {a.role!r}; expected one of {sorted(set(ALIAS))}")
+    a.role = role
+    if not a.prompt and not a.prompt_file:
+        p.error("need --prompt or --prompt-file")
+    prompt = a.prompt if a.prompt is not None else open(a.prompt_file).read()
+    a.name = a.name or f"orq-{a.role}-{int(time.time()) % 100000}"
+    flags = ROLE_FLAGS[a.role]
+    if a.force_lock:
+        ok, lock = True, {"forced": True}
+    else:
+        ok, lock = Lock.acquire(a.task_dir, a.role, a.name)
+    if not ok:
+        print(json.dumps({"error": "active_run_same_task_role", "lock": lock}, ensure_ascii=False), file=sys.stderr)
+        return 3
+    cmd = build_cmd(a, prompt, flags)
+    out = {
+        "cmd": cmd,
+        "vigia_args": vigia_args(a, flags),
+        "lock": lock,
+        "role": a.role,
+        "tool": a.tool,
+        "name": a.name,
+    }
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

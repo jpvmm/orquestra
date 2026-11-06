@@ -249,6 +249,7 @@ for t in tests/test_*.py; do python3 "$t"; done
 - `test_vigia_notify.py`: per-run webhook, muting, `started` not POSTed, dedupe
 - `test_vigia_watchdog.py`: wall-clock cap across suspension, stall with CPU, `incomplete`, watchdog, PID reuse
 - `test_fleet.py`: fleet-wt waves/integration/conflicts and `fleet-run --dry-run`
+- `test_orq_launch.py`: role flags and task-dir+role lock for `orq-launch`
 
 ## Security notes
 

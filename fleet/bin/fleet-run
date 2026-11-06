@@ -120,7 +120,8 @@ class Criteria:
     SUBST = re.compile(r"\$\(|`|<\(|>\(")
     VACUOUS = {"true", ":", "echo", "printf", "exit", "false", "yes", "sleep", "read"}
     SETUP = {"cd", "export", "set"}   # allowed before the proving command, never alone
-    WRAPPERS = {"env", "timeout", "nice", "command", "nohup", "time", "xargs", "exec"}
+    WRAPPERS = {"env", "timeout", "nice", "command", "nohup", "time", "exec"}
+    CONDITIONAL = {"xargs", "parallel", "find"}   # may run nothing (empty input / no match) and still exit 0
     FILE_TESTS = {"-s", "-f", "-e", "-r", "-x", "-d"}
     SCRIPT_RUNNERS = {"bash", "sh"}
     # interpreters whose first operand is a script file, unless code/module comes inline (-c/-m/-e...)
@@ -184,6 +185,8 @@ class Criteria:
                 return "nested shells are not allowed"
             inner = Criteria.segments(w[2])
             return inner if isinstance(inner, str) else Criteria.segments_problem(inner, path, repo, depth + 1)
+        if first in Criteria.CONDITIONAL:
+            return f"{first} may run nothing and still succeed: call the check directly"
         if first in Criteria.SETUP:
             return None
         if first in Criteria.VACUOUS:

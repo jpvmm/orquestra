@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fleet-run criteria gate (no LLM): every criterion is a whitelisted command (test runner, T/checks script, or a UI
 criterion's `test -s ARTIFACT`) joined only by &&. Run: python3 tests/test_fleet_criteria.py"""
-import importlib.machinery, importlib.util, json, os, sys, tempfile, unittest
+import importlib.machinery, importlib.util, json, os, subprocess, sys, tempfile, unittest
 
 sys.dont_write_bytecode = True
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -110,6 +110,28 @@ class CriteriaGate(unittest.TestCase):
             self.assertTrue(self.bad(command=cmd), cmd)
         self.assertEqual(self.bad(command="python3 -m pytest -q 2>&1"), [])
         self.assertEqual(self.bad(command="python3 -m pytest -q -k 'a or b'"), [])
+
+    def test_quoted_operators_never_split_segments(self):
+        """shlex strips quotes: `'&&'` must not count as the && operator (the shell passes it as an argument)."""
+        ui = dict(when="ui", artifact="proofs/ui.png")
+        for cmd in (f"bash {self.c1} '&&' test -s proofs/ui.png", f'bash {self.c1} "&&" test -s proofs/ui.png',
+                    f'"&&" {self.c1} && test -s proofs/ui.png', f"'&&' python3 -m pytest -q && test -s proofs/ui.png",
+                    f"{self.c1} '&&' test -s proofs/ui.png", f"bash {self.c1} ';' test -s proofs/ui.png",
+                    f"bash {self.c1} '|' test -s proofs/ui.png", f"bash {self.c1} '(' test -s proofs/ui.png"):
+            self.assertTrue(self.bad(command=cmd, **ui), cmd)
+        self.assertEqual(self.bad(command=f"bash {self.c1} && test -s proofs/ui.png", **ui), [])
+
+    def test_quoted_and_and_really_skips_the_artifact_check(self):
+        """Execution-level: with the artifact missing, bash exits 0 on the quoted form, so the gate must refuse it."""
+        write(self.c1, "#!/bin/sh\nexit 0\n"); os.chmod(self.c1, 0o755)
+        ui = dict(when="ui", artifact="proofs/ui.png")
+        cmd = f"bash {self.c1} '&&' test -s proofs/ui.png"
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "proofs", "ui.png")))
+        r = subprocess.run(["bash", "-c", cmd], cwd=self.repo, capture_output=True)
+        self.assertEqual(r.returncode, 0)                                  # the artifact is never checked
+        honest = subprocess.run(["bash", "-c", f"bash {self.c1} && test -s proofs/ui.png"], cwd=self.repo)
+        self.assertNotEqual(honest.returncode, 0)                          # the unquoted form does check it
+        self.assertTrue(self.bad(command=cmd, **ui))
 
     def test_fake_test_path_and_inline_code(self):
         """Round-10 bypasses: a fake `test` path and assignment-only inline code."""

@@ -168,6 +168,15 @@ class Criteria:
         why = Criteria.unquoted_problem(command)
         if why:
             return why
+        q = None                     # shlex strips quotes: a quoted '&&' must never become an operator (fail closed)
+        for ch in command:
+            if q:
+                if ch == q:
+                    q = None
+                elif ch in ";&|()":
+                    return f"quoted operator character {ch!r} is not allowed: it would be passed as an argument"
+            elif ch in "'\"":
+                q = ch
         try:
             lx = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
             lx.whitespace_split = True

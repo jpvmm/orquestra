@@ -5,6 +5,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- Flaky watchdog test: the simulated suspension jumped exactly the 3600 s alert threshold; it now jumps 3660 s.
+
 ## [0.1.0] - 2026-11-03
 
 ### Added

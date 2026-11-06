@@ -73,12 +73,12 @@ class Caps(Base):
         self.assertIn("even with CPU", st["summary"])
 
     def test_suspended_box_counts_toward_cap(self):
-        """A paused VM stops the monotonic clock. Simulate the wall clock jumping 1 h after 2 s."""
+        """A paused VM stops the monotonic clock. Simulate the wall clock jumping 1 h (+1 min margin: the measured jump wobbles around the 3600 s alert threshold) after 2 s."""
         boot = (
             "import importlib.machinery, importlib.util, sys, time\n"
             "sys.dont_write_bytecode = True\n"
             "real, m0 = time.time, time.monotonic()\n"
-            "time.time = lambda: real() + (3600 if time.monotonic() - m0 > 2 else 0)\n"
+            "time.time = lambda: real() + (3660 if time.monotonic() - m0 > 2 else 0)\n"
             f"ld = importlib.machinery.SourceFileLoader('vigia_run', {RUN!r})\n"
             "mod = importlib.util.module_from_spec(importlib.util.spec_from_loader('vigia_run', ld)); ld.exec_module(mod)\n"
             "sys.argv = ['vigia-run'] + sys.argv[1:]; mod.main()\n")

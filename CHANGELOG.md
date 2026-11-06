@@ -7,9 +7,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 - Fleet criteria template ships a `C-UI` visual-proof criterion (screenshot or Playwright journey log) for UI tasks.
-- fleet-run criteria gate: refuses manual, vacuous (`true`, `echo`, `test 1`), unknown or failure-masking commands
-  (`||`, `;`, `|`, `&`, subshells, `$(...)`), commands that may run nothing (`xargs`, `find -exec`, a bare interpreter, `--version`, no-op inline code like `python3 -c pass`, `set -n` or other no-exec shell options, unknown wrapper options such as `env -S`, `exec`), anything that is not a test runner (`pytest`, `python3 -m pytest`, `go test`, `npm test`...), a file test, `grep`/`diff`/`cmp` on files, `curl --fail` or a script; help/version/collect-only flags are refused and relative scripts resolve after any `cd`, programs called by path must be scripts, and assertion-disabling Python (`-O`, `PYTHONOPTIMIZE`) is refused, long commands (→ `T/checks/<id>.sh`), missing/non-executable scripts,
-  and UI criteria whose command does not check their `artifact`. The skill states criteria never change in a run.
+- fleet-run criteria gate is a whitelist: a criterion command may only run a test runner (`pytest`,
+  `python3 -m pytest|unittest`, `npm|pnpm|yarn test`, `go test`, `cargo test`) or an existing text script under
+  `T/checks/`, joined by `&&` with optional `cd DIR` / `VAR=value`; a UI criterion must name its `artifact` and check
+  it with `test -s ARTIFACT` (or a `T/checks` script naming it). Everything else is refused: manual text, inline code
+  (`python3 -c`, `node -e`, `bash -c`), other programs, wrappers (`env`, `exec`, `timeout`, `xargs`, `find`), shell
+  options, failure-masking operators, help/collect-only/no-run flags and assertion-disabling Python settings. The skill states criteria never change in a run.
 
 
 ## [0.1.0] - 2026-11-03

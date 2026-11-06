@@ -31,12 +31,16 @@ so nothing is rendered at install time.
 then the fleet writes `fleet.json`, `fleet-state.json`, `progress.md`, `briefs/`, `reports/`, `review/`, `patches/`,
 `wt/integration`, `wt/task-ID`, `FINAL-SUMMARY.md`.
 
-Criteria gate (fleet-run refuses the start otherwise): each `command` is short (≤240 chars, else a script in
-`T/checks/<id>.sh` called by absolute path) and executable — not manual text, not a no-op (`true`, `echo`, `test 1`),
-on PATH or an executable file (relative paths = the repo, since criteria run from the integration worktree).
-Commands join only with `&&`: no `||`, `;`, `|`, `&`, subshells or `$(...)`, so nothing masks a failure. A UI
-criterion (`"when": "ui"` or id `C-UI*`) names its proof file in `artifact` and its command checks it explicitly
-(`test -s ARTIFACT`, optionally `&& your-check ARTIFACT`). Interpreter scripts (`python3 x.py`, `node x.js`) must exist. Criteria never change during a run; only a replan changes them.
+Criteria gate (fleet-run refuses the start otherwise): each `command` is a WHITELISTED proof, ≤240 chars, joined only
+with `&&` (no `||`, `;`, `|`, `&`, subshells or `$(...)`, so nothing masks a failure). Allowed simple commands:
+`cd DIR` (literal; later relative paths resolve from it) and `VAR=value` prefixes (not `PYTHONOPTIMIZE`,
+`PYTEST_ADDOPTS`, `BASH_ENV`...); a test runner — `pytest`, `python3 -m pytest|unittest`, `npm|pnpm|yarn test`,
+`go test`, `cargo test` (bare, or the path of an existing executable named like the runner), without
+help/version/collect-only/no-run flags; an existing text script under `T/checks/` (absolute path, or `bash|sh` + that
+path). Everything else is refused: inline code (`python3 -c`, `node -e`, `bash -c`), other programs, wrappers (`env`,
+`exec`, `timeout`, `xargs`, `find`) and shell options. A UI criterion (`"when": "ui"` or id `C-UI*`) names its proof
+file in `artifact` and checks it with `test -s ARTIFACT` (`test -s` is allowed only there) or a `T/checks` script that
+names the artifact. Criteria never change during a run; only a replan changes them.
 
 ## Usage
 ```

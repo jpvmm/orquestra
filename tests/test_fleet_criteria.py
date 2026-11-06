@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""fleet-run criteria gate (no LLM): every criterion is one short executable command that cannot mask a failure;
-a UI criterion checks its artifact. Run: python3 tests/test_fleet_criteria.py"""
+"""fleet-run criteria gate (no LLM): every criterion is a whitelisted command (test runner, T/checks script, or a UI
+criterion's `test -s ARTIFACT`) joined only by &&. Run: python3 tests/test_fleet_criteria.py"""
 import importlib.machinery, importlib.util, json, os, sys, tempfile, unittest
 
 sys.dont_write_bytecode = True
@@ -11,82 +11,107 @@ _ld.exec_module(R)
 PATH = os.environ.get("PATH", "")
 
 
+def write(p, txt):
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        f.write(txt)
+
+
 class CriteriaGate(unittest.TestCase):
+    """Whitelist: test runners, T/checks scripts, and `test -s ARTIFACT` for UI criteria. Nothing else."""
+
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()   # an empty repo: relative scripts must exist in it
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = os.path.join(self.tmp.name, "repo")          # empty repo: relative paths resolve here
+        self.T = os.path.join(self.tmp.name, "T")
+        os.makedirs(os.path.join(self.repo, "sub")); os.makedirs(os.path.join(self.T, "checks"))
+        self.c1 = os.path.join(self.T, "checks", "C1.sh")
+        write(self.c1, "#!/bin/sh\ntest -s out\n"); os.chmod(self.c1, 0o755)
+        self.noexec = os.path.join(self.T, "checks", "C2.sh")
+        write(self.noexec, "exit 1\n")
+        self.other = os.path.join(self.repo, "check.sh")         # executable script outside T/checks
+        write(self.other, "#!/bin/sh\nexit 0\n"); os.chmod(self.other, 0o755)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def bad(self, **c):
-        return R.Criteria.problems([{"id": "C1", **c}], PATH, repo=self.tmp.name)
+        return R.Criteria.problems([{"id": "C1", **c}], PATH, repo=self.repo, task_dir=self.T)
 
-    def test_executable_commands_pass(self):
-        os.makedirs(os.path.join(self.tmp.name, "bin"), exist_ok=True)
-        open(os.path.join(self.tmp.name, "bin", "test_x.py"), "w").write("assert True\n")
-        os.makedirs(os.path.join(self.tmp.name, "checks"), exist_ok=True)
-        open(os.path.join(self.tmp.name, "checks", "c1.sh"), "w").write("#!/bin/sh\ntest -s out\n")
-        os.chmod(os.path.join(self.tmp.name, "checks", "c1.sh"), 0o755)
-        for cmd in ("python3 -m pytest -q", "test -s proofs/x.png", "[ -f out.txt ]", "FOO=1 python3 -c 'print(1); x'",
-                    "cd sub && python3 -m pytest -q 2>&1", "bash -c 'python3 -m pytest -q'", "timeout 60 python3 -m pytest",
-                    "cd bin && python3 test_x.py", "bash -c 'cd bin && python3 test_x.py'", "grep -q needle README.md",
-                    "diff out.txt expected.txt", f"{sys.executable} -m pytest -q", "./checks/c1.sh"):
+    def test_whitelisted_commands_pass(self):
+        rel_from_sub = os.path.relpath(self.c1, os.path.join(self.repo, "sub"))
+        for cmd in ("python3 -m pytest -q", "pytest -q tests/test_a.py", "python3 -m unittest discover -s tests",
+                    "cd sub && python3 -m pytest -q 2>&1", "PYTHONPATH=src python3 -m pytest -q",
+                    f"{sys.executable} -m pytest -q", "python3 -B -m pytest", self.c1, f"bash {self.c1}",
+                    f"sh {self.noexec}", f"cd sub && {rel_from_sub}", f"cd {self.T} && checks/C1.sh",
+                    f"python3 -m pytest -q && {self.c1}", "cd ~ && python3 -m pytest -q"):
             self.assertEqual(self.bad(command=cmd), [], cmd)
 
-    def test_manual_vacuous_and_masking_rejected(self):
-        for cmd in ("", "manual check of the page", "Verify visually that it works", "N/A", "...", "true", "echo ok",
-                    "see README", "nosuchtool-xyz --run", "/bin/true", "env true", "timeout 5 true",
-                    "python3 -m pytest || true", "python3 -m pytest; exit 0", "test 1 # proofs/ui.png", "test 1",
-                    "[ 1 ]", "bash -c true", "sh -c 'true && :'", "python3 -m pytest; printf ok",
-                    "python3 -m pytest | tee log", "python3 -m pytest &", "(python3 -m pytest)", "echo $(python3 x)",
-                    "python3 -m pytest && true", "cd sub", "bash -c cd", "python3 missing-proof-script.py",
-                    "node missing.js", "sh", "xargs -r test -s proofs/ui.png", "find . -name x -exec true",
-                    "python3", "python3 -c pass", "python3 --version", "node -v", "python3 -c 'import sys; print(1)'",
-                    "node -e 'process.exit(0)'", "python3 -c",
-                    "set -n && test -s proofs/ui.png", "env --split-string=true test -s proofs/ui.png",
-                    "env -S true", "command -v test", "set -o noexec && test -s x", "bash -n checks/C1.sh",
-                    "sh -c 'set -n && test -s x'", "timeout --foo 5 test -s x", "nice --bogus test -s x",
-                    "exec test -f /etc/passwd && test -s proofs/ui.png", "env exec test -s x",
-                    "python3 -m pytest --help", "python3 -m pytest --collect-only", "pwd", "ls", "cat README.md",
-                    "python3 -m http.server", "python3 test_x.py", "make -n test", "make", "npm run",
-                    "cd bin && python3 missing.py", "cd $HOME && python3 -m pytest", "grep needle",
-                    f"{sys.executable} -c pass", "/bin/ls", "/usr/bin/env true", "python3 -O -c 'assert False'",
-                    "PYTHONOPTIMIZE=1 python3 -c 'assert False'", "env PYTHONOPTIMIZE=1 python3 -m pytest",
-                    "export PYTHONOPTIMIZE=1 && python3 -m pytest", "python3 -OO -m pytest"):
+    def test_everything_else_is_refused(self):
+        for cmd in ("manual check of the page", "Verify visually that it works", "N/A", "...", "true", "echo ok",
+                    "see README", "nosuchtool-xyz --run", "/bin/true", "env true", "timeout 5 python3 -m pytest",
+                    "python3 -m pytest || true", "python3 -m pytest; exit 0", "test 1", "[ 1 ]", "bash -c true",
+                    "bash -c 'python3 -m pytest -q'", "sh -c 'true && :'", "python3 -m pytest | tee log",
+                    "python3 -m pytest &", "(python3 -m pytest)", "echo $(python3 x)", "python3 -m pytest && true",
+                    "cd sub", "python3", "python3 -c pass", "python3 -c 'x=1'", "python3 -c 'assert 1 == 1'",
+                    "python3 --version", "node -e 'process.exit(0)'", "node --test", "python3 test_x.py",
+                    "python3 -m http.server", "python3 -O -m pytest", "PYTHONOPTIMIZE=1 python3 -m pytest",
+                    "PYTEST_ADDOPTS=--collect-only python3 -m pytest", "BASH_ENV=x bash " + self.c1,
+                    "set -n && python3 -m pytest", "exec python3 -m pytest", "env -S 'python3 -m pytest'",
+                    "xargs -r test -s proofs/ui.png", "find . -name x -exec true ;", "parallel true",
+                    "python3 -m pytest --help", "python3 -m pytest --collect-only", "pytest --co", "cargo test --no-run",
+                    "npm run build", "npm", "go vet ./...", "go test -list .", "pwd", "ls", "cat README.md",
+                    "grep -q x README.md", "diff a b", "curl -f http://x", "make test", "/bin/ls",
+                    "/does/not/exist/test -s proof.png", "/does/not/exist/pytest", "/does/not/exist/python3 -m pytest",
+                    self.other, f"bash {self.other}", f"cd {self.repo} && ./check.sh", self.noexec,
+                    f"bash -x {self.c1}", "bash", "./checks/C1.sh", "test -s proofs/ui.png", "cd $HOME && pytest",
+                    "cd - && pytest", f"cd sub && {self.c1}x"):
             self.assertTrue(self.bad(command=cmd), cmd)
 
-    def test_scripts_must_exist_and_be_executable(self):
-        with tempfile.TemporaryDirectory() as d:
-            script = os.path.join(d, "checks", "C1.sh")
-            os.makedirs(os.path.dirname(script))
-            with open(script, "w") as f:
-                f.write("exit 1\n")
-            ok = R.Criteria.problems([{"id": "C1", "command": "bash checks/C1.sh"},
-                                      {"id": "C2", "command": "bash " + script}], PATH, repo=d)
-            self.assertEqual(ok, [])
-            for cmd in ("./missing-check", "bash checks/missing.sh", "./checks", "./checks/C1.sh", "bash -x"):
-                self.assertTrue(R.Criteria.problems([{"id": "C1", "command": cmd}], PATH, repo=d), cmd)
-            os.chmod(script, 0o755)
-            self.assertEqual(R.Criteria.problems([{"id": "C1", "command": "./checks/C1.sh"}], PATH, repo=d), [])
+    def test_r10_regressions(self):
+        """Round-10 bypasses: a fake `test` path and assignment-only inline code."""
+        for cmd in ("/does/not/exist/test -s proof.png", "python3 -c 'x=1'"):
+            self.assertTrue(self.bad(command=cmd), cmd)
+            self.assertTrue(self.bad(command=cmd, when="ui", artifact="proof.png"), cmd)
+
+    def test_binary_in_t_checks_is_refused(self):
+        b = os.path.join(self.T, "checks", "bin")
+        with open(b, "wb") as f:
+            f.write(b"\x7fELF\0\0")
+        os.chmod(b, 0o755)
+        self.assertTrue(self.bad(command=b))
+        os.symlink("/bin/true", os.path.join(self.T, "checks", "link"))
+        self.assertTrue(self.bad(command=os.path.join(self.T, "checks", "link")))
+
+    def test_scripts_need_a_task_dir(self):
+        self.assertTrue(R.Criteria.problems([{"id": "C1", "command": self.c1}], PATH, repo=self.repo))
 
     def test_long_or_multiline_goes_to_checks(self):
-        self.assertIn("T/checks/C1.sh", self.bad(command="python3 -c '" + "x" * 300 + "'")[0])
+        self.assertIn("T/checks/C1.sh", self.bad(command="python3 -m pytest " + "x" * 300)[0])
         self.assertTrue(self.bad(command="python3 -m pytest\npython3 -m pytest"))
 
     def test_ui_criterion_must_check_its_artifact(self):
-        art = "proofs/ui.png"
+        ui = dict(when="ui", artifact="proofs/ui.png")
         self.assertTrue(self.bad(command="python3 -m pytest -q", when="ui"))
-        self.assertTrue(self.bad(command="python3 -m pytest -q", when="ui", artifact=art))
-        self.assertTrue(self.bad(command="test -n proofs/ui.png", when="ui", artifact=art))
-        self.assertTrue(self.bad(command="test -s proofs/ui.png || /bin/true", when="ui", artifact=art))
-        self.assertEqual(self.bad(command="[ -s proofs/ui.png ]", when="ui", artifact=art), [])
-        self.assertEqual(self.bad(command="python3 -m pytest -q && test -s proofs/ui.png", when="ui", artifact=art), [])
-        self.assertTrue(self.bad(command="python3 -c pass proofs/ui.png", when="ui", artifact=art))
+        self.assertTrue(self.bad(command="python3 -m pytest -q", **ui))
+        self.assertTrue(self.bad(command="test -n proofs/ui.png", **ui))
+        self.assertTrue(self.bad(command="test -f proofs/ui.png", **ui))
+        self.assertTrue(self.bad(command="test -s proofs/other.png", **ui))
+        self.assertTrue(self.bad(command="test -s proofs/ui.png || true", **ui))
+        self.assertTrue(self.bad(command="cd sub && test -s proofs/ui.png", **ui))     # resolves to another file
+        self.assertEqual(self.bad(command="python3 -m pytest -q && test -s proofs/ui.png", **ui), [])
+        self.assertEqual(self.bad(command="[ -s proofs/ui.png ]", **ui), [])
+        self.assertEqual(self.bad(command="test -s proofs/ui.png", **ui), [])
+        self.assertTrue(self.bad(command=self.c1, **ui))                                 # script does not name it
+        write(self.c1, "#!/bin/sh\ntest -s proofs/ui.png\n")
+        self.assertEqual(self.bad(command=self.c1, **ui), [])                             # folded into the script
 
-    def test_template_criteria_shape(self):
-        with open(os.path.join(ROOT, "fleet", "skill", "fleet-sdd", "templates", "criteria.json")) as f:
-            crit = json.load(f)["criteria"]
-        self.assertEqual(R.Criteria.problems([c for c in crit if c["id"] == "C-UI"], PATH), [])
+    def test_template_criteria_are_valid(self):
+        crit = json.load(open(os.path.join(ROOT, "fleet", "skill", "fleet-sdd", "templates", "criteria.json")))["criteria"]
+        c2 = os.path.join(self.T, "checks", "C2.sh")
+        for c in crit:
+            c["command"] = c["command"].replace("/ABSOLUTE/PATH/TO/T/checks/C2.sh", c2)
+        self.assertEqual(R.Criteria.problems(crit, PATH, repo=self.repo, task_dir=self.T), [])
 
 
 if __name__ == "__main__":

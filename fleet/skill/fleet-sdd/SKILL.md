@@ -28,7 +28,10 @@ T/FINAL-SUMMARY.md                   ← your final summary (fixed format)
 ```
 
 UI tasks: `criteria.json` MUST include a visual-proof criterion whose `artifact` (screenshot or Playwright headless
-journey log) its command checks; fleet-run rejects a UI criterion without it. Template: `templates/criteria.json` `C-UI`.
+journey log) its command checks with `test -s ARTIFACT` (or a `T/checks` script that names it); fleet-run rejects a UI criterion without it. Template: `templates/criteria.json` `C-UI`.
+Criteria commands are a whitelist (fleet-run refuses the rest): a test runner (`pytest`, `python3 -m pytest|unittest`,
+`npm test`, `go test`, `cargo test`) or an executable script `T/checks/<id>.sh` by absolute path, optionally after
+`cd DIR` / `VAR=value`, joined only by `&&`. No inline code (`python3 -c`, `bash -c`), other programs or wrappers.
 Tools (in the fleet `bin/` folder given in your prompt, use absolute paths): `fleet-wt`, `codex-reviewer`,
 `codex-dev`, `fleet-wait`. Models/roles: read `T/fleet.json` (`roles`, `max_parallel`).
 

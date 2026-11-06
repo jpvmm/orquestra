@@ -5,6 +5,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- `install.sh` no longer overwrites a customized `orquestra.md` on reinstall; writes `orquestra.md.new` instead.
+
+
 ## [0.1.0] - 2026-11-03
 
 ### Added

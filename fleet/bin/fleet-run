@@ -115,7 +115,9 @@ class Criteria:
       - a known test runner: `pytest`, `python3 -m pytest|unittest`, `npm|pnpm|yarn test`, `go test`, `cargo test`
         (bare name, or the path of an existing executable named like the runner);
       - a check script under T/checks (`/abs/T/checks/ID.sh`, or `bash|sh` + that path), resolved after any `cd`;
-      - UI criteria only: `test -s ARTIFACT` / `[ -s ARTIFACT ]` for the criterion's own artifact.
+      - UI criteria only (and then required): `test -s ARTIFACT` / `[ -s ARTIFACT ]` for the criterion's own artifact.
+    Runner arguments are whitelisted per runner (ARGS): no help/listing/no-run modes, -exec, plugins or name filters
+    that can select nothing.
     Inline code (`python3 -c`, `node -e`, `bash -c`), other programs, wrappers (`env`, `exec`, `timeout`, `xargs`,
     `find`...) and shell options are refused: the proof lives in a test file or a T/checks script."""
 
@@ -132,8 +134,19 @@ class Criteria:
     # runner → required first operand (None: pytest takes test paths/options directly)
     RUNNERS = {"pytest": None, "py.test": None, "npm": "test", "pnpm": "test", "yarn": "test", "go": "test",
                "cargo": "test"}
-    NO_PROOF_FLAGS = {"--help", "-h", "--version", "-V", "--collect-only", "--co", "--setup-plan", "--setup-only",
-                      "--fixtures", "--markers", "--no-run", "-list", "--list", "--passWithNoTests", "--dry-run"}
+    # runner → (flags allowed alone, flags taking one value [separate or =], positional operands allowed). Anything else
+    # (help/listing/no-run modes, -exec, plugins, config files, test-name filters that can select nothing) is refused.
+    ARGS = {
+        "pytest": ({"-q", "-qq", "-v", "-vv", "-x", "-s", "-l", "-ra", "-rA", "--no-header", "--strict-markers",
+                    "--exitfirst", "--quiet", "--verbose"}, {"-k", "-m", "--tb", "--maxfail", "--durations", "-W"}, True),
+        "unittest": ({"-q", "-v", "-f", "-b", "--quiet", "--verbose", "--failfast", "--buffer"}, {"-k"}, True),
+        "unittest discover": ({"-q", "-v", "-f", "-b", "--quiet", "--verbose", "--failfast", "--buffer"},
+                              {"-k", "-s", "-p", "-t", "--start-directory", "--pattern", "--top-level-directory"}, False),
+        "go": ({"-v", "-race", "-short", "-cover", "-failfast"}, {"-count", "-timeout", "-p"}, True),
+        "cargo": ({"-q", "--quiet", "--release", "--workspace", "--all", "--all-features", "--locked", "--offline"},
+                  {"-p", "--package", "--features", "-j", "--jobs"}, False),
+        "npm": (set(), set(), False), "pnpm": (set(), set(), False), "yarn": (set(), set(), False),
+    }
     SCRIPT_SHELLS = {"bash", "sh"}
 
     @staticmethod
@@ -238,20 +251,46 @@ class Criteria:
         if name is None:
             return "bad", (f"{w0!r} is not an allowed proving command: use a test runner (pytest, python3 -m pytest, "
                            f"npm test, go test, cargo test) or a script in T/checks")
-        if any(x in Criteria.NO_PROOF_FLAGS for x in w[1:]):
-            return "bad", "help/version/listing/no-run flags prove nothing"
         if Criteria.PY.fullmatch(name):
             i = 1
             while i < len(w) and w[i] in Criteria.PY_FLAGS:
                 i += 1
             if i + 1 >= len(w) or w[i] != "-m" or w[i + 1] not in Criteria.PY_MODULES:
                 return "bad", f"{name}: only `{name} -m pytest|unittest ...` (no inline code, scripts or other flags)"
-            return "runner", f"{name} -m {w[i + 1]}"
-        need = Criteria.RUNNERS[name]
-        ops = [x for x in w[1:] if not x.startswith("-")]
-        if need and (not ops or ops[0] != need):
-            return "bad", f"{name}: only `{name} {need}`"
-        return "runner", name
+            key, args = w[i + 1], w[i + 2:]
+            if key == "unittest" and args[:1] == ["discover"]:
+                key, args = "unittest discover", args[1:]
+        else:
+            need = Criteria.RUNNERS[name]
+            if need and w[1:2] != [need]:
+                return "bad", f"{name}: only `{name} {need}`"
+            key, args = ("pytest" if name in ("pytest", "py.test") else name), w[2 if need else 1:]
+        why = Criteria.args_problem(key, args)
+        return ("bad", why) if why else ("runner", key)
+
+    @staticmethod
+    def args_problem(runner, args):
+        """Problem with a runner's arguments (strict per-runner whitelist), or None."""
+        alone, valued, positional = Criteria.ARGS[runner]
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a.startswith("-"):
+                if a in alone:
+                    i += 1; continue
+                k = a.split("=", 1)[0]
+                if k in valued and "=" in a:
+                    i += 1; continue
+                if a in valued:
+                    if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                        return f"{runner}: {a} needs a value"
+                    i += 2; continue
+                return (f"{runner}: option {a!r} is not allowed here (allowed: "
+                        f"{' '.join(sorted(alone | valued)) or 'none'})")
+            if not positional or a.startswith("@"):
+                return f"{runner}: extra argument {a!r} is not allowed"
+            i += 1
+        return None
 
     @staticmethod
     def check(cmd, path, repo, task_dir, art):
@@ -274,24 +313,12 @@ class Criteria:
             kinds.append((kind, detail))
         if not kinds:
             return "command proves nothing"
-        if art:
-            ok = any(k == "artifact" for k, _ in kinds) or any(
-                k == "script" and Criteria.mentions(d, art, repo) for k, d in kinds)
-            if not ok:
-                return ("UI criterion must check its artifact: `test -s ARTIFACT`, or a T/checks script that names "
-                        "the artifact path")
-        elif not any(k in ("runner", "script") for k, _ in kinds):
+        if art and not any(k == "artifact" for k, _ in kinds):
+            return ("UI criterion must check its artifact explicitly with `test -s ARTIFACT` (a T/checks script may "
+                    "check more, after or before it)")
+        if not art and not any(k in ("runner", "script") for k, _ in kinds):
             return "command proves nothing"
         return None
-
-    @staticmethod
-    def mentions(script, art, repo):
-        try:
-            txt = open(script, encoding="utf-8", errors="replace").read()
-        except OSError:
-            return False
-        rel = os.path.relpath(art, repo) if repo else art
-        return art in txt or rel in txt
 
     @staticmethod
     def problems(crit, path, repo=None, task_dir=None):

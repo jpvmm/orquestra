@@ -10,7 +10,7 @@ All notable changes to this project are documented here. The format is based on
 - fleet-run criteria gate is a whitelist: a criterion command may only run a test runner (`pytest`,
   `python3 -m pytest|unittest`, `npm|pnpm|yarn test`, `go test`, `cargo test`) or an existing text script under
   `T/checks/`, joined by `&&` with optional `cd DIR` / `VAR=value`; a UI criterion must name its `artifact` and check
-  it with `test -s ARTIFACT` (or a `T/checks` script naming it). Everything else is refused: manual text, inline code
+  it explicitly with `test -s ARTIFACT`. Runner arguments are whitelisted per runner. Everything else is refused: manual text, inline code
   (`python3 -c`, `node -e`, `bash -c`), other programs, wrappers (`env`, `exec`, `timeout`, `xargs`, `find`), shell
   options, failure-masking operators, help/collect-only/no-run flags and assertion-disabling Python settings. The skill states criteria never change in a run.
 

@@ -44,7 +44,10 @@ class CriteriaGate(unittest.TestCase):
                     "cd sub && python3 -m pytest -q 2>&1", "PYTHONPATH=src python3 -m pytest -q",
                     f"{sys.executable} -m pytest -q", "python3 -B -m pytest", self.c1, f"bash {self.c1}",
                     f"sh {self.noexec}", f"cd sub && {rel_from_sub}", f"cd {self.T} && checks/C1.sh",
-                    f"python3 -m pytest -q && {self.c1}", "cd ~ && python3 -m pytest -q"):
+                    f"python3 -m pytest -q && {self.c1}", "cd ~ && python3 -m pytest -q",
+                    "python3 -m pytest -q -x -k 'add and not slow' --tb=short tests/test_a.py",
+                    "python3 -m unittest -v tests.test_a", "python3 -m unittest discover -s tests -p 'test_*.py'",
+                    "npm test", "go test -count=1 -race ./...", "cargo test --workspace -q"):
             self.assertEqual(self.bad(command=cmd), [], cmd)
 
     def test_everything_else_is_refused(self):
@@ -65,7 +68,14 @@ class CriteriaGate(unittest.TestCase):
                     "/does/not/exist/test -s proof.png", "/does/not/exist/pytest", "/does/not/exist/python3 -m pytest",
                     self.other, f"bash {self.other}", f"cd {self.repo} && ./check.sh", self.noexec,
                     f"bash -x {self.c1}", "bash", "./checks/C1.sh", "test -s proofs/ui.png", "cd $HOME && pytest",
-                    "cd - && pytest", f"cd sub && {self.c1}x"):
+                    "cd - && pytest", f"cd sub && {self.c1}x",
+                    # runner arguments are whitelisted too
+                    "python3 -m unittest -vh", "python3 -m unittest -h", "go test -exec /bin/true ./...",
+                    "go test -run '^$' ./...", "go test -list .", "pytest -p no:python", "pytest -qx --co",
+                    "pytest @args.txt", "pytest -c /dev/null", "pytest --rootdir=/", "pytest -k --collect-only",
+                    "npm test -- --passWithNoTests", "npm test --if-present", "yarn test --help",
+                    "cargo test nonexistent_name", "cargo test -- --list", "cargo test --no-run",
+                    "python3 -m unittest discover -h", "python3 -m unittest --locals x"):
             self.assertTrue(self.bad(command=cmd), cmd)
 
     def test_r10_regressions(self):
@@ -102,9 +112,11 @@ class CriteriaGate(unittest.TestCase):
         self.assertEqual(self.bad(command="python3 -m pytest -q && test -s proofs/ui.png", **ui), [])
         self.assertEqual(self.bad(command="[ -s proofs/ui.png ]", **ui), [])
         self.assertEqual(self.bad(command="test -s proofs/ui.png", **ui), [])
-        self.assertTrue(self.bad(command=self.c1, **ui))                                 # script does not name it
+        write(self.c1, "#!/bin/sh\n# proofs/ui.png\nexit 0\n")                     # naming it is not checking it
+        self.assertTrue(self.bad(command=self.c1, **ui))
         write(self.c1, "#!/bin/sh\ntest -s proofs/ui.png\n")
-        self.assertEqual(self.bad(command=self.c1, **ui), [])                             # folded into the script
+        self.assertTrue(self.bad(command=self.c1, **ui))                                  # explicit check required
+        self.assertEqual(self.bad(command=f"{self.c1} && test -s proofs/ui.png", **ui), [])
 
     def test_template_criteria_are_valid(self):
         crit = json.load(open(os.path.join(ROOT, "fleet", "skill", "fleet-sdd", "templates", "criteria.json")))["criteria"]

@@ -36,11 +36,11 @@ with `&&` (no `||`, `;`, `|`, `&`, subshells or `$(...)`, so nothing masks a fai
 `cd DIR` (literal; later relative paths resolve from it) and `VAR=value` prefixes (not `PYTHONOPTIMIZE`,
 `PYTEST_ADDOPTS`, `BASH_ENV`...); a test runner — `pytest`, `python3 -m pytest|unittest`, `npm|pnpm|yarn test`,
 `go test`, `cargo test` (bare, or the path of an existing executable named like the runner), without
-help/version/collect-only/no-run flags; an existing text script under `T/checks/` (absolute path, or `bash|sh` + that
+a whitelist of arguments per runner (no help/listing/no-run modes, `-exec`, plugins, config files or name filters that can select nothing); an existing text script under `T/checks/` (absolute path, or `bash|sh` + that
 path). Everything else is refused: inline code (`python3 -c`, `node -e`, `bash -c`), other programs, wrappers (`env`,
 `exec`, `timeout`, `xargs`, `find`) and shell options. A UI criterion (`"when": "ui"` or id `C-UI*`) names its proof
-file in `artifact` and checks it with `test -s ARTIFACT` (`test -s` is allowed only there) or a `T/checks` script that
-names the artifact. Criteria never change during a run; only a replan changes them.
+file in `artifact` and always checks it explicitly with `test -s ARTIFACT` (`test -s` is allowed only there; a
+`T/checks` script may check more). Criteria never change during a run; only a replan changes them.
 
 ## Usage
 ```

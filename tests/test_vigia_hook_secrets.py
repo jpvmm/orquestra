@@ -140,8 +140,8 @@ class GrepSecrets(unittest.TestCase):
         self.assertTrue(self.deny(path=self.repo, glob="!*.md"))
         self.assertIsNone(self.deny(path=self.repo, glob="*.py"))
         self.assertIsNone(self.deny(path=self.repo, glob="**/*.{py,md}"))
-        self.assertIsNone(self.deny(path=self.repo, type="py"))
-        self.assertTrue(self.deny(path=self.repo, type="sh"))              # rg's sh type includes *.env / .env
+        self.assertTrue(self.deny(path=self.repo, type="py"))              # type is refused: use a glob
+        self.assertTrue(self.deny(path=self.repo, type="sh"))
         self.assertTrue(self.deny(path=self.repo, type="config"))
         self.assertIsNone(self.deny(path=os.path.join(self.repo, "src")))
 
@@ -152,13 +152,12 @@ class GrepSecrets(unittest.TestCase):
         self.assertTrue(self.deny(path=self.repo, glob="*staging*"))
         self.assertIsNone(self.deny(path=self.repo, glob="*.py"))
         self.assertIsNone(self.deny(path=self.repo, glob="!*.staging"))
-        self.assertIsNone(self.deny(path=self.repo, type="json"))
+        self.assertTrue(self.deny(path=self.repo, type="json"))
         open(os.path.join(self.repo, "src", ".env.json"), "w").write('{"TOKEN": "abc123456"}\n')
         self.assertTrue(self.deny(path=self.repo, type="json"))
         self.assertTrue(self.deny(path=self.repo, glob="src/*.json"))
         self.assertTrue(self.deny(path=self.repo, glob="**/*.json"))
         self.assertTrue(self.deny(path=os.path.join(self.repo, "src"), glob="*.{json,py}"))
-        self.assertIsNone(self.deny(path=self.repo, type="py"))
         self.assertIsNone(self.deny(path=self.repo, glob="*.md"))
 
     def test_ripgrep_semantics_and_no_skipped_dirs(self):
@@ -167,9 +166,6 @@ class GrepSecrets(unittest.TestCase):
         open(os.path.join(self.repo, "src", "sub", ".env.json"), "w").write("{}\n")
         self.assertTrue(self.deny(path=self.repo, glob="!src/*.json"))           # src/sub/.env.json is still searched
         self.assertIsNone(self.deny(path=self.repo, glob="!**/*.json"))
-        self.assertTrue(self.deny(path=self.repo, glob="*.json", type="py"))     # the glob overrides the type
-        self.assertIsNone(self.deny(path=self.repo, glob="*.py", type="json"))
-        self.assertTrue(self.deny(path=self.repo, glob="!*.md", type="json"))    # negation then type
         os.remove(os.path.join(self.repo, "src", "sub", ".env.json"))
         for d in ("build", "dist", "node_modules", ".git"):
             os.makedirs(os.path.join(self.repo, d), exist_ok=True)
@@ -179,6 +175,13 @@ class GrepSecrets(unittest.TestCase):
             os.remove(f)
         self.assertIsNone(self.deny(path=self.repo, glob="*"))
         self.assertTrue(self.deny(path=self.repo, glob="*.{a,{b,c}}"))           # unexpanded nesting fails closed
+
+    def test_type_is_refused(self):
+        """ripgrep's type globs drift across versions (*.rake, *.svelte.ts): any type fails closed."""
+        self.assertIsNone(self.deny(path=self.repo))                        # nothing secret here, no filter: allowed
+        for t in ("json", "ruby", "py", "svelte", "nosuchtype"):
+            self.assertTrue(self.deny(path=self.repo, type=t), t)
+            self.assertTrue(self.deny(path=self.repo, glob="*.py", type=t), t)
 
     def test_anchored_exclusion_stays_at_the_root(self):
         """`!/name` excludes only the root file; a nested secret is still searched."""
@@ -199,17 +202,18 @@ class GrepSecrets(unittest.TestCase):
                   "sub/c.md", "sub/deep/d.json"):
             open(os.path.join(self.repo, f), "w").write("x\n")
         globs = ["*.py", "*.json", "!*.json", "!/.env", "!.env*", "!**/.env*", "!sub/*", "!sub/**", "**/*.py", "src/**",
-                 "*.{py,md}", "!*.{json,env}", "!/sub", "!build", "*", "!webhook.env", "sub/*.json", "!src/x/*"]
-        types = ["", "py", "json", "md", "sh"]
+                 "*.{py,md}", "!*.{json,env}", "!{.env*,webhook.env}", "*.md", "sub/*.md", "!/sub", "!build", "*", "!webhook.env", "sub/*.json", "!src/x/*"]
+        allowed = 0
         for g in globs + [""]:
-            for t in types:
-                inp = {k: v for k, v in (("glob", g), ("type", t)) if v}
-                if self.deny(path=self.repo, **inp) is not None:
-                    continue
-                cmd = ["rg", "--files", "--hidden", "--no-ignore"] + (["-g", g] if g else []) + (["-t", t] if t else [])
-                out = subprocess.run(cmd, cwd=self.repo, capture_output=True, text=True).stdout.split()
-                leaked = [x for x in out if self.V.touches_secret(x)]
-                self.assertEqual(leaked, [], (g, t))
+            inp = {"glob": g} if g else {}
+            if self.deny(path=self.repo, **inp) is not None:
+                continue
+            allowed += 1
+            cmd = ["rg", "--files", "--hidden", "--no-ignore"] + (["-g", g] if g else [])
+            out = subprocess.run(cmd, cwd=self.repo, capture_output=True, text=True).stdout.split()
+            leaked = [x for x in out if self.V.touches_secret(x)]
+            self.assertEqual(leaked, [], g)
+        self.assertGreater(allowed, 3)
 
     def test_hook_blocks_and_logs_it_as_secret(self):
         open(os.path.join(self.repo, ".env"), "w").write("TOKEN=abc123456\n")

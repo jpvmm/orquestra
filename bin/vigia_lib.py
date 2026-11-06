@@ -718,43 +718,8 @@ class HookPolicy:
     TEST = "Test file protected by Vigia (it exists on the base): do not edit it; add a new test file if needed."
     SECRET = "Secret file (.env / webhook.env) blocked by Vigia: do not read or write it."
     SECRET_SEARCH = ("Search blocked by Vigia: it would read secret files (.env / webhook.env) in this folder. "
-                     "Narrow it with a glob/type that excludes them (e.g. glob='*.py' or type='py').")
+                     "Narrow it with a glob that excludes them (e.g. glob='*.py'); the type parameter is not accepted.")
     MAX_ENTRIES = 50000
-    # ripgrep 14 default --type globs (rg --type-list); an unknown type is treated as no filter
-    TYPE_GLOBS = {
-        'c': ('*.[chH]', '*.[chH].in', '*.cats'),
-        'cpp': ('*.[ChH]', '*.[ChH].in', '*.[ch]pp', '*.[ch]pp.in', '*.[ch]xx', '*.[ch]xx.in', '*.cc', '*.cc.in', '*.hh', '*.hh.in', '*.inl'),
-        'csharp': ('*.cs',),
-        'css': ('*.css', '*.scss'),
-        'dart': ('*.dart',),
-        'elixir': ('*.eex', '*.ex', '*.exs', '*.heex', '*.leex', '*.livemd'),
-        'go': ('*.go',),
-        'haskell': ('*.c2hs', '*.cpphs', '*.hs', '*.hsc', '*.lhs'),
-        'html': ('*.ejs', '*.htm', '*.html'),
-        'java': ('*.java', '*.jsp', '*.jspx', '*.properties'),
-        'js': ('*.cjs', '*.js', '*.jsx', '*.mjs', '*.vue'),
-        'json': ('*.json', '*.sarif', 'composer.lock'),
-        'kotlin': ('*.kt', '*.kts'),
-        'lua': ('*.lua',),
-        'markdown': ('*.markdown', '*.md', '*.mdown', '*.mdwn', '*.mdx', '*.mkd', '*.mkdn'),
-        'md': ('*.markdown', '*.md', '*.mdown', '*.mdwn', '*.mdx', '*.mkd', '*.mkdn'),
-        'php': ('*.php', '*.php3', '*.php4', '*.php5', '*.php7', '*.php8', '*.pht', '*.phtml'),
-        'py': ('*.py', '*.pyi'),
-        'python': ('*.py', '*.pyi'),
-        'rst': ('*.rst',),
-        'ruby': ('*.gemspec', '*.rb', '*.rbw', '.irbrc', 'Gemfile', 'Rakefile', 'config.ru'),
-        'rust': ('*.rs',),
-        'scala': ('*.sbt', '*.scala'),
-        'sql': ('*.psql', '*.sql'),
-        'svelte': ('*.svelte',),
-        'swift': ('*.swift',),
-        'toml': ('*.toml', 'Cargo.lock'),
-        'ts': ('*.cts', '*.mts', '*.ts', '*.tsx'),
-        'txt': ('*.txt',),
-        'typescript': ('*.cts', '*.mts', '*.ts', '*.tsx'),
-        'vue': ('*.vue',),
-        'yaml': ('*.yaml', '*.yml'),
-    }
 
     @staticmethod
     def _globs(g):
@@ -767,12 +732,13 @@ class HookPolicy:
     @staticmethod
     def search_reaches_secret(inp, cwd):
         """Grep that would read a secret file: walk its root (bounded, no directory skipped) and test every file that the
-        full secret rule flags against the glob/type filters with ripgrep's precedence. Fails closed when unsure."""
+        full secret rule flags against the glob filter as ripgrep applies it. Fails closed when unsure: any `type`
+        counts as reaching a secret (type globs differ across ripgrep versions; use a glob instead)."""
         g = str(inp.get("glob") or "")
-        t = str(inp.get("type") or "")
+        if str(inp.get("type") or ""):
+            return True
         neg = g.startswith("!")
         pats = HookPolicy._globs(g[1:] if neg else g) if g else []
-        tglobs = HookPolicy.TYPE_GLOBS.get(t) if t else None
 
         def rx(pat, strict):
             """Glob -> regex. strict (exclusions): `*`/`?` stay inside one path segment, like ripgrep; loose
@@ -813,14 +779,10 @@ class HookPolicy:
             return True                                  # nested braces are not expanded: assume they reach one
 
         def included(rel):
-            # ripgrep: a positive glob decides alone (it overrides --type); a negated one only excludes, then the type
+            # ripgrep: a positive glob includes only what it matches; a negated one excludes what it matches
             if pats and not neg:
                 return any(match(x, rel, False) for x in pats)
-            if pats and neg and any(match(x, rel, True) for x in pats):
-                return False
-            if tglobs is not None:
-                return any(match(x, rel, False) for x in tglobs)
-            return True
+            return not (pats and any(match(x, rel, True) for x in pats))
 
         root = str(inp.get("path") or cwd or "")
         if not root:

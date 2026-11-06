@@ -123,6 +123,9 @@ class Criteria:
     WRAPPERS = {"env", "timeout", "nice", "command", "nohup", "time", "xargs", "exec"}
     FILE_TESTS = {"-s", "-f", "-e", "-r", "-x", "-d"}
     SCRIPT_RUNNERS = {"bash", "sh"}
+    # interpreters whose first operand is a script file, unless code/module comes inline (-c/-m/-e...)
+    INTERPRETERS = {"bash", "sh", "python", "python3", "node", "ruby", "perl"}
+    INLINE = {"-c", "-m", "-e", "--eval", "-p", "--print", "-r"}
 
     @staticmethod
     def segments(command):
@@ -180,13 +183,7 @@ class Criteria:
             if depth:
                 return "nested shells are not allowed"
             inner = Criteria.segments(w[2])
-            if isinstance(inner, str):
-                return inner
-            for sg in inner:
-                why = Criteria.segment_problem(Criteria.words(sg), path, repo, depth + 1)
-                if why:
-                    return why
-            return None
+            return inner if isinstance(inner, str) else Criteria.segments_problem(inner, path, repo, depth + 1)
         if first in Criteria.SETUP:
             return None
         if first in Criteria.VACUOUS:
@@ -204,30 +201,45 @@ class Criteria:
                 return f"{w[0]!r} is not an executable file (relative = repo; T/checks scripts by absolute path)"
         elif not shutil.which(first, path=path):
             return f"{first!r} is not an executable on PATH"
-        if first in Criteria.SCRIPT_RUNNERS:
-            if len(w) < 2 or w[1].startswith("-"):
+        if first in Criteria.INTERPRETERS or re.fullmatch(r"python3?(\.\d+)?", first):
+            script = None
+            for x in w[1:]:
+                if x in Criteria.INLINE:
+                    break               # inline code or a module (python3 -m pytest): no script operand
+                if not x.startswith("-"):
+                    script = x
+                    break
+            if script is None and first in Criteria.SCRIPT_RUNNERS and not set(w[1:]) & Criteria.INLINE:
                 return f"{first} needs a script file"
-            f = Criteria.resolve(w[1], repo)
-            if repo and not os.path.isfile(f):
-                return (f"script {w[1]!r} does not exist (relative = repo; T/checks scripts by absolute path; "
+            if script is not None and repo and not os.path.isfile(Criteria.resolve(script, repo)):
+                return (f"script {script!r} does not exist (relative = repo; T/checks scripts by absolute path; "
                         f"they exist before the run)")
         return None
 
     @staticmethod
+    def segments_problem(segs, path, repo, depth=0):
+        """First problem of a list of &&-joined segments; setup commands (cd/export/set) alone prove nothing."""
+        for sg in segs:
+            why = Criteria.segment_problem(Criteria.words(sg), path, repo, depth)
+            if why:
+                return why
+        if all(os.path.basename((Criteria.words(sg) or [""])[0]) in Criteria.SETUP for sg in segs):
+            return "command proves nothing"
+        return None
+
+    @staticmethod
     def ui_checked(art, segs):
-        """The artifact is file-tested (test/[ -s|-f ART) or passed to a program in some segment."""
+        """Some segment explicitly checks the artifact is a non-empty/regular file: test/[ -s|-f ARTIFACT.
+        (Passing it to a program is not enough: `python3 -c pass ART` succeeds without reading it.)"""
         for sg in segs:
             w = Criteria.words(sg)
             first = os.path.basename(w[0]) if w else ""
-            if first in ("test", "["):
-                if art in w and w[w.index(art) - 1] in ("-s", "-f"):
-                    return True
-            elif first in Criteria.SCRIPT_RUNNERS and len(w) >= 3 and w[1] == "-c":
+            if first in ("test", "[") and art in w and w[w.index(art) - 1] in ("-s", "-f"):
+                return True
+            if first in Criteria.SCRIPT_RUNNERS and len(w) >= 3 and w[1] == "-c":
                 inner = Criteria.segments(w[2])
                 if not isinstance(inner, str) and Criteria.ui_checked(art, inner):
                     return True
-            elif art in w[1:]:
-                return True
         return False
 
     @staticmethod
@@ -245,18 +257,15 @@ class Criteria:
             segs = Criteria.segments(cmd)
             if isinstance(segs, str):
                 out.append(f"{cid}: {segs} ({cmd[:60]!r})"); continue
-            why = next((y for y in (Criteria.segment_problem(Criteria.words(sg), path, repo) for sg in segs) if y), None)
-            if not why and all(os.path.basename(Criteria.words(sg)[0]) in Criteria.SETUP for sg in segs):
-                why = "command proves nothing"
+            why = Criteria.segments_problem(segs, path, repo)
             if why:
                 out.append(f"{cid}: {why} ({cmd[:60]!r})"); continue
             if c.get("when") == "ui" or str(cid).upper().startswith("C-UI"):
                 art = str(c.get("artifact") or "").strip()
                 if not art or not Criteria.ui_checked(art, segs):
                     out.append(f"{cid}: UI criterion must name its proof file in 'artifact' and the command must check "
-                               f"it (`test -s ARTIFACT`, or pass it to a check script)")
+                               f"it explicitly (`test -s ARTIFACT`, optionally `&& your-check ARTIFACT`)")
         return out
-
 
 def main():
     ap = argparse.ArgumentParser(prog="fleet-run")

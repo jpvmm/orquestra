@@ -12,8 +12,14 @@ PATH = os.environ.get("PATH", "")
 
 
 class CriteriaGate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()   # an empty repo: relative scripts must exist in it
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
     def bad(self, **c):
-        return R.Criteria.problems([{"id": "C1", **c}], PATH)
+        return R.Criteria.problems([{"id": "C1", **c}], PATH, repo=self.tmp.name)
 
     def test_executable_commands_pass(self):
         for cmd in ("python3 -m pytest -q", "test -s proofs/x.png", "[ -f out.txt ]", "FOO=1 python3 -c 'print(1); x'",
@@ -26,7 +32,8 @@ class CriteriaGate(unittest.TestCase):
                     "python3 -m pytest || true", "python3 -m pytest; exit 0", "test 1 # proofs/ui.png", "test 1",
                     "[ 1 ]", "bash -c true", "sh -c 'true && :'", "python3 -m pytest; printf ok",
                     "python3 -m pytest | tee log", "python3 -m pytest &", "(python3 -m pytest)", "echo $(python3 x)",
-                    "python3 -m pytest && true", "cd sub"):
+                    "python3 -m pytest && true", "cd sub", "bash -c cd", "python3 missing-proof-script.py",
+                    "node missing.js", "sh"):
             self.assertTrue(self.bad(command=cmd), cmd)
 
     def test_scripts_must_exist_and_be_executable(self):
@@ -55,6 +62,7 @@ class CriteriaGate(unittest.TestCase):
         self.assertTrue(self.bad(command="test -s proofs/ui.png || /bin/true", when="ui", artifact=art))
         self.assertEqual(self.bad(command="[ -s proofs/ui.png ]", when="ui", artifact=art), [])
         self.assertEqual(self.bad(command="python3 -m pytest -q && test -s proofs/ui.png", when="ui", artifact=art), [])
+        self.assertTrue(self.bad(command="python3 -c pass proofs/ui.png", when="ui", artifact=art))
 
     def test_template_criteria_shape(self):
         with open(os.path.join(ROOT, "fleet", "skill", "fleet-sdd", "templates", "criteria.json")) as f:

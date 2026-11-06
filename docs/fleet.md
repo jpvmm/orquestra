@@ -35,8 +35,8 @@ Criteria gate (fleet-run refuses the start otherwise): each `command` is short (
 `T/checks/<id>.sh` called by absolute path) and executable — not manual text, not a no-op (`true`, `echo`, `test 1`),
 on PATH or an executable file (relative paths = the repo, since criteria run from the integration worktree).
 Commands join only with `&&`: no `||`, `;`, `|`, `&`, subshells or `$(...)`, so nothing masks a failure. A UI
-criterion (`"when": "ui"` or id `C-UI*`) names its proof file in `artifact` and its command checks it
-(`test -s ARTIFACT` or passes it to a check script). Criteria never change during a run; only a replan changes them.
+criterion (`"when": "ui"` or id `C-UI*`) names its proof file in `artifact` and its command checks it explicitly
+(`test -s ARTIFACT`, optionally `&& your-check ARTIFACT`). Interpreter scripts (`python3 x.py`, `node x.js`) must exist. Criteria never change during a run; only a replan changes them.
 
 ## Usage
 ```

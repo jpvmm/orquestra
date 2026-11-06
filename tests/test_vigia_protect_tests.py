@@ -163,7 +163,7 @@ class TrustedBase(unittest.TestCase):
         self.assertEqual(V.ProtectedTests.load(self.T), frozenset({"tests/test_old.py"}))   # git, not the file
 
     def test_clean_filter_cannot_hide_a_change(self):
-        import shutil
+        import shutil, subprocess
         keep = os.path.join(self.tmp.name, "orig.py")
         shutil.copy(os.path.join(self.repo, "tests", "test_old.py"), keep)
         subprocess.run(["git", "config", "filter.hide.clean", f"cat {keep}"], cwd=self.repo, check=True, env=self.e)

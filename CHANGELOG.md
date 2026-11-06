@@ -5,6 +5,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- `orq-launch`: optional per-role Claude/Codex flag builder and task-dir+role concurrency lock (fleet runners stay unchanged).
+- `orq-launch` safety: Claude gets `--disallowedTools` (git commit/push/merge/rebase, gh, curl, wget, rm -rf, secret files) and `--strict-mcp-config`; Codex write roles get `network_access=false` (fleet-run now refuses a Codex M/G lead instead of giving its sandbox network); plan is read-only (no Bash); lead protects tests; `--output-schema` for read-only Codex roles.
 ### Fixed
 - `--protect-tests` only counts test paths inside the run cwd/worktree (scratch under `/tmp` no longer trips the loop detector).
 - `--protect-tests` protects only the tests that exist on the base commit (snapshot by fleet-run in `$VIGIA_BASE/protected/`, outside the agent-writable task dir; relative `../` paths are resolved against the run cwd; shell writes are denied too): new test files are allowed, so TDD works. The M/G lead now runs with it too; a subagent's denied attempt is an alert, not a kill of the lead, and the loop/scope detector counts only the run's own calls.

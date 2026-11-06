@@ -43,7 +43,8 @@ fleet-run ... --dry-run                                                # print t
 - **P**: no lead. 1 dev run + 1 reviewer run of the other tool (2 Orquestra wake-ups). One task (`task-1`) per folder.
 - **M/G**: 1 team-lead run (Claude opus). It creates worktrees, dispatches devs/reviewers in parallel,
   integrates and writes `T/FINAL-SUMMARY.md`. Orquestra sleeps until the notification.
-- **`--lead codex`** for M/G: EXPERIMENTAL, not tested end to end.
+- **`--lead codex`** is P only: fleet-run refuses a Codex M/G lead (its sandbox has no network, so it could not
+  launch agents; turning network on is what push/exfiltration needs).
 - Security: `--security auto` (default) enables the security reviewer on G, on a task with `"security": true`,
   or when the plan mentions auth/secret/input/network. `yes|no` forces it.
 - A fleet lead that exits without a fresh `T/FINAL-SUMMARY.md` ends as `incomplete` in the Vigia (with a `detected`
@@ -51,7 +52,8 @@ fleet-run ... --dry-run                                                # print t
 
 ## What the fleet may not do (and why)
 The fleet never publishes. `fleet-run` launches every Claude run (lead, dev, reviewer) with
-`--disallowedTools "Bash(git commit:*)" "Bash(git push:*)" "Bash(git merge:*)" "Bash(git rebase:*)" "Bash(gh:*)" "Bash(rm -rf *)"`.
+`--disallowedTools "Bash(git commit:*)" "Bash(git push:*)" "Bash(git merge:*)" "Bash(git rebase:*)" "Bash(gh:*)" "Bash(rm -rf *)"`,
+plus `curl`/`wget` and Read/Edit/Write of `.env*`/`webhook.env`, and `--strict-mcp-config` (no MCP servers).
 Each task becomes a patch (git *tree* snapshots, no commits) and the result stays in `T/wt/integration`
 (detached at BASE, changes in index/tree). Orquestra checks the integration (criteria commands, suite) and only
 then commits, pushes and opens/merges the PR itself, per the AUTONOMY section of its prompt. Codex devs run in the

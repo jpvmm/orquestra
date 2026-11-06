@@ -16,10 +16,10 @@ command -v pgrep >/dev/null 2>&1 || { echo "install.sh: pgrep (procps) is requir
 mkdir -p "$BIN" "$VIGIA_BASE/active"
 touch "$ORQUESTRA_HOME/.orquestra-home"
 
-for f in vigia-run vigia-status vigia-stop vigia-notify vigia-claude-hook vigia-codex-hook vigia_lib.py vigia_comms.py; do
+for f in vigia-run vigia-status vigia-stop vigia-notify vigia-claude-hook vigia-codex-hook vigia_lib.py vigia_comms.py orq-launch; do
   cp "$REPO/bin/$f" "$BIN/$f"
 done
-chmod 755 "$BIN"/vigia-*
+chmod 755 "$BIN"/vigia-* "$BIN/orq-launch"
 chmod 644 "$BIN/vigia_lib.py" "$BIN/vigia_comms.py"
 
 # Claude Code needs absolute hook paths: render the settings file for this install.

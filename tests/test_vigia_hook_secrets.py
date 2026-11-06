@@ -145,6 +145,22 @@ class GrepSecrets(unittest.TestCase):
         self.assertTrue(self.deny(path=self.repo, type="config"))
         self.assertIsNone(self.deny(path=os.path.join(self.repo, "src")))
 
+    def test_filters_are_checked_against_real_secret_files(self):
+        """A glob/type that a real secret file matches must not pass (not just a few example names)."""
+        open(os.path.join(self.repo, ".env.staging"), "w").write("TOKEN=abc123456\n")
+        self.assertTrue(self.deny(path=self.repo, glob="*.staging"))
+        self.assertTrue(self.deny(path=self.repo, glob="*staging*"))
+        self.assertIsNone(self.deny(path=self.repo, glob="*.py"))
+        self.assertIsNone(self.deny(path=self.repo, glob="!*.staging"))
+        self.assertIsNone(self.deny(path=self.repo, type="json"))
+        open(os.path.join(self.repo, "src", ".env.json"), "w").write('{"TOKEN": "abc123456"}\n')
+        self.assertTrue(self.deny(path=self.repo, type="json"))
+        self.assertTrue(self.deny(path=self.repo, glob="src/*.json"))
+        self.assertTrue(self.deny(path=self.repo, glob="**/*.json"))
+        self.assertTrue(self.deny(path=os.path.join(self.repo, "src"), glob="*.{json,py}"))
+        self.assertIsNone(self.deny(path=self.repo, type="py"))
+        self.assertIsNone(self.deny(path=self.repo, glob="*.md"))
+
     def test_hook_blocks_and_logs_it_as_secret(self):
         open(os.path.join(self.repo, ".env"), "w").write("TOKEN=abc123456\n")
         hb = os.path.join(self.repo, "hb.jsonl")

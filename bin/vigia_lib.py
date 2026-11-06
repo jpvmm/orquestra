@@ -719,14 +719,44 @@ class HookPolicy:
     SECRET = "Secret file (.env / webhook.env) blocked by Vigia: do not read or write it."
     SECRET_SEARCH = ("Search blocked by Vigia: it would read secret files (.env / webhook.env) in this folder. "
                      "Narrow it with a glob/type that excludes them (e.g. glob='*.py' or type='py').")
-    SECRET_NAMES = (".env", ".env.local", ".env.production", ".env.dev", "webhook.env")
     SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
              ".next", "target"}
     MAX_ENTRIES = 50000
-    # ripgrep types checked to have no glob that matches .env / *.env / webhook.env (`sh`, `config`... do or may)
-    SAFE_TYPES = {"py", "python", "js", "ts", "typescript", "go", "rust", "java", "c", "cpp", "md", "markdown",
-                  "json", "yaml", "toml", "html", "css", "ruby", "php", "kotlin", "swift", "csharp", "sql", "rst",
-                  "txt", "vue", "svelte", "scala", "lua", "elixir", "haskell", "dart"}
+    # ripgrep 14 default --type globs (rg --type-list); an unknown type is treated as no filter
+    TYPE_GLOBS = {
+        'c': ('*.[chH]', '*.[chH].in', '*.cats'),
+        'cpp': ('*.[ChH]', '*.[ChH].in', '*.[ch]pp', '*.[ch]pp.in', '*.[ch]xx', '*.[ch]xx.in', '*.cc', '*.cc.in', '*.hh', '*.hh.in', '*.inl'),
+        'csharp': ('*.cs',),
+        'css': ('*.css', '*.scss'),
+        'dart': ('*.dart',),
+        'elixir': ('*.eex', '*.ex', '*.exs', '*.heex', '*.leex', '*.livemd'),
+        'go': ('*.go',),
+        'haskell': ('*.c2hs', '*.cpphs', '*.hs', '*.hsc', '*.lhs'),
+        'html': ('*.ejs', '*.htm', '*.html'),
+        'java': ('*.java', '*.jsp', '*.jspx', '*.properties'),
+        'js': ('*.cjs', '*.js', '*.jsx', '*.mjs', '*.vue'),
+        'json': ('*.json', '*.sarif', 'composer.lock'),
+        'kotlin': ('*.kt', '*.kts'),
+        'lua': ('*.lua',),
+        'markdown': ('*.markdown', '*.md', '*.mdown', '*.mdwn', '*.mdx', '*.mkd', '*.mkdn'),
+        'md': ('*.markdown', '*.md', '*.mdown', '*.mdwn', '*.mdx', '*.mkd', '*.mkdn'),
+        'php': ('*.php', '*.php3', '*.php4', '*.php5', '*.php7', '*.php8', '*.pht', '*.phtml'),
+        'py': ('*.py', '*.pyi'),
+        'python': ('*.py', '*.pyi'),
+        'rst': ('*.rst',),
+        'ruby': ('*.gemspec', '*.rb', '*.rbw', '.irbrc', 'Gemfile', 'Rakefile', 'config.ru'),
+        'rust': ('*.rs',),
+        'scala': ('*.sbt', '*.scala'),
+        'sql': ('*.psql', '*.sql'),
+        'svelte': ('*.svelte',),
+        'swift': ('*.swift',),
+        'toml': ('*.toml', 'Cargo.lock'),
+        'ts': ('*.cts', '*.mts', '*.ts', '*.tsx'),
+        'txt': ('*.txt',),
+        'typescript': ('*.cts', '*.mts', '*.ts', '*.tsx'),
+        'vue': ('*.vue',),
+        'yaml': ('*.yaml', '*.yml'),
+    }
 
     @staticmethod
     def _globs(g):
@@ -738,32 +768,45 @@ class HookPolicy:
 
     @staticmethod
     def search_reaches_secret(inp, cwd):
-        """Grep whose files could include a secret file: no type/glob that excludes them, and one exists under its
-        path (bounded walk; too many files to check counts as yes)."""
+        """Grep that would read a secret file: walk its root (bounded) and test every file that the full secret rule
+        flags against the glob/type filters the way ripgrep applies them. Too many files to check counts as yes."""
         import fnmatch
-        t = str(inp.get("type") or "")
-        if t in HookPolicy.SAFE_TYPES:
-            return False                      # rg --type of a language whose globs never match a .env file
-        # any other type (e.g. `sh` includes *.env / .env) is treated like no filter
         g = str(inp.get("glob") or "")
-        if g and not g.startswith("!"):
-            pats = [x.rsplit("/", 1)[-1] for x in HookPolicy._globs(g)]
-            if not any(fnmatch.fnmatch(n, pt) for n in HookPolicy.SECRET_NAMES for pt in pats):
+        t = str(inp.get("type") or "")
+        neg = g.startswith("!")
+        pats = HookPolicy._globs(g[1:] if neg else g) if g else []
+        tglobs = HookPolicy.TYPE_GLOBS.get(t) if t else None
+
+        def match(pat, rel, base):
+            if "/" in pat.strip("/"):
+                return fnmatch.fnmatch(rel, pat.lstrip("/")) or (pat.startswith("**/") and fnmatch.fnmatch(base, pat[3:]))
+            return fnmatch.fnmatch(base, pat)
+
+        def included(rel):
+            base = rel.rsplit("/", 1)[-1]
+            if pats and (any(match(x, rel, base) for x in pats) == neg):
                 return False
+            if tglobs is not None and not any(fnmatch.fnmatch(base, x) for x in tglobs):
+                return False
+            return True
+
         root = str(inp.get("path") or cwd or "")
         if not root:
             return True
         root = root if os.path.isabs(root) else os.path.join(cwd or "", root)
         if os.path.isfile(root):
-            return touches_secret(root)
+            return touches_secret(os.path.basename(root))
         n = 0
         for dirpath, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if d not in HookPolicy.SKIP_DIRS]
+            dirs[:] = [x for x in dirs if x not in HookPolicy.SKIP_DIRS]
             n += len(files) + len(dirs)
-            if any(touches_secret(f) for f in files) or n > HookPolicy.MAX_ENTRIES:
+            if n > HookPolicy.MAX_ENTRIES:
                 return True
+            for f in files:
+                rel = os.path.relpath(os.path.join(dirpath, f), root).replace(os.sep, "/")
+                if touches_secret(rel) and included(rel):
+                    return True
         return False
-
 
     @staticmethod
     def deny_reason(event, tool, inp, files=(), env=None):

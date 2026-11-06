@@ -5,6 +5,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- Detect Claude CLI 5-hour usage limit; review falls back to Codex, lead/other roles pause as `limit_paused` (no silent loop). Usage lines append to `progress.md` when present.
+
+
 ## [0.1.0] - 2026-11-03
 
 ### Added

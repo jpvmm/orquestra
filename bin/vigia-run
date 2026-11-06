@@ -724,6 +724,50 @@ def supervise(a, paths, key, notifier=None):
     if an.result:
         r = an.result
         st["result"] = {k: r.get(k) for k in ("subtype", "is_error", "num_turns", "total_cost_usd", "duration_ms") if k in r}
+        usage = st.setdefault("usage", {})
+        if isinstance(r.get("usage"), dict):
+            usage.update(r["usage"])
+        for k in ("input_tokens", "output_tokens", "total_tokens"):
+            if k in r:
+                usage[k] = r[k]
+    # Claude subscription limit → explicit state (no silent loop)
+    blob = " ".join([
+        st.get("summary") or "",
+        " ".join(st.get("alerts") or []),
+        str(an.last_error or ""),
+    ])
+    try:
+        with open(paths["stderr"], errors="replace") as _ef:
+            blob += " " + _ef.read()[-2000:]
+    except OSError:
+        pass
+    lim = V.detect_claude_limit(blob)
+    if lim:
+        st["limit"] = lim
+        role = None
+        try:
+            fj = V.read_json(os.path.join(a.task_dir, "fleet.json")) or {}
+            if fj.get("runs"):
+                role = (fj["runs"][-1] or {}).get("role")
+        except Exception:
+            pass
+        fb = V.limit_fallback_plan(role or a.name or "")
+        st["limit_fallback"] = fb
+        if fb["action"] == "pause" and st.get("state") in ("done", "failed", "running"):
+            st["state"] = "limit_paused"
+        st["summary"] = (fb["summary"] + (f" (resets {lim.get('resets')})" if lim.get("resets") else "")
+                         + " | " + (st.get("summary") or ""))[:500]
+        usage = dict(st.get("usage") or {})
+        usage.update({k: st.get("result", {}).get(k) for k in ("total_cost_usd", "num_turns", "duration_ms") if st.get("result")})
+        usage["role"] = role
+        V.append_usage_progress(a.task_dir, name=a.name, tool=a.tool, model=st.get("model"),
+                                usage=usage, limit_info=lim)
+    elif st.get("state") in ("done", "failed", "incomplete", "timeout", "loop", "killed") and a.task_dir:
+        usage = dict(st.get("usage") or {})
+        if st.get("result"):
+            usage.update({k: st["result"].get(k) for k in ("total_cost_usd", "num_turns", "duration_ms") if k in st["result"]})
+        V.append_usage_progress(a.task_dir, name=a.name, tool=a.tool, model=st.get("model"), usage=usage)
+
     if not st["summary"]:
         base = an.last_msg or an.last_error or ""
         if not base:

@@ -413,9 +413,71 @@ SHELL_WRITE_RE = re.compile(
 )
 ALERT_RE = re.compile(
     r"rate.?limit|usage limit|too many requests|\b429\b|quota|authentication_failed|invalid api key|not logged in|"
-    r"please run /login|unauthorized|\b401\b|oauth token|login required|credit balance",
+    r"please run /login|unauthorized|\b401\b|oauth token|login required|credit balance|"
+    r"hit your .+ limit|5-hour limit|resets \d{1,2}:\d{2}\s*(am|pm)?",
     re.I,
 )
+
+# Claude CLI subscription cap, e.g.:
+# "You've hit your 5-hour limit · resets 11:50pm (America/Sao_Paulo)"
+CLAUDE_LIMIT_RE = re.compile(
+    r"you'?ve hit your .+ limit|hit your 5-hour limit|5-hour limit\s*[·•].*resets",
+    re.I,
+)
+
+
+def detect_claude_limit(text):
+    """If text is the Claude CLI usage-limit error, return dict with resets; else None."""
+    if not text:
+        return None
+    m = CLAUDE_LIMIT_RE.search(str(text))
+    if not m:
+        return None
+    resets = None
+    rm = re.search(r"resets\s+([^\n(]+)", str(text), re.I)
+    if rm:
+        resets = rm.group(1).strip(" ·•")
+    return {"kind": "claude_usage_limit", "match": m.group(0), "resets": resets}
+
+
+def limit_fallback_plan(role):
+    """What to do when Claude hits the usage limit, by run role.
+    review → fall back to Codex; lead/plan/implement → pause with a clear state (no loop)."""
+    role = (role or "").lower()
+    if role in ("review", "reviewer", "final_reviewer", "security"):
+        return {"action": "fallback_tool", "tool": "codex", "state": "limit_fallback",
+                "summary": "Claude usage limit: review falls back to Codex"}
+    return {"action": "pause", "tool": None, "state": "limit_paused",
+            "summary": "Claude usage limit: lead/run paused — do not loop; wait for reset or switch tool"}
+
+
+def append_usage_progress(task_dir, *, name, tool, model, usage=None, limit_info=None):
+    """Append a short usage line to task_dir/progress.md when the file exists."""
+    if not task_dir:
+        return False
+    path = os.path.join(task_dir, "progress.md")
+    if not os.path.isfile(path):
+        return False
+    usage = usage or {}
+    parts = [f"- usage {now_iso()}: run={name} tool={tool} model={model or '?'}"]
+    bits = []
+    for k in ("input_tokens", "output_tokens", "total_tokens", "total_cost_usd", "num_turns", "duration_ms"):
+        if usage.get(k) is not None:
+            bits.append(f"{k}={usage[k]}")
+    if bits:
+        parts.append(" ".join(bits))
+    if limit_info:
+        parts.append(f"LIMIT {limit_info.get('kind')} resets={limit_info.get('resets')}")
+        fb = limit_fallback_plan(usage.get("role"))
+        parts.append(f"fallback={fb['action']}:{fb.get('tool') or fb['state']}")
+    line = " ".join(parts) + "\n"
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+        return True
+    except OSError:
+        return False
+
 
 # agent stderr: this pattern always applies; ALERT_RE only on Claude's stderr (Codex echoes the whole conversation: noise)
 STDERR_ALERT_RE = re.compile(r"Background tasks still running", re.I)

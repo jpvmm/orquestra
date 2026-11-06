@@ -30,6 +30,8 @@ class SizingGate(unittest.TestCase):
         self.assertIn("split", R.Sizing.problems("G", self.ts(9), None)[0])
         self.assertEqual(R.Sizing.problems("G", self.ts(8), 240), [])
         self.assertTrue(R.Sizing.problems("G", self.ts(8), 300))
+        for bad in (float("nan"), float("inf"), 0, -5):   # nan compares False to every limit: must not slip through
+            self.assertTrue(R.Sizing.problems("M", self.ts(2), bad), bad)
 
     def test_judgment_and_security_need_reasons(self):
         self.assertTrue(R.Sizing.problems("M", self.ts(2, judgment=True), None))

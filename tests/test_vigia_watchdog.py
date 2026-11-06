@@ -50,6 +50,15 @@ class Base(unittest.TestCase):
         return [(e["event"], e["state"]) for e in self.events(name)]
 
 
+class Input(Base):
+    def test_non_finite_limits_refused(self):
+        for opt in ("--max-min", "--stall-min"):
+            for bad in ("nan", "inf", "0"):
+                r = subprocess.run([RUN, "--tool", "other", "--task-dir", self.td, "--name", "bad", "--foreground",
+                                    opt, bad, "--", "true"], env=self.env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 2, (opt, bad, r.stderr))
+
+
 class Caps(Base):
     def test_timeout_kills(self):
         t = time.time()

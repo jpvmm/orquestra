@@ -71,7 +71,9 @@ class Sizing:
             out.append(f"{cx} takes {lo}-{hi} tasks, tasks.json has {len(ts)}: {hint}")
         if cx == "P" and ts and len(ts[0].get("files") or []) > Sizing.P_MAX_FILES:
             out.append(f"P touches at most {Sizing.P_MAX_FILES} files")
-        if max_min and max_min > Sizing.MAX_MIN[cx]:
+        if max_min is not None and not (math.isfinite(max_min) and max_min > 0):
+            out.append(f"--max-min must be a finite positive number (got {max_min!r})")
+        elif max_min and max_min > Sizing.MAX_MIN[cx]:
             out.append(f"{cx} runs at most {Sizing.MAX_MIN[cx]} min (asked {max_min:g}): split instead")
         for t in ts:
             for flag in ("judgment", "security"):

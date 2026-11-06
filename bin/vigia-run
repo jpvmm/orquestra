@@ -22,7 +22,7 @@ a JSON object with the status path. Exit 0 = started; 2 = bad usage; 3 = active-
 Paths: state lives in $VIGIA_BASE (default $ORQUESTRA_HOME/vigia, default ~/.orquestra/vigia);
 per-run files live in <task-dir>/runs/.
 """
-import argparse, ctypes, json, os, re, shlex, signal, shutil, subprocess, sys, time
+import argparse, ctypes, json, math, os, re, shlex, signal, shutil, subprocess, sys, time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -69,6 +69,10 @@ def parse():
         fail("empty command after '--'", 2)
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", a.name):
         fail("--name only accepts letters, digits, dot, _ and - (up to 80)", 2)
+    for k in ("max_min", "stall_min"):
+        v = getattr(a, k)
+        if v is not None and not (math.isfinite(v) and v > 0):
+            fail(f"--{k.replace('_', '-')} must be a finite positive number", 2)
     a.cmd = cmd
     a.task_dir = os.path.abspath(a.task_dir)
     a.cwd = os.path.abspath(a.cwd or os.getcwd())

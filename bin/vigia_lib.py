@@ -800,12 +800,14 @@ class HookPolicy:
             return out
 
         def match(pat, rel, strict):
+            anchored = "/" in pat.rstrip("/")                 # gitignore rule: a slash (leading/middle) anchors it
             p = pat[1:] if pat.startswith("/") else pat
-            if "/" not in p.rstrip("/"):                      # a bare name matches the file name at any depth
-                return re.fullmatch(rx(p, strict), rel.rsplit("/", 1)[-1]) is not None
-            if strict:                                         # anchored to the search root, like ripgrep
-                return re.fullmatch(rx(p, True), rel) is not None
-            return re.fullmatch("(?:.*/)?" + rx(p, False), rel) is not None   # inclusion: any suffix counts
+            if not strict:                                     # inclusion: name or any path suffix counts
+                return (re.fullmatch(rx(p, False), rel.rsplit("/", 1)[-1]) is not None
+                        or re.fullmatch("(?:.*/)?" + rx(p, False), rel) is not None)
+            if not anchored:                                   # exclusion by a bare name: the file name, any depth
+                return re.fullmatch(rx(p, True), rel.rsplit("/", 1)[-1]) is not None
+            return re.fullmatch(rx(p, True), rel) is not None  # anchored exclusion: from the search root only
 
         if pats and not neg and any(c in x for x in pats for c in "{}"):
             return True                                  # nested braces are not expanded: assume they reach one

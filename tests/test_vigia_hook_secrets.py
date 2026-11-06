@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hooks deny secret files (always, any tool) and redact secrets before anything is truncated or written.
 Run: python3 tests/test_vigia_hook_secrets.py"""
-import json, os, subprocess, sys, tempfile, unittest
+import shutil, json, os, subprocess, sys, tempfile, unittest
 sys.dont_write_bytecode = True
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "bin"))
@@ -179,6 +179,37 @@ class GrepSecrets(unittest.TestCase):
             os.remove(f)
         self.assertIsNone(self.deny(path=self.repo, glob="*"))
         self.assertTrue(self.deny(path=self.repo, glob="*.{a,{b,c}}"))           # unexpanded nesting fails closed
+
+    def test_anchored_exclusion_stays_at_the_root(self):
+        """`!/name` excludes only the root file; a nested secret is still searched."""
+        os.makedirs(os.path.join(self.repo, "sub"))
+        open(os.path.join(self.repo, "sub", "webhook.env"), "w").write("T=1\n")
+        self.assertTrue(self.deny(path=self.repo, glob="!/webhoo[k].env"))
+        self.assertIsNone(self.deny(path=self.repo, glob="!webhoo[k].env"))
+        self.assertTrue(self.deny(path=self.repo, glob="!/sub"))
+
+    @unittest.skipUnless(shutil.which("rg"), "ripgrep not installed")
+    def test_allowed_searches_never_list_a_secret_in_ripgrep(self):
+        """Differential: whenever the hook allows a Grep, `rg --files --hidden --no-ignore` with the same filters lists
+        no secret file."""
+        import subprocess
+        for d in ("sub/deep", "build", "src/x"):
+            os.makedirs(os.path.join(self.repo, d), exist_ok=True)
+        for f in (".env", "sub/.env.json", "sub/deep/webhook.env", "build/.env.staging", "src/x/.env.local", "src/x/b.py",
+                  "sub/c.md", "sub/deep/d.json"):
+            open(os.path.join(self.repo, f), "w").write("x\n")
+        globs = ["*.py", "*.json", "!*.json", "!/.env", "!.env*", "!**/.env*", "!sub/*", "!sub/**", "**/*.py", "src/**",
+                 "*.{py,md}", "!*.{json,env}", "!/sub", "!build", "*", "!webhook.env", "sub/*.json", "!src/x/*"]
+        types = ["", "py", "json", "md", "sh"]
+        for g in globs + [""]:
+            for t in types:
+                inp = {k: v for k, v in (("glob", g), ("type", t)) if v}
+                if self.deny(path=self.repo, **inp) is not None:
+                    continue
+                cmd = ["rg", "--files", "--hidden", "--no-ignore"] + (["-g", g] if g else []) + (["-t", t] if t else [])
+                out = subprocess.run(cmd, cwd=self.repo, capture_output=True, text=True).stdout.split()
+                leaked = [x for x in out if self.V.touches_secret(x)]
+                self.assertEqual(leaked, [], (g, t))
 
     def test_hook_blocks_and_logs_it_as_secret(self):
         open(os.path.join(self.repo, ".env"), "w").write("TOKEN=abc123456\n")
